@@ -85,6 +85,18 @@ EOF
 3. Copy the token and set it as `BB_TOKEN`
 4. Set `BB_USER` to your Bitbucket account email address
 
+### Required Bitbucket Permissions
+
+Your Bitbucket account needs these workspace permissions:
+
+| Feature | Required Permission |
+|---------|---------------------|
+| View pipelines, PRs, repos | **Read** access to repositories |
+| Trigger/stop pipelines | **Read + Write** access to Pipelines |
+| Create/approve/merge PRs | **Read + Write** access to Pull Requests |
+
+Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too.
+
 ### Environment Variables
 
 You can also set configuration via environment variables:
