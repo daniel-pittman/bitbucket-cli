@@ -345,7 +345,7 @@ cmd_logs() {
     echo "Logs for step [${step_index}] ${step_name}:"
     echo ""
 
-    curl -sf -u "${BB_USER}:${BB_TOKEN}" \
+    curl -sfL -u "${BB_USER}:${BB_TOKEN}" \
         "${BB_API}$(repo_path "$repo")/pipelines/%7B${pipeline_uuid}%7D/steps/%7B${step_uuid}%7D/log" \
         2>/dev/null || echo "(no log output available)"
 }
