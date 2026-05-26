@@ -48,7 +48,16 @@ class BBConfigError(RuntimeError):
 
 
 class BBApiError(RuntimeError):
-    """Raised for non-2xx HTTP responses. Carries status, URL, and body."""
+    """Raised when an API call cannot be completed.
+
+    The common case is a non-2xx HTTP response — `status` carries the HTTP
+    code, `body` carries the response body (truncated in the message). The
+    same exception is also used as a generic transport-error wrapper for
+    network failures (DNS, TLS, timeout) and for malformed-response errors
+    surfaced by `BBClient.paginate`; in those cases `status` is `0` and
+    `body` is a diagnostic string. Callers branching on HTTP semantics
+    should check `status > 0` before dispatching by code.
+    """
 
     def __init__(self, status: int, url: str, body: str):
         super().__init__(f"HTTP {status} from {url}: {body[:500]}")
@@ -104,18 +113,22 @@ def load_config(
 ) -> BBConfig:
     """Resolve BB_USER / BB_TOKEN / BB_WORKSPACE / BB_API_BASE.
 
-    Precedence (highest first), matching the bash script's behaviour:
-        1. Process environment variables.
-        2. ~/.config/bb/config (or the explicit `config_path` argument).
-        3. .env in the bb script's directory (or the explicit `dotenv_path`).
+    Precedence (highest first), matching the bash script's `source` order:
+        1. Process environment variables (an env var set, even to "", wins).
+        2. .env in the bb script's directory (`dotenv_path`).
+        3. ~/.config/bb/config (`config_path`).
 
-    Differs from the bash script in one harmless way: bash `source` lets a
-    later file overwrite an earlier one. Here, an env var ALWAYS wins so
-    test callers can shadow files cleanly. The bash script gives the same
-    practical result because env vars set in the current shell are visible
-    to `source`d files and stay set unless the file rewrites them.
+    The bash script `source`s ~/.config/bb/config first and `.env` second,
+    so .env values overwrite the home-config values. This function mirrors
+    that order. .env is a repo-local development override; ~/.config/bb is
+    user-global.
 
-    Raises BBConfigError if any required key is missing.
+    Membership test (rather than `or` coalesce) so an explicitly-set empty
+    env var doesn't silently fall through to the file. The required-keys
+    check below still catches empty values as missing — that part matches
+    bash's `[[ -z "$BB_USER" ]]` check.
+
+    Raises BBConfigError if any required key is missing or empty.
     """
     env = env if env is not None else dict(os.environ)
     if config_path is None:
@@ -123,18 +136,25 @@ def load_config(
     # dotenv_path is intentionally optional; callers running outside the
     # script directory don't get one by default.
 
+    # Build the file_config in the SAME order bash sources its files so
+    # .env wins over the home config. Later .update() overwrites.
     file_config: dict[str, str] = {}
+    file_config.update(_read_keyvalue_file(config_path))
     if dotenv_path is not None:
         file_config.update(_read_keyvalue_file(dotenv_path))
-    file_config.update(_read_keyvalue_file(config_path))
 
     def resolve(key: str) -> str | None:
-        return env.get(key) or file_config.get(key)
+        if key in env:
+            return env[key]
+        return file_config.get(key)
 
     user = resolve("BB_USER")
     token = resolve("BB_TOKEN")
     workspace = resolve("BB_WORKSPACE")
-    api_base = resolve("BB_API_BASE") or DEFAULT_API_BASE
+    api_base_raw = resolve("BB_API_BASE")
+    api_base = api_base_raw if api_base_raw else DEFAULT_API_BASE
+    # Normalise trailing slash so api_base + "/path" never produces "//path".
+    api_base = api_base.rstrip("/")
 
     missing = [k for k, v in [("BB_USER", user), ("BB_TOKEN", token), ("BB_WORKSPACE", workspace)] if not v]
     if missing:
@@ -143,8 +163,9 @@ def load_config(
             "Set as environment variables or in ~/.config/bb/config."
         )
 
-    # mypy: the missing-check above guarantees these are non-None strings.
-    assert user is not None and token is not None and workspace is not None
+    # Explicit narrow (not `assert ... is not None`, which `python -O` strips).
+    if user is None or token is None or workspace is None:
+        raise BBConfigError("Internal: required key resolved to None despite missing-check.")
     return BBConfig(user=user, token=token, workspace=workspace, api_base=api_base)
 
 
@@ -216,18 +237,49 @@ def detect_repo(
 def repo_path(workspace: str, repo: str) -> str:
     """Build the Bitbucket REST path for a repo (`/repositories/{ws}/{repo}`).
 
-    Mirrors the bash repo_path helper. Validates that the inputs don't
-    contain a slash, which would silently change the path's structure.
+    Mirrors the bash repo_path helper. Validates inputs reject:
+      - empty / whitespace-only values (would produce `/repositories//repo`)
+      - embedded `/` (would silently change path structure)
+      - `.` or `..` segments (path-traversal: after URL normalisation,
+        `/repositories/../widget` resolves to `/repositories/widget` with
+        the wrong workspace)
     """
-    if "/" in workspace or "/" in repo:
-        raise ValueError(
-            f"workspace and repo must not contain '/'. "
-            f"Got workspace={workspace!r}, repo={repo!r}."
-        )
+    for label, value in (("workspace", workspace), ("repo", repo)):
+        if not value or not value.strip():
+            raise ValueError(f"{label} must be a non-empty, non-whitespace string. Got {value!r}.")
+        if "/" in value:
+            raise ValueError(f"{label} must not contain '/'. Got {value!r}.")
+        if value in (".", ".."):
+            raise ValueError(f"{label} must not be '.' or '..'. Got {value!r}.")
     return f"/repositories/{workspace}/{repo}"
 
 
 # --- HTTP transport -------------------------------------------------------
+
+
+def _validate_query_value(key: str, value: Any) -> None:
+    """Reject non-scalar query values that urlencode would silently stringify.
+
+    With `doseq=True`, urlencode iterates dicts as their keys (`{"a":"b"}` ->
+    `q=a`) and stringifies arbitrary objects via repr. Both produce surprising
+    URLs that the caller never explicitly authored. Allow only scalars and
+    homogeneous lists/tuples of scalars.
+    """
+    scalar = (str, int, float, bool)
+    if isinstance(value, scalar):
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, scalar):
+                raise TypeError(
+                    f"query[{key!r}]: list/tuple elements must be scalars "
+                    f"(str/int/float/bool), got {type(item).__name__}"
+                )
+        return
+    raise TypeError(
+        f"query[{key!r}]: must be scalar or list/tuple of scalars, "
+        f"got {type(value).__name__}"
+    )
 
 
 class BBClient:
@@ -243,6 +295,10 @@ class BBClient:
     `opener` is an injection seam for tests; the default is a fresh
     urllib opener with no proxy / cookie handling so the test suite
     doesn't accidentally hit a real server.
+
+    `timeout` is the default for every request. Each method accepts an
+    override via the `timeout=` kwarg for endpoints that legitimately take
+    longer (pipeline log streaming, large PR diffs).
     """
 
     def __init__(
@@ -254,7 +310,7 @@ class BBClient:
     ):
         self.config = config
         self._opener = opener or urllib.request.build_opener()
-        self._timeout = timeout
+        self._default_timeout = timeout
         # Pre-compute the Basic auth header so each request constructs
         # the same string (cheap, but more importantly easy to assert on
         # in tests).
@@ -270,12 +326,16 @@ class BBClient:
         *,
         json_body: Any = None,
         query: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         url = self.config.api_base + path
         if query:
             # Drop None values so callers can pass `branch=None` to mean
-            # "skip this query parameter."
+            # "skip this query parameter." Validate the rest so a nested
+            # dict/object doesn't silently become a meaningless URL.
             cleaned = {k: v for k, v in query.items() if v is not None}
+            for k, v in cleaned.items():
+                _validate_query_value(k, v)
             if cleaned:
                 url = url + "?" + urllib.parse.urlencode(cleaned, doseq=True)
 
@@ -290,8 +350,9 @@ class BBClient:
             headers["Content-Type"] = "application/json"
 
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        effective_timeout = timeout if timeout is not None else self._default_timeout
         try:
-            with self._opener.open(req, timeout=self._timeout) as resp:
+            with self._opener.open(req, timeout=effective_timeout) as resp:
                 body = resp.read()
                 # 204 No Content is a valid empty response on DELETE / some
                 # mutation endpoints; return None so callers can branch on it.
@@ -309,20 +370,44 @@ class BBClient:
             except Exception:  # noqa: BLE001 - HTTPError.read can raise anything
                 pass
             raise BBApiError(e.code, url, body_text) from e
+        except urllib.error.URLError as e:
+            # DNS failure, connection refused, TLS error, socket timeout, etc.
+            # HTTPError is a subclass of URLError, so the order above matters
+            # (HTTPError caught first). Wrap with status=0 to preserve the
+            # documented BBApiError contract (see class docstring).
+            raise BBApiError(0, url, f"network error: {e.reason}") from e
 
     # -- Public methods --
 
-    def get(self, path: str, *, query: dict[str, Any] | None = None) -> Any:
-        return self._request("GET", path, query=query)
+    def get(
+        self,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return self._request("GET", path, query=query, timeout=timeout)
 
-    def post(self, path: str, *, json_body: Any = None) -> Any:
-        return self._request("POST", path, json_body=json_body)
+    def post(
+        self,
+        path: str,
+        *,
+        json_body: Any = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return self._request("POST", path, json_body=json_body, timeout=timeout)
 
-    def put(self, path: str, *, json_body: Any = None) -> Any:
-        return self._request("PUT", path, json_body=json_body)
+    def put(
+        self,
+        path: str,
+        *,
+        json_body: Any = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return self._request("PUT", path, json_body=json_body, timeout=timeout)
 
-    def delete(self, path: str) -> Any:
-        return self._request("DELETE", path)
+    def delete(self, path: str, *, timeout: float | None = None) -> Any:
+        return self._request("DELETE", path, timeout=timeout)
 
     def paginate(
         self,
@@ -346,6 +431,12 @@ class BBClient:
         url: str | None = None
         last_next: str | None = None
         page_query: dict[str, Any] | None = query
+        # Acceptable separators after api_base in a continuation URL. A bare
+        # `startswith(api_base)` is a *string* match that lets
+        # `https://api.bitbucket.org/2.0evil.example.com/...` slip past, so
+        # we require the next character to be a path or query separator.
+        base_with_path = self.config.api_base + "/"
+        base_with_query = self.config.api_base + "?"
 
         for iteration in range(max_iterations):
             if url is None:
@@ -354,12 +445,13 @@ class BBClient:
                 # Strip the api_base off `next` so _request can re-add it;
                 # this keeps every request going through the same code path
                 # and means tests don't need to special-case page-2 URLs.
-                if url.startswith(self.config.api_base):
+                if url.startswith(base_with_path) or url.startswith(base_with_query):
                     rel = url[len(self.config.api_base) :]
                 else:
-                    # Bitbucket's `next` should always start with our base,
-                    # but be defensive: if it doesn't, refuse rather than
-                    # silently following a redirect to an arbitrary host.
+                    # Bitbucket's `next` should always start with our base
+                    # followed by `/` or `?`. Anything else (different host,
+                    # or the prefix-trick where api_base is followed by
+                    # arbitrary characters) is refused rather than followed.
                     raise BBApiError(
                         0,
                         url,
@@ -375,12 +467,25 @@ class BBClient:
                     f"expected dict from paginated endpoint, got {type(payload).__name__}",
                 )
 
-            for item in payload.get("values", []):
+            if "values" not in payload:
+                raise BBApiError(
+                    0,
+                    url or (self.config.api_base + path),
+                    "paginated response missing 'values' key",
+                )
+
+            for item in payload["values"]:
                 yield item
 
             next_url = payload.get("next")
             if not next_url:
                 return
+            if not isinstance(next_url, str):
+                raise BBApiError(
+                    0,
+                    url or (self.config.api_base + path),
+                    f"paginated response 'next' must be a string, got {type(next_url).__name__}",
+                )
             if next_url == last_next:
                 # Stuck cursor — server returned the same `next` again.
                 return

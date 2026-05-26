@@ -132,19 +132,66 @@ def test_load_config_ignores_blank_and_comment_lines(tmp_path: Path) -> None:
     assert cfg.user == "alice@example.com"
 
 
-def test_load_config_dotenv_lower_precedence(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "primary.cfg"
+def test_load_config_dotenv_overrides_home_config(tmp_path: Path) -> None:
+    """Mirrors bash's load order: ~/.config/bb/config is sourced first,
+    then .env, so .env overwrites the home config. Repo-local .env is
+    intentionally the highest-priority file source because it's the
+    development-override knob."""
+    cfg_path = tmp_path / "home.cfg"
     cfg_path.write_text(
-        "BB_USER=alice@example.com\nBB_TOKEN=primary-tok\nBB_WORKSPACE=acme\n"
+        "BB_USER=alice@example.com\nBB_TOKEN=home-tok\nBB_WORKSPACE=acme\n"
     )
     dotenv = tmp_path / ".env"
-    dotenv.write_text("BB_TOKEN=dotenv-tok\nBB_WORKSPACE=other\n")
+    dotenv.write_text("BB_TOKEN=dotenv-tok\nBB_WORKSPACE=widget-co\n")
 
     cfg = load_config(env={}, config_path=cfg_path, dotenv_path=dotenv)
-    # Primary config wins over dotenv (matches the bash script's load order:
-    # ~/.config/bb/config is loaded last, so its values overwrite .env).
-    assert cfg.token == "primary-tok"
-    assert cfg.workspace == "acme"
+    # .env wins. user is only in home, so it's carried through unchanged.
+    assert cfg.user == "alice@example.com"
+    assert cfg.token == "dotenv-tok"
+    assert cfg.workspace == "widget-co"
+
+
+def test_load_config_env_beats_dotenv(tmp_path: Path) -> None:
+    """Process env still wins over .env, which still wins over home config."""
+    cfg_path = tmp_path / "home.cfg"
+    cfg_path.write_text(
+        "BB_USER=alice@example.com\nBB_TOKEN=home-tok\nBB_WORKSPACE=acme\n"
+    )
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("BB_TOKEN=dotenv-tok\n")
+
+    cfg = load_config(
+        env={"BB_TOKEN": "env-tok"},
+        config_path=cfg_path,
+        dotenv_path=dotenv,
+    )
+    assert cfg.token == "env-tok"
+
+
+def test_load_config_empty_env_var_does_not_fall_through(tmp_path: Path) -> None:
+    """An explicitly-set empty env var should NOT silently let the file
+    value through (the old `or` falsy-coalesce did this). The required-key
+    check then catches the empty value and raises."""
+    cfg_path = tmp_path / "home.cfg"
+    cfg_path.write_text(
+        "BB_USER=alice@example.com\nBB_TOKEN=file-tok\nBB_WORKSPACE=acme\n"
+    )
+    with pytest.raises(BBConfigError, match="BB_TOKEN"):
+        load_config(env={"BB_TOKEN": ""}, config_path=cfg_path)
+
+
+def test_load_config_normalises_trailing_slash_on_api_base(tmp_path: Path) -> None:
+    cfg = load_config(
+        env={
+            "BB_USER": "alice@example.com",
+            "BB_TOKEN": "tok",
+            "BB_WORKSPACE": "acme",
+            "BB_API_BASE": "https://bitbucket.example.com/2.0/",
+        },
+        config_path=tmp_path / "nope",
+    )
+    # No trailing slash — guards against `api_base + "/path"` producing "//path".
+    assert cfg.api_base == "https://bitbucket.example.com/2.0"
 
 
 def test_load_config_missing_keys_lists_all(tmp_path: Path) -> None:
@@ -234,6 +281,33 @@ def test_detect_repo_ssh_remote() -> None:
     assert detect_repo(runner=runner) == "widget-service"
 
 
+def test_detect_repo_invokes_git_remote_get_url() -> None:
+    """Verifies the exact subprocess call shape. A future refactor that
+    changes the command (e.g. to `git config remote.origin.url`), drops
+    text=True, or skips cwd propagation, would silently break — without
+    this assertion the canned-output tests would still pass.
+    """
+    captured: dict[str, Any] = {}
+
+    class _Recording:
+        @staticmethod
+        def run(args: Any, **kwargs: Any) -> Any:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(
+                returncode=0,
+                stdout="https://bitbucket.org/acme/widget-service.git\n",
+                stderr="",
+            )
+
+    assert detect_repo(path="/some/dir", runner=_Recording) == "widget-service"
+    assert captured["args"] == ["git", "remote", "get-url", "origin"]
+    assert captured["kwargs"]["capture_output"] is True
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["cwd"] == "/some/dir"
+    assert captured["kwargs"]["check"] is False
+
+
 def test_detect_repo_not_a_git_dir() -> None:
     runner = _fake_runner(returncode=128, stderr="fatal: not a git repository\n")
     with pytest.raises(BBConfigError, match="Not a git repository"):
@@ -270,6 +344,24 @@ def test_repo_path_rejects_slashes() -> None:
         repo_path("acme/sub", "widget")
     with pytest.raises(ValueError):
         repo_path("acme", "widget/sub")
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "\t\n"])
+def test_repo_path_rejects_empty_or_whitespace(bad: str) -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        repo_path(bad, "widget")
+    with pytest.raises(ValueError, match="non-empty"):
+        repo_path("acme", bad)
+
+
+@pytest.mark.parametrize("bad", [".", ".."])
+def test_repo_path_rejects_dot_segments(bad: str) -> None:
+    """`/repositories/../widget` after URL normalisation can resolve to
+    `/repositories/widget` with the wrong workspace — path-traversal."""
+    with pytest.raises(ValueError, match=r"'\.'|'\.\.'"):
+        repo_path(bad, "widget")
+    with pytest.raises(ValueError, match=r"'\.'|'\.\.'"):
+        repo_path("acme", bad)
 
 
 # =========================================================================
@@ -446,6 +538,72 @@ def test_http_error_surfaces_as_bbapierror() -> None:
     assert "Repository not found" in exc.value.body
 
 
+def test_urlerror_surfaces_as_bbapierror_with_status_zero() -> None:
+    """A DNS / TLS / connection / timeout failure raises urllib.error.URLError
+    (which is HTTPError's parent class). Without an explicit handler, this
+    would escape the BBApiError contract. Wrap with status=0 (the documented
+    transport-error sentinel)."""
+
+    class _NetworkDownOpener:
+        def open(self, req: urllib.request.Request, timeout: float = 30.0) -> Any:
+            raise urllib.error.URLError("Name or service not known")
+
+    client = _client(_CaptureOpener([]))
+    client._opener = _NetworkDownOpener()  # type: ignore[assignment]
+    with pytest.raises(BBApiError) as exc:
+        client.get("/repos")
+    assert exc.value.status == 0
+    assert "network error" in exc.value.body.lower()
+
+
+def test_request_uses_default_timeout() -> None:
+    opener = _CaptureOpener([{"ok": True}])
+    cfg = BBConfig(
+        user="alice@example.com", token="tok", workspace="acme", api_base=DEFAULT_API_BASE
+    )
+    client = BBClient(cfg, opener=opener, timeout=12.5)
+    client.get("/repos")
+    assert opener.calls[0]["timeout"] == 12.5
+
+
+def test_request_per_call_timeout_overrides_default() -> None:
+    """A long-running call (log streaming, large diff) needs to extend the
+    default timeout. Each public method exposes a per-call override."""
+    opener = _CaptureOpener([{"ok": True}, {"ok": True}, {"ok": True}, None])
+    cfg = BBConfig(
+        user="alice@example.com", token="tok", workspace="acme", api_base=DEFAULT_API_BASE
+    )
+    client = BBClient(cfg, opener=opener, timeout=5.0)
+    client.get("/a", timeout=120.0)
+    client.post("/b", json_body={"x": 1}, timeout=60.0)
+    client.put("/c", json_body={"y": 2}, timeout=30.0)
+    client.delete("/d", timeout=15.0)
+    assert [c["timeout"] for c in opener.calls] == [120.0, 60.0, 30.0, 15.0]
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [{"nested": "dict"}, ["list", {"of": "stuff"}], object()],
+)
+def test_query_rejects_non_scalar_values(bad_value: Any) -> None:
+    opener = _CaptureOpener([])
+    client = _client(opener)
+    with pytest.raises(TypeError, match="query"):
+        client.get("/repos", query={"q": bad_value})
+    # Confirm nothing went out on the wire.
+    assert opener.calls == []
+
+
+def test_query_accepts_scalar_list() -> None:
+    opener = _CaptureOpener([{"values": []}])
+    client = _client(opener)
+    client.get("/repos", query={"tag": ["a", "b"]})
+    url = opener.calls[0]["url"]
+    # urllib serialises lists as repeated query keys with doseq=True.
+    assert "tag=a" in url
+    assert "tag=b" in url
+
+
 # =========================================================================
 # Pagination
 # =========================================================================
@@ -510,6 +668,48 @@ def test_paginate_refuses_cross_host_next() -> None:
     )
     client = _client(opener)
     with pytest.raises(BBApiError, match="host mismatch"):
+        list(client.paginate("/repos"))
+
+
+def test_paginate_refuses_prefix_trick_next() -> None:
+    """A `next` URL that string-prefixes api_base but continues into a
+    different host slips past a naive `startswith()` check. Defends by
+    requiring the separator after api_base to be `/` or `?`."""
+    sneaky = DEFAULT_API_BASE + "evil.example.com/repos?page=2"
+    opener = _CaptureOpener(
+        [
+            {"values": [{"id": 1}], "next": sneaky},
+        ]
+    )
+    client = _client(opener)
+    with pytest.raises(BBApiError, match="host mismatch"):
+        list(client.paginate("/repos"))
+
+
+def test_paginate_missing_values_key_raises() -> None:
+    """A malformed page (or proxy-corrupted response) without `values` should
+    be loud, not silently treated as empty. The previous .get('values', [])
+    would have advanced through `next` with a silent hole in the result set."""
+    opener = _CaptureOpener(
+        [
+            {"next": DEFAULT_API_BASE + "/repos?page=2"},  # no `values`
+        ]
+    )
+    client = _client(opener)
+    with pytest.raises(BBApiError, match="missing 'values'"):
+        list(client.paginate("/repos"))
+
+
+def test_paginate_non_string_next_raises() -> None:
+    """`next: 123` would otherwise crash on `.startswith()` with
+    AttributeError, bypassing the BBApiError contract."""
+    opener = _CaptureOpener(
+        [
+            {"values": [{"id": 1}], "next": 12345},
+        ]
+    )
+    client = _client(opener)
+    with pytest.raises(BBApiError, match="must be a string"):
         list(client.paginate("/repos"))
 
 

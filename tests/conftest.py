@@ -21,7 +21,12 @@ import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("BB_MCP_SKIP_BOOTSTRAP", "1")
+# Set unconditionally. `setdefault` would be a no-op if a developer had
+# `export BB_MCP_SKIP_BOOTSTRAP=0` in their shell, defeating the guard
+# silently and hanging the test process when mcp_server tries to exec
+# into its bootstrap venv. The guard must take effect for the test run
+# regardless of inherited environment.
+os.environ["BB_MCP_SKIP_BOOTSTRAP"] = "1"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
