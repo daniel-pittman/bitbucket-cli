@@ -557,7 +557,11 @@ def pr_merge(
     matches bash's default of True.
     """
     _validate_pr_id(pr_id)
-    if strategy not in _VALID_MERGE_STRATEGIES:
+    # isinstance gate before the membership test: a non-hashable strategy
+    # (list, dict, set) would otherwise raise TypeError from the frozenset
+    # `in` check rather than the documented ValueError, breaking the
+    # "every boundary failure is ValueError" convention this file follows.
+    if not isinstance(strategy, str) or strategy not in _VALID_MERGE_STRATEGIES:
         raise ValueError(
             f"strategy must be one of {sorted(_VALID_MERGE_STRATEGIES)}, "
             f"got {strategy!r}"

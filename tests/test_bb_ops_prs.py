@@ -382,7 +382,16 @@ class TestPrCreate:
             bb_ops.pr_create(_client(opener), "acme", "widget-service", **kwargs)
         assert opener.calls == []
 
-    def test_rejects_empty_reviewer_uuid(self) -> None:
+    @pytest.mark.parametrize(
+        "bad_reviewer",
+        [
+            "",                     # empty string
+            None,                   # non-string sentinel
+            123,                    # non-string scalar
+            {"uuid": "alice-uuid"}, # the most plausible caller mistake — pre-shaping the payload
+        ],
+    )
+    def test_rejects_invalid_reviewer(self, bad_reviewer: Any) -> None:
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="reviewer"):
             bb_ops.pr_create(
@@ -391,7 +400,7 @@ class TestPrCreate:
                 "widget-service",
                 title="t",
                 source_branch="s",
-                reviewers=[""],
+                reviewers=[bad_reviewer],
             )
         assert opener.calls == []
 
@@ -511,7 +520,18 @@ class TestPrMerge:
             )
             assert opener.calls[0]["body"]["merge_strategy"] == strategy
 
-    def test_rejects_invalid_strategy(self) -> None:
+    @pytest.mark.parametrize(
+        "bad_strategy",
+        [
+            "rebase",       # not in Bitbucket's set
+            "",             # empty string
+            None,           # non-string sentinel
+            123,            # non-string scalar
+            ["squash"],     # unhashable type — would have raised TypeError
+            {"squash"},     # unhashable type
+        ],
+    )
+    def test_rejects_invalid_strategy(self, bad_strategy: Any) -> None:
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="strategy"):
             bb_ops.pr_merge(
@@ -519,7 +539,7 @@ class TestPrMerge:
                 "acme",
                 "widget-service",
                 7,
-                strategy="rebase",  # not a Bitbucket strategy
+                strategy=bad_strategy,
             )
         assert opener.calls == []
 
@@ -690,6 +710,13 @@ class TestPrDiff:
         result = bb_ops.pr_diff(_client(opener), "acme", "widget-service", 42)
         assert result == "diff body from remote\n"
         assert len(opener.calls) == 2
+        # First hop MUST carry Authorization (we own the request to
+        # api.bitbucket.org). A regression that dropped auth on the
+        # initial request would otherwise pass silently.
+        assert opener.calls[0]["headers"]["Authorization"].startswith("Basic ")
+        # And the Location header was actually followed (not refetched
+        # original URL).
+        assert opener.calls[1]["url"] == remote_url
         # Second hop must NOT carry the Bitbucket credential.
         assert "Authorization" not in opener.calls[1]["headers"], (
             "Bitbucket Basic auth leaked to the diff-cache host"
