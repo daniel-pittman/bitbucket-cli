@@ -604,6 +604,47 @@ def test_query_accepts_scalar_list() -> None:
     assert "tag=b" in url
 
 
+def test_default_opener_refuses_redirects() -> None:
+    """The default BBClient opener installs _NoRedirectHandler so a 3xx
+    response surfaces as an HTTPError rather than causing urllib to
+    resubmit the Authorization header to the redirect's Location URL.
+
+    This is what the bash side does by default (curl without -L). Endpoints
+    that legitimately redirect (e.g. log streaming to S3) need a separate
+    code path that strips Authorization on cross-host hops; that work lands
+    when bb_ops adds pipeline_logs.
+    """
+    cfg = BBConfig(
+        user="alice@example.com", token="tok", workspace="acme", api_base=DEFAULT_API_BASE
+    )
+    client = BBClient(cfg)  # default opener
+    handler_classes = [type(h).__name__ for h in client._opener.handlers]
+    # The custom handler is installed; the stock HTTPRedirectHandler is
+    # replaced (urllib keys handlers by class hierarchy, so installing a
+    # subclass supersedes the default).
+    assert "_NoRedirectHandler" in handler_classes
+
+
+def test_no_redirect_handler_returns_none() -> None:
+    """Direct unit test of the redirect handler's contract: returning None
+    from redirect_request tells urllib NOT to follow the redirect and
+    instead surface the 3xx as an HTTPError. The wider behaviour is
+    confirmed by inspection of urllib's HTTPRedirectHandler base class;
+    here we just pin that our subclass does the override correctly.
+    """
+    handler = bb_api._NoRedirectHandler()
+    fake_req = urllib.request.Request("https://api.bitbucket.org/2.0/repos")
+    result = handler.redirect_request(
+        fake_req,
+        io.BytesIO(b""),
+        302,
+        "Found",
+        {"Location": "https://evil.example.com/"},
+        "https://evil.example.com/",
+    )
+    assert result is None
+
+
 # =========================================================================
 # Pagination
 # =========================================================================
@@ -621,7 +662,14 @@ def test_paginate_walks_pages() -> None:
     client = _client(opener)
     items = list(client.paginate("/repositories/acme/widget-service/pullrequests"))
     assert [i["id"] for i in items] == [1, 2, 3, 4]
+    # Assert URL for each page, not just call count. Without this a regression
+    # that refetches the original URL three times would still consume the three
+    # queued responses and pass — exactly the "mock returns success regardless
+    # of request" anti-pattern.
     assert len(opener.calls) == 3
+    assert opener.calls[0]["url"] == base
+    assert opener.calls[1]["url"] == base + "?page=2"
+    assert opener.calls[2]["url"] == base + "?page=3"
 
 
 def test_paginate_stops_on_stuck_cursor() -> None:

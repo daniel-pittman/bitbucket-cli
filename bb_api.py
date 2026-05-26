@@ -186,6 +186,19 @@ def parse_remote_url(url: str) -> tuple[str, str] | None:
     `workspace/repo` pair. The bash version's sed regex only returns the
     repo slug; the Python version also returns the workspace because the
     MCP server uses it for cross-workspace context resolution.
+
+    Caller contract — IMPORTANT: this function does NOT anchor to any
+    specific host (matches bash's loose parsing, and intentional so
+    enterprise / self-hosted Bitbucket deployments work). For URLs the
+    developer controls (`git remote get-url origin`), that's fine. For
+    URLs sourced from untrusted external input (e.g. webhook payload
+    fields like `repository.links.clone[].href`), the caller is
+    responsible for verifying the URL belongs to a known Bitbucket
+    host BEFORE feeding it here — otherwise a github.com URL silently
+    parses to a (workspace, repo) tuple that the MCP server would
+    authenticate to against Bitbucket Cloud. If a future consumer
+    needs that guarantee, add a `strict=True` mode here rather than
+    pushing the check to every call site.
     """
     match = _REMOTE_TAIL.search(url.strip())
     if match is None:
@@ -257,6 +270,41 @@ def repo_path(workspace: str, repo: str) -> str:
 # --- HTTP transport -------------------------------------------------------
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib redirect handler that refuses to follow any 3xx response.
+
+    Why: urllib's default `HTTPRedirectHandler` resubmits the original
+    request — including the `Authorization` header — against the
+    `Location` URL on a 3xx response. urllib does NOT strip the auth
+    header on cross-origin redirects, so a misconfigured proxy, a
+    DNS-hijack, or a future Bitbucket-side 3xx pointing at a different
+    host could leak the Basic auth credential to an arbitrary server.
+
+    The bash script's `curl -sf` doesn't follow redirects by default
+    either (the `bb logs` command explicitly opts in via `-L` because
+    Bitbucket's log endpoint returns a 307 to S3). When bb_ops adds a
+    `pipeline_logs` operation later, it will need a separate code path
+    that follows redirects but strips `Authorization` on cross-host
+    hops. For every other Bitbucket REST endpoint, refusing redirects
+    is the correct behaviour and is what bb does today.
+
+    Returning None from redirect_request causes urllib to surface the
+    3xx as an HTTPError, which our `_request` already wraps into
+    BBApiError.
+    """
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 def _validate_query_value(key: str, value: Any) -> None:
     """Reject non-scalar query values that urlencode would silently stringify.
 
@@ -309,7 +357,10 @@ class BBClient:
         timeout: float = 30.0,
     ):
         self.config = config
-        self._opener = opener or urllib.request.build_opener()
+        # Default opener refuses 3xx redirects so Authorization headers
+        # are never resubmitted to a Location URL. Tests pass their own
+        # opener in via the `opener=` kwarg.
+        self._opener = opener or urllib.request.build_opener(_NoRedirectHandler)
         self._default_timeout = timeout
         # Pre-compute the Basic auth header so each request constructs
         # the same string (cheap, but more importantly easy to assert on
@@ -430,7 +481,6 @@ class BBClient:
         """
         url: str | None = None
         last_next: str | None = None
-        page_query: dict[str, Any] | None = query
         # Acceptable separators after api_base in a continuation URL. A bare
         # `startswith(api_base)` is a *string* match that lets
         # `https://api.bitbucket.org/2.0evil.example.com/...` slip past, so
@@ -440,7 +490,11 @@ class BBClient:
 
         for iteration in range(max_iterations):
             if url is None:
-                payload = self._request("GET", path, query=page_query)
+                # First page uses caller's `path` + `query` (already in
+                # closure as the `query` parameter — no second variable
+                # needed since subsequent pages route through the `next`
+                # URL which carries any continuation params itself).
+                payload = self._request("GET", path, query=query)
             else:
                 # Strip the api_base off `next` so _request can re-add it;
                 # this keeps every request going through the same code path
@@ -458,7 +512,6 @@ class BBClient:
                         f"pagination cursor host mismatch (expected {self.config.api_base})",
                     )
                 payload = self._request("GET", rel)
-                page_query = None  # only the first page uses caller's query
 
             if not isinstance(payload, dict):
                 raise BBApiError(
