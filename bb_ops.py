@@ -678,3 +678,224 @@ def pr_comment_add(
         f"{_prs_root(workspace, repo)}/{pr_id}/comments",
         json_body={"content": {"raw": body}},
     )
+
+
+# ===========================================================================
+#  REPOSITORY / BRANCH / VARIABLES / DOWNLOADS / COMMITS
+# ===========================================================================
+
+
+def repos_list(
+    client: BBClient,
+    workspace: str | None = None,
+    *,
+    count: int = 100,
+    sort: str = "-updated_on",
+    query: str | None = None,
+) -> list[dict[str, Any]]:
+    """List repositories in a workspace.
+
+    `workspace=None` defaults to the client's configured workspace
+    (`client.config.workspace`); pass an explicit workspace to query
+    a different one (the bash equivalent only ever uses BB_WORKSPACE).
+
+    `query` is a Bitbucket BBQL filter string passed via `?q=`, e.g.
+    `'name ~ "widget"'`. Bash doesn't expose this; it's a 4.7 parity
+    gap for the agent's filtered-list workflows.
+    """
+    ws = workspace if workspace is not None else client.config.workspace
+    if not isinstance(ws, str) or not ws.strip():
+        raise ValueError(f"workspace must be a non-empty string, got {ws!r}")
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"sort": sort, "pagelen": pagelen}
+    if query is not None:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError(
+                f"query must be a non-empty, non-whitespace string when provided, "
+                f"got {query!r}"
+            )
+        q["q"] = query
+
+    out: list[dict[str, Any]] = []
+    for r in client.paginate(f"/repositories/{ws}", query=q):
+        out.append(r)
+        if len(out) >= count:
+            break
+    return out
+
+
+def repo_show(
+    client: BBClient, workspace: str, repo: str
+) -> dict[str, Any]:
+    """Fetch repository metadata: language, size, clone URLs, mainbranch,
+    privacy, etc."""
+    return client.get(repo_path(workspace, repo))
+
+
+# --- Branches ---
+
+
+def branches_list(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    count: int = 50,
+    sort: str = "-target.date",
+    query: str | None = None,
+) -> list[dict[str, Any]]:
+    """List branches in the repo, default sort is most-recently-updated
+    first (matches bash). `query` is a Bitbucket BBQL filter for
+    name-substring etc.; not exposed by bash."""
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"sort": sort, "pagelen": pagelen}
+    if query is not None:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError(
+                f"query must be a non-empty, non-whitespace string when provided, "
+                f"got {query!r}"
+            )
+        q["q"] = query
+
+    out: list[dict[str, Any]] = []
+    for br in client.paginate(
+        f"{repo_path(workspace, repo)}/refs/branches", query=q
+    ):
+        out.append(br)
+        if len(out) >= count:
+            break
+    return out
+
+
+def branch_show(
+    client: BBClient, workspace: str, repo: str, name: str
+) -> dict[str, Any]:
+    """Fetch a single branch by name. Not exposed by bash today — 4.7
+    parity gap. Useful for the agent's "does this branch exist?" lookup
+    before creating a PR.
+
+    The branch name is URL-encoded; `feat/widget` becomes `feat%2Fwidget`
+    in the request path so the slash isn't interpreted as a sub-resource.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            f"name must be a non-empty, non-whitespace string, got {name!r}"
+        )
+    # `quote` with no `safe=` URL-encodes `/` to `%2F`. Branch names like
+    # `feat/widget` would otherwise be interpreted as a sub-resource path
+    # by Bitbucket and 404.
+    from urllib.parse import quote as _quote
+    encoded = _quote(name.strip(), safe="")
+    return client.get(f"{repo_path(workspace, repo)}/refs/branches/{encoded}")
+
+
+# --- Variables (pipeline configuration) ---
+
+
+def vars_list(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """List pipeline configuration variables (key/value pairs, with a
+    `secured` flag that masks values for sensitive variables).
+
+    Bash truncates secured values to `********` in its display layer;
+    Python returns the raw dicts (which include `"value": null` for
+    secured entries — Bitbucket does NOT echo secured values). The
+    MCP agent surfaces the secured flag explicitly so callers don't
+    accidentally assume `null` means "unset".
+    """
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    out: list[dict[str, Any]] = []
+    for v in client.paginate(
+        f"{repo_path(workspace, repo)}/pipelines_config/variables/",
+        query={"pagelen": pagelen},
+    ):
+        out.append(v)
+        if len(out) >= count:
+            break
+    return out
+
+
+# --- Downloads (release artifacts) ---
+
+
+def downloads_list(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    count: int = 25,
+) -> list[dict[str, Any]]:
+    """List repository download artifacts (the Bitbucket "Downloads" tab
+    — release binaries, install bundles, etc.)."""
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    out: list[dict[str, Any]] = []
+    for d in client.paginate(
+        f"{repo_path(workspace, repo)}/downloads",
+        query={"pagelen": pagelen},
+    ):
+        out.append(d)
+        if len(out) >= count:
+            break
+    return out
+
+
+# --- Commits ---
+
+
+def commits_list(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    branch: str | None = None,
+    count: int = 10,
+) -> list[dict[str, Any]]:
+    """List recent commits.
+
+    With `branch=None`, lists across all branches (Bitbucket's
+    `/commits` endpoint).
+
+    With `branch="feat/widget"`, lists commits reachable from that
+    branch (`/commits/{branch}`). Branch names are URL-encoded for
+    the same slash-as-sub-resource reason as branch_show.
+
+    Not exposed by the bash CLI today — 4.7 parity gap. Useful for
+    the agent's "what shipped recently?" / "what's in this branch
+    that isn't in main?" workflows.
+    """
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+    if branch is not None and (not isinstance(branch, str) or not branch.strip()):
+        raise ValueError(
+            f"branch must be a non-empty, non-whitespace string when provided, "
+            f"got {branch!r}"
+        )
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    if branch is None:
+        path = f"{repo_path(workspace, repo)}/commits"
+    else:
+        from urllib.parse import quote as _quote
+        encoded = _quote(branch.strip(), safe="")
+        path = f"{repo_path(workspace, repo)}/commits/{encoded}"
+
+    out: list[dict[str, Any]] = []
+    for c in client.paginate(path, query={"pagelen": pagelen}):
+        out.append(c)
+        if len(out) >= count:
+            break
+    return out
