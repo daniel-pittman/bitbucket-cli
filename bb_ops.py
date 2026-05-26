@@ -382,6 +382,15 @@ def prs_list(
         raise ValueError(f"count must be a positive int, got {count!r}")
     if not isinstance(state, str) or not state:
         raise ValueError(f"state must be a non-empty string, got {state!r}")
+    # _KNOWN_PR_STATES is the boundary check. Without it, typos like
+    # state="OPENED", case bugs like state="open", and unsupported
+    # compound forms like state="OPEN,MERGED" would burn an API call
+    # before failing (Bitbucket returns 400 or empty results). For
+    # compound filtering use a `?q=` query via client.paginate directly.
+    if state not in _KNOWN_PR_STATES:
+        raise ValueError(
+            f"state must be one of {sorted(_KNOWN_PR_STATES)}, got {state!r}"
+        )
 
     pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
     query: dict[str, Any] = {"state": state, "pagelen": pagelen}
@@ -456,8 +465,13 @@ def pr_create(
         ("source_branch", source_branch),
         ("destination_branch", destination_branch),
     ):
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+        # Strip-check rather than truthiness so " " / "\n\t" don't slip
+        # through. A whitespace-only PR title is technically accepted by
+        # Bitbucket but visually meaningless in any PR list view.
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"{label} must be a non-empty, non-whitespace string, got {value!r}"
+            )
     if not isinstance(description, str):
         raise ValueError(
             f"description must be a string, got {type(description).__name__}"
@@ -558,13 +572,14 @@ def pr_merge(
         "close_source_branch": close_source_branch,
     }
     if message is not None:
-        # Symmetric with pr_comment_add's body validation: empty message
-        # would produce `"message": ""` in the payload, leading to an
-        # empty merge-commit subject line. Reject at the boundary.
-        if not isinstance(message, str) or not message:
+        # Symmetric with pr_comment_add's body validation: empty (or
+        # whitespace-only) message would produce a blank merge-commit
+        # subject line, visually empty in any `git log --oneline` view.
+        # Reject at the boundary.
+        if not isinstance(message, str) or not message.strip():
             raise ValueError(
-                f"message must be a non-empty string when provided, "
-                f"got {message!r}"
+                f"message must be a non-empty, non-whitespace string "
+                f"when provided, got {message!r}"
             )
         payload["message"] = message
     # Mirror bash's PUT verb (cmd_pr_merge uses bb_put). Bitbucket Cloud
@@ -651,8 +666,10 @@ def pr_comment_add(
     `{"content": {"raw": "<text>"}}`.
     """
     _validate_pr_id(pr_id)
-    if not isinstance(body, str) or not body:
-        raise ValueError(f"body must be a non-empty string, got {body!r}")
+    if not isinstance(body, str) or not body.strip():
+        raise ValueError(
+            f"body must be a non-empty, non-whitespace string, got {body!r}"
+        )
     return client.post(
         f"{_prs_root(workspace, repo)}/{pr_id}/comments",
         json_body={"content": {"raw": body}},

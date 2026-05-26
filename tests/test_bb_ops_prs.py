@@ -143,7 +143,10 @@ class TestPrsList:
 
     def test_rejects_non_positive_count(self) -> None:
         opener = _CaptureOpener([])
-        for bad in (0, -1, "ten"):
+        # True/False included: bool is a subclass of int but its URL
+        # stringification is "True"/"False" — symmetric with the bool
+        # rejection in TestPrActivity / TestPrCommentsList / pr_id checks.
+        for bad in (0, -1, True, False, "ten"):
             with pytest.raises(ValueError, match="count"):
                 bb_ops.prs_list(
                     _client(opener),
@@ -157,6 +160,21 @@ class TestPrsList:
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="state"):
             bb_ops.prs_list(_client(opener), "acme", "widget-service", state="")
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_state", ["OPENED", "open", "OPEN,MERGED", "INVALID"])
+    def test_rejects_unknown_state(self, bad_state: str) -> None:
+        """A typo like OPENED, a case bug like 'open', or the
+        comma-separated compound form (which Bitbucket does NOT accept
+        on the simple ?state= filter) all need to fail at the boundary
+        — otherwise the API call burns a quota slot returning empty
+        results or a 400. _KNOWN_PR_STATES is the symmetric guard to
+        pr_merge's strategy validation."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="state must be one of"):
+            bb_ops.prs_list(
+                _client(opener), "acme", "widget-service", state=bad_state
+            )
         assert opener.calls == []
 
 
@@ -339,9 +357,17 @@ class TestPrCreate:
     @pytest.mark.parametrize(
         "field,value",
         [
+            # Empty string AND whitespace-only must both reject for every
+            # required string field. Without .strip(), whitespace-only
+            # values create degenerate PRs with visually-blank fields
+            # in any list view.
             ("title", ""),
+            ("title", "   "),
+            ("title", "\n\t"),
             ("source_branch", ""),
+            ("source_branch", "   "),
             ("destination_branch", ""),
+            ("destination_branch", "\t"),
         ],
     )
     def test_rejects_empty_required_fields(self, field: str, value: str) -> None:
@@ -531,14 +557,15 @@ class TestPrMerge:
             )
         assert opener.calls == []
 
-    def test_rejects_empty_message(self) -> None:
-        # Symmetric with pr_comment_add: an empty message would produce
-        # `"message": ""` in the merge payload, leaving the merge commit
-        # subject empty.
+    @pytest.mark.parametrize("bad_message", ["", "   ", "\n\t"])
+    def test_rejects_empty_or_whitespace_message(self, bad_message: str) -> None:
+        # Symmetric with pr_comment_add: an empty (or whitespace-only)
+        # message would produce a blank merge-commit subject line,
+        # visually empty in any `git log --oneline` view.
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="message"):
             bb_ops.pr_merge(
-                _client(opener), "acme", "widget-service", 7, message=""
+                _client(opener), "acme", "widget-service", 7, message=bad_message
             )
         assert opener.calls == []
 
@@ -625,12 +652,48 @@ class TestPrDiff:
         assert result == diff_body
         assert opener.calls[0]["url"] == _prs_url() + "/42/diff"
         assert opener.calls[0]["method"] == "GET"
+        # The first hop must carry Authorization (we own the request to
+        # api.bitbucket.org). A regression that wired pr_diff to a
+        # no-auth path would silently break authenticated diff fetches.
+        assert opener.calls[0]["headers"]["Authorization"].startswith("Basic ")
 
     def test_invalid_pr_id(self) -> None:
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="pr_id"):
             bb_ops.pr_diff(_client(opener), "acme", "widget-service", 0)
         assert opener.calls == []
+
+    def test_follows_cross_host_redirect_and_strips_auth(self) -> None:
+        """If Bitbucket ever introduces a redirect on the diff endpoint
+        (the current behaviour is direct 200), the cross-host-auth-strip
+        protection from fetch_redirected_text must apply. A regression
+        that wired pr_diff to plain client.get would 5xx on any redirect
+        (default opener refuses 3xx) — different from the bash-side
+        failure mode but equally surprising. Pin the safe behaviour here
+        rather than only in test_bb_api.
+
+        Models the same shape as the pipeline_logs S3-redirect test."""
+        remote_url = "https://diff-cache.example.com/acme/widget-service/42.diff?sig=abc"
+        redirect = urllib.error.HTTPError(
+            url=DEFAULT_API_BASE + "/repositories/acme/widget-service/pullrequests/42/diff",
+            code=307,
+            msg="Temporary Redirect",
+            hdrs={"Location": remote_url},  # type: ignore[arg-type]
+            fp=__import__("io").BytesIO(b""),
+        )
+        opener = _CaptureOpener(
+            [
+                redirect,
+                b"diff body from remote\n",
+            ]
+        )
+        result = bb_ops.pr_diff(_client(opener), "acme", "widget-service", 42)
+        assert result == "diff body from remote\n"
+        assert len(opener.calls) == 2
+        # Second hop must NOT carry the Bitbucket credential.
+        assert "Authorization" not in opener.calls[1]["headers"], (
+            "Bitbucket Basic auth leaked to the diff-cache host"
+        )
 
 
 # ===========================================================================
@@ -658,6 +721,19 @@ class TestPrCommentsList:
         assert url.startswith(_prs_url() + "/42/comments?")
         assert "pagelen=100" in url
 
+    def test_rejects_non_positive_count(self) -> None:
+        opener = _CaptureOpener([])
+        for bad in (0, -1, True, False, "ten"):
+            with pytest.raises(ValueError, match="count"):
+                bb_ops.pr_comments_list(
+                    _client(opener),
+                    "acme",
+                    "widget-service",
+                    42,
+                    count=bad,  # type: ignore[arg-type]
+                )
+        assert opener.calls == []
+
 
 class TestPrCommentAdd:
     def test_posts_comment_body_in_content_raw(self) -> None:
@@ -672,11 +748,12 @@ class TestPrCommentAdd:
         # Bitbucket's contract: {"content": {"raw": "<text>"}}.
         assert call["body"] == {"content": {"raw": "Looks good."}}
 
-    def test_rejects_empty_body(self) -> None:
+    @pytest.mark.parametrize("bad_body", ["", "   ", "\n\t"])
+    def test_rejects_empty_or_whitespace_body(self, bad_body: str) -> None:
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="body"):
             bb_ops.pr_comment_add(
-                _client(opener), "acme", "widget-service", 42, ""
+                _client(opener), "acme", "widget-service", 42, bad_body
             )
         assert opener.calls == []
 
