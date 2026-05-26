@@ -32,6 +32,19 @@ from bb_api import BBApiError, BBClient, repo_path
 # preserved.
 _BITBUCKET_MAX_PAGELEN = 100
 
+
+def _is_positive_int(value: Any) -> bool:
+    """True iff `value` is an int (NOT a bool) >= 1.
+
+    `bool` is a subclass of `int` in Python, so `isinstance(True, int)` is
+    True and `True < 1` is False — meaning a bare `isinstance(x, int) and
+    x >= 1` check happily accepts `True` as `1`. That then propagates
+    through f-string interpolation into URLs as the literal `"True"`, and
+    through `urlencode({"pagelen": True})` as `"pagelen=True"` — both
+    failure modes the boundary validator exists to prevent.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
 # When resolving a build_number -> uuid, we walk the pipelines list sorted
 # by most-recent-first. This cap bounds how far back we look before giving
 # up. 2000 = 20 pages of 100 = "any pipeline triggered in the last few
@@ -103,7 +116,7 @@ def _resolve_pipeline_uuid(
     window. Distinct from a network/API failure so callers can render
     "no such pipeline #N" naturally.
     """
-    if not isinstance(build_number, int) or build_number < 1:
+    if not _is_positive_int(build_number):
         raise ValueError(f"build_number must be a positive int, got {build_number!r}")
 
     seen = 0
@@ -139,7 +152,11 @@ def _resolve_step_uuid(
     MCP step-logs tool wraps the log payload in its own response shape
     and can surface the name there.
     """
-    if not isinstance(step_index, int) or step_index < 0:
+    if (
+        not isinstance(step_index, int)
+        or isinstance(step_index, bool)
+        or step_index < 0
+    ):
         raise ValueError(f"step_index must be a non-negative int, got {step_index!r}")
 
     steps = _pipeline_steps_by_uuid(client, workspace, repo, pipeline_uuid)
@@ -175,7 +192,7 @@ def pipelines_list(
     Bitbucket's `target.ref_name` query (the API supports this without a
     `?q=` filter shape).
     """
-    if not isinstance(count, int) or count < 1:
+    if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
 
     pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
@@ -323,10 +340,13 @@ def pipeline_logs(
 # server's 400.
 _VALID_MERGE_STRATEGIES = frozenset({"merge_commit", "squash", "fast_forward"})
 
-# PR `state` filter values the Bitbucket API accepts. Not validated as
-# strictly because Bitbucket also accepts comma-separated combinations
-# (e.g. "OPEN,MERGED"); the caller is responsible for using one of these
-# spellings or a documented composition.
+# PR `state` filter values the Bitbucket API accepts on the simple
+# `?state=` query parameter. For multi-state filtering, Bitbucket requires
+# the BBQL `q` parameter (e.g. `?q=state="OPEN" OR state="MERGED"`); the
+# `?state=OPEN,MERGED` shape returns 400 / empty results. We validate the
+# scalar form against this set when prs_list is called with `state=`;
+# callers needing compound filtering should construct a `q=` query and
+# call `client.paginate` directly.
 _KNOWN_PR_STATES = frozenset({"OPEN", "MERGED", "DECLINED", "SUPERSEDED"})
 
 
@@ -339,8 +359,12 @@ def _validate_pr_id(pr_id: int) -> None:
     """PR IDs are positive integers. The bash script passes them as bare
     strings and lets Bitbucket reject malformed values; we fail at the
     boundary so the MCP tool surfaces a clear error before any network
-    call burns API budget."""
-    if not isinstance(pr_id, int) or pr_id < 1:
+    call burns API budget.
+
+    Rejects bool explicitly (`True`/`False` are subclass-of-int in Python
+    but stringify to `"True"`/`"False"` in URLs, not `"1"`/`"0"`).
+    """
+    if not _is_positive_int(pr_id):
         raise ValueError(f"pr_id must be a positive int, got {pr_id!r}")
 
 
@@ -354,7 +378,7 @@ def prs_list(
 ) -> list[dict[str, Any]]:
     """List pull requests filtered by state. Defaults match bash:
     state=OPEN, count=25. Walks pages as needed to honour `count`."""
-    if not isinstance(count, int) or count < 1:
+    if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
     if not isinstance(state, str) or not state:
         raise ValueError(f"state must be a non-empty string, got {state!r}")
@@ -391,7 +415,7 @@ def pr_activity(
     surfaced separately as an op so the MCP agent can render its own view
     of the activity timeline."""
     _validate_pr_id(pr_id)
-    if not isinstance(count, int) or count < 1:
+    if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
     pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
     out: list[dict[str, Any]] = []
@@ -434,6 +458,14 @@ def pr_create(
     ):
         if not isinstance(value, str) or not value:
             raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+    if not isinstance(description, str):
+        raise ValueError(
+            f"description must be a string, got {type(description).__name__}"
+        )
+    if not isinstance(close_source_branch, bool):
+        raise ValueError(
+            f"close_source_branch must be a bool, got {type(close_source_branch).__name__}"
+        )
 
     payload: dict[str, Any] = {
         "title": title,
@@ -441,13 +473,21 @@ def pr_create(
         "destination": {"branch": {"name": destination_branch}},
         "close_source_branch": close_source_branch,
     }
-    if description:
-        # Bash includes an empty description string ALWAYS; Python omits
-        # it when empty so the API payload stays minimal. Parity item:
-        # bash should align on omission too. The Bitbucket API treats
-        # both shapes equivalently for the description field.
+    # Bash includes an empty description string ALWAYS; Python omits
+    # when the description is empty or whitespace-only so the API payload
+    # stays meaningful. Parity item: bash should align on omission.
+    if description.strip():
         payload["description"] = description
     if reviewers is not None:
+        # A bare string is technically an Iterable[str] (yields characters),
+        # which would silently produce `[{"uuid":"a"}, {"uuid":"l"}, ...]`
+        # from `reviewers="alice-uuid"`. Reject explicitly so the typo
+        # fails locally rather than as a 400 from Bitbucket.
+        if isinstance(reviewers, str):
+            raise ValueError(
+                f"reviewers must be a list/tuple of uuids, not a bare string. "
+                f"Got {reviewers!r}; did you mean [{reviewers!r}]?"
+            )
         normalised: list[dict[str, str]] = []
         for uuid in reviewers:
             if not isinstance(uuid, str) or not uuid:
@@ -508,15 +548,23 @@ def pr_merge(
             f"strategy must be one of {sorted(_VALID_MERGE_STRATEGIES)}, "
             f"got {strategy!r}"
         )
+    if not isinstance(close_source_branch, bool):
+        raise ValueError(
+            f"close_source_branch must be a bool, got {type(close_source_branch).__name__}"
+        )
     payload: dict[str, Any] = {
         "type": "pullrequest",
         "merge_strategy": strategy,
         "close_source_branch": close_source_branch,
     }
     if message is not None:
-        if not isinstance(message, str):
+        # Symmetric with pr_comment_add's body validation: empty message
+        # would produce `"message": ""` in the payload, leading to an
+        # empty merge-commit subject line. Reject at the boundary.
+        if not isinstance(message, str) or not message:
             raise ValueError(
-                f"message must be a string, got {type(message).__name__}"
+                f"message must be a non-empty string when provided, "
+                f"got {message!r}"
             )
         payload["message"] = message
     # Mirror bash's PUT verb (cmd_pr_merge uses bb_put). Bitbucket Cloud
@@ -550,10 +598,13 @@ def pr_diff(
     """Fetch the unified diff text for a pull request.
 
     Bitbucket returns plain text (not JSON), so we route through
-    `fetch_redirected_text`. The same cross-host-auth-strip protection
-    applies if Bitbucket ever introduces a redirect on this endpoint
-    (the bash equivalent uses `curl -sf` without `-L`, so bash would
-    fail visibly in that case — Python continues to work safely).
+    `fetch_redirected_text`. Today the diff endpoint does NOT redirect,
+    so this is functionally equivalent to a direct GET. If Bitbucket
+    ever introduces a redirect, the cross-host-auth-strip protection
+    kicks in — but the returned body would then be whatever the redirect
+    target serves (a behavioural divergence from bash, which uses
+    `curl -sf` without `-L` and would fail visibly on any 3xx). Until
+    that happens, the two surfaces produce identical text.
     """
     _validate_pr_id(pr_id)
     return client.fetch_redirected_text(
@@ -572,7 +623,7 @@ def pr_comments_list(
 ) -> list[dict[str, Any]]:
     """List comments on a pull request."""
     _validate_pr_id(pr_id)
-    if not isinstance(count, int) or count < 1:
+    if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
     pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
     out: list[dict[str, Any]] = []

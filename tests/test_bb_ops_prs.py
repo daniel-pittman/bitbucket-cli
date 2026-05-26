@@ -175,7 +175,11 @@ class TestPrShow:
 
     def test_rejects_invalid_pr_id(self) -> None:
         opener = _CaptureOpener([])
-        for bad in (0, -5, "42", 1.5, None):
+        # True/False included explicitly: bool is a subclass of int in
+        # Python, so a naive isinstance(x, int) check would accept them
+        # and stringify them in URLs as "True"/"False" — the regression
+        # this validator now defends against.
+        for bad in (0, -5, "42", 1.5, None, True, False):
             with pytest.raises(ValueError, match="pr_id"):
                 bb_ops.pr_show(
                     _client(opener), "acme", "widget-service", bad  # type: ignore[arg-type]
@@ -197,6 +201,43 @@ class TestPrActivity:
         url = opener.calls[0]["url"]
         assert url.startswith(_prs_url() + "/42/activity?")
         assert "pagelen=50" in url
+
+    def test_count_walks_pages(self) -> None:
+        # Same paginate-with-count semantics as prs_list; verify the
+        # behaviour symmetrically.
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [{"i": i} for i in range(100)],
+                    "next": _prs_url() + "/42/activity?page=2",
+                },
+                {"values": [{"i": i} for i in range(100, 150)]},
+            ]
+        )
+        result = bb_ops.pr_activity(
+            _client(opener), "acme", "widget-service", 42, count=150
+        )
+        assert len(result) == 150
+        assert "pagelen=100" in opener.calls[0]["url"]
+
+    def test_rejects_non_positive_count(self) -> None:
+        opener = _CaptureOpener([])
+        for bad in (0, -1, True, False, "ten"):
+            with pytest.raises(ValueError, match="count"):
+                bb_ops.pr_activity(
+                    _client(opener),
+                    "acme",
+                    "widget-service",
+                    42,
+                    count=bad,  # type: ignore[arg-type]
+                )
+        assert opener.calls == []
+
+    def test_rejects_invalid_pr_id(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="pr_id"):
+            bb_ops.pr_activity(_client(opener), "acme", "widget-service", 0)
+        assert opener.calls == []
 
 
 # ===========================================================================
@@ -328,6 +369,62 @@ class TestPrCreate:
             )
         assert opener.calls == []
 
+    def test_rejects_bare_string_reviewers(self) -> None:
+        """A bare string is technically an Iterable[str] (yields chars).
+        Without the early-reject, `reviewers="alice-uuid"` would silently
+        produce `[{"uuid":"a"}, {"uuid":"l"}, {"uuid":"i"}, ...]`."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="reviewers must be a list"):
+            bb_ops.pr_create(
+                _client(opener),
+                "acme",
+                "widget-service",
+                title="t",
+                source_branch="s",
+                reviewers="alice-uuid",  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_string_description(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="description"):
+            bb_ops.pr_create(
+                _client(opener),
+                "acme",
+                "widget-service",
+                title="t",
+                source_branch="s",
+                description={"foo": "bar"},  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_bool_close_source_branch(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="close_source_branch"):
+            bb_ops.pr_create(
+                _client(opener),
+                "acme",
+                "widget-service",
+                title="t",
+                source_branch="s",
+                close_source_branch="yes",  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    def test_whitespace_only_description_omitted(self) -> None:
+        opener = _CaptureOpener([_make_pr(13)])
+        bb_ops.pr_create(
+            _client(opener),
+            "acme",
+            "widget-service",
+            title="t",
+            source_branch="s",
+            description="   \n\t  ",
+        )
+        # Whitespace-only descriptions don't carry information; omit
+        # rather than ship a meaningless empty-ish field.
+        assert "description" not in opener.calls[0]["body"]
+
 
 # ===========================================================================
 # pr_approve / pr_unapprove
@@ -434,6 +531,29 @@ class TestPrMerge:
             )
         assert opener.calls == []
 
+    def test_rejects_empty_message(self) -> None:
+        # Symmetric with pr_comment_add: an empty message would produce
+        # `"message": ""` in the merge payload, leaving the merge commit
+        # subject empty.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="message"):
+            bb_ops.pr_merge(
+                _client(opener), "acme", "widget-service", 7, message=""
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_bool_close_source_branch(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="close_source_branch"):
+            bb_ops.pr_merge(
+                _client(opener),
+                "acme",
+                "widget-service",
+                7,
+                close_source_branch="yes",  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
 
 # ===========================================================================
 # pr_decline
@@ -448,6 +568,43 @@ class TestPrDecline:
         assert call["method"] == "POST"
         assert call["url"] == _prs_url() + "/7/decline"
         assert call["body"] is None
+
+
+# ===========================================================================
+# Boundary-validation symmetry — every PR-id-taking op rejects bad IDs
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "fn,extra_args",
+    [
+        (bb_ops.pr_approve, ()),
+        (bb_ops.pr_unapprove, ()),
+        (bb_ops.pr_decline, ()),
+        (bb_ops.pr_comments_list, ()),
+        (bb_ops.pr_comment_add, ("body",)),
+        # pr_merge has required strategy default; works with no extra args.
+        (bb_ops.pr_merge, ()),
+        (bb_ops.pr_diff, ()),
+        (bb_ops.pr_show, ()),
+        (bb_ops.pr_activity, ()),
+    ],
+)
+def test_every_pr_op_rejects_bad_pr_id(fn: Any, extra_args: tuple[Any, ...]) -> None:
+    """If any future refactor removes `_validate_pr_id(pr_id)` from a
+    function, this catches it. Without this matrix the validator was
+    only directly tested on pr_show / pr_diff."""
+    opener = _CaptureOpener([])
+    for bad in (0, -5, True, False, "42", 1.5, None):
+        with pytest.raises(ValueError, match="pr_id"):
+            fn(
+                _client(opener),
+                "acme",
+                "widget-service",
+                bad,
+                *extra_args,
+            )
+    assert opener.calls == []
 
 
 # ===========================================================================
