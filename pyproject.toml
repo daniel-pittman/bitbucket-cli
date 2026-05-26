@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitbucket-cli"
+description = "Bitbucket Cloud CLI (bb) and MCP server for agent-driven Bitbucket workflows."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dynamic = ["version"]
+authors = [
+    { name = "Daniel Pittman" },
+]
+keywords = ["bitbucket", "cli", "mcp", "pipelines", "pull-requests", "developer-tools"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control",
+]
+
+# Runtime dependencies are intentionally minimal. The MCP server self-bootstraps
+# a venv at /tmp/bbenv on first run and installs `mcp` there; consumers who
+# install via `pip install -e .` get the same package added explicitly via the
+# `mcp` extra. The transport layer (bb_api) is stdlib-only.
+dependencies = []
+
+[project.optional-dependencies]
+# Pull in the MCP runtime when installing for the MCP server use case:
+#   pip install -e ".[mcp]"
+mcp = ["mcp >= 1.0"]
+
+# Test-time dependencies.
+test = ["pytest >= 7"]
+
+[project.urls]
+Homepage = "https://github.com/daniel-pittman/bitbucket-cli"
+Repository = "https://github.com/daniel-pittman/bitbucket-cli"
+Issues = "https://github.com/daniel-pittman/bitbucket-cli/issues"
+
+[tool.setuptools]
+# Flat module layout — same shape as zenhub-cli. The bash `bb` script lives
+# alongside; it is not a Python module.
+py-modules = ["bb_api"]
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra: short summary of all non-pass outcomes
+# --strict-markers: typo-proof @pytest.mark usage
+addopts = "-ra --strict-markers"
