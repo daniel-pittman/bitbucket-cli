@@ -619,11 +619,12 @@ class TestResolveStepUuid:
         opener = _CaptureOpener(
             [{"values": [_make_step("build", "s1"), _make_step("test", "s2")]}]
         )
-        uuid, name = bb_ops._resolve_step_uuid(
+        uuid = bb_ops._resolve_step_uuid(
             _client(opener), "acme", "widget-service", "pipe-uuid", 1
         )
+        # Returns just the uuid — callers that want the name fetch
+        # steps separately via pipeline_steps().
         assert uuid == "s2"
-        assert name == "test"
 
     def test_index_out_of_range_raises(self) -> None:
         opener = _CaptureOpener(

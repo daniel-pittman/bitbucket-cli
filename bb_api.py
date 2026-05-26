@@ -493,6 +493,15 @@ class BBClient:
         method is to follow Bitbucket -> S3); same-host hops keep the
         auth header in case Bitbucket itself ever redirects internally.
 
+        Symmetry with bash: `bb logs` uses `curl -sfL -u user:tok`, and
+        curl's `--location` does NOT resend `-u` credentials on a
+        cross-host redirect (only `--location-trusted` would, or a
+        custom `-H Authorization` header). So the bash side is also
+        safe today. We don't rely on that behaviour — the MCP server
+        may later need header-based auth where the curl analogue would
+        leak, and the explicit Python check is the symmetric, future-
+        proof version.
+
         Returns the body of the final 200 response as a decoded string.
         Raises BBApiError on too-many-redirects, missing Location header,
         non-3xx HTTP errors, or transport failures.
@@ -500,7 +509,10 @@ class BBClient:
         url = self.config.api_base + path
         # The first request carries Bitbucket auth. We rebuild headers on
         # each hop so a cross-host redirect can drop the credential.
-        bitbucket_host = urllib.parse.urlparse(self.config.api_base).netloc
+        # Hostname compared case-insensitively per RFC 3986 §3.2.2 so
+        # `API.bitbucket.org` doesn't trigger a needless auth-strip on a
+        # capitalisation-only difference.
+        bitbucket_host = urllib.parse.urlparse(self.config.api_base).netloc.lower()
         send_auth = True
 
         for hop in range(max_redirects + 1):
@@ -518,27 +530,36 @@ class BBClient:
                     body = resp.read()
                     return body.decode("utf-8", errors="replace")
             except urllib.error.HTTPError as e:
-                if e.code not in (301, 302, 303, 307, 308):
-                    body_text = ""
+                try:
+                    if e.code not in (301, 302, 303, 307, 308):
+                        body_text = ""
+                        try:
+                            body_text = e.read().decode("utf-8", errors="replace")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise BBApiError(e.code, url, body_text) from e
+                    # 3xx: extract Location, follow it. urllib's HTTPError
+                    # exposes the response headers via e.headers.
+                    location = e.headers.get("Location") if e.headers else None
+                    if not location:
+                        raise BBApiError(
+                            e.code, url, "redirect response missing Location header"
+                        ) from e
+                    new_url = urllib.parse.urljoin(url, location)
+                    new_host = urllib.parse.urlparse(new_url).netloc.lower()
+                    # Strip auth on any cross-host hop. Once stripped, keep it
+                    # stripped for all subsequent hops in this chain.
+                    if new_host != bitbucket_host:
+                        send_auth = False
+                    url = new_url
+                finally:
+                    # Explicit close so the underlying socket is released
+                    # immediately on the redirect path; GC would do this
+                    # eventually but explicit-is-better under load.
                     try:
-                        body_text = e.read().decode("utf-8", errors="replace")
+                        e.close()
                     except Exception:  # noqa: BLE001
                         pass
-                    raise BBApiError(e.code, url, body_text) from e
-                # 3xx: extract Location, follow it. urllib's HTTPError
-                # exposes the response headers via e.headers.
-                location = e.headers.get("Location") if e.headers else None
-                if not location:
-                    raise BBApiError(
-                        e.code, url, "redirect response missing Location header"
-                    ) from e
-                new_url = urllib.parse.urljoin(url, location)
-                new_host = urllib.parse.urlparse(new_url).netloc
-                # Strip auth on any cross-host hop. Once stripped, keep it
-                # stripped for all subsequent hops in this chain.
-                if new_host != bitbucket_host:
-                    send_auth = False
-                url = new_url
             except urllib.error.URLError as e:
                 raise BBApiError(0, url, f"network error: {e.reason}") from e
 

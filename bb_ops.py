@@ -57,7 +57,7 @@ def _wrap_uuid(uuid: str) -> str:
     inner = uuid.strip()
     if inner.startswith("{") and inner.endswith("}"):
         inner = inner[1:-1]
-    return f"%7B{quote(inner, safe='-')}%7D"
+    return f"%7B{quote(inner)}%7D"
 
 
 def _pipelines_root(workspace: str, repo: str) -> str:
@@ -127,24 +127,28 @@ def _resolve_step_uuid(
     repo: str,
     pipeline_uuid: str,
     step_index: int,
-) -> tuple[str, str]:
-    """Return (step_uuid, step_name) for the step at the given 0-based index.
+) -> str:
+    """Return the step UUID for the step at the given 0-based index.
 
     The bash script's `bb logs` uses the same 0-based indexing into the
     steps list; mirror that contract so the user-facing index numbers
     match across both surfaces.
+
+    Returns just the uuid (not the name) — callers that need the name
+    should fetch the steps list themselves via `pipeline_steps()`. The
+    MCP step-logs tool wraps the log payload in its own response shape
+    and can surface the name there.
     """
     if not isinstance(step_index, int) or step_index < 0:
         raise ValueError(f"step_index must be a non-negative int, got {step_index!r}")
 
-    steps = pipeline_steps_raw(client, workspace, repo, pipeline_uuid)
+    steps = _pipeline_steps_by_uuid(client, workspace, repo, pipeline_uuid)
     if step_index >= len(steps):
         raise BBOpNotFound(
             f"step index {step_index} out of range "
             f"(pipeline has {len(steps)} step{'s' if len(steps) != 1 else ''})"
         )
-    step = steps[step_index]
-    return _strip_uuid_braces(step.get("uuid")), step.get("name", "")
+    return _strip_uuid_braces(steps[step_index].get("uuid"))
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +199,7 @@ def pipeline_show(
     return client.get(f"{_pipelines_root(workspace, repo)}{_wrap_uuid(uuid)}")
 
 
-def pipeline_steps_raw(
+def _pipeline_steps_by_uuid(
     client: BBClient, workspace: str, repo: str, pipeline_uuid: str
 ) -> list[dict[str, Any]]:
     """Internal: list steps when you already have a pipeline UUID. Used by
@@ -211,7 +215,7 @@ def pipeline_steps(
 ) -> list[dict[str, Any]]:
     """List the steps of a pipeline by build_number."""
     uuid = _resolve_pipeline_uuid(client, workspace, repo, build_number)
-    return pipeline_steps_raw(client, workspace, repo, uuid)
+    return _pipeline_steps_by_uuid(client, workspace, repo, uuid)
 
 
 def pipeline_trigger(
@@ -300,7 +304,7 @@ def pipeline_logs(
     no timeout cap.
     """
     pipeline_uuid = _resolve_pipeline_uuid(client, workspace, repo, build_number)
-    step_uuid, _step_name = _resolve_step_uuid(
+    step_uuid = _resolve_step_uuid(
         client, workspace, repo, pipeline_uuid, step_index
     )
     path = (
