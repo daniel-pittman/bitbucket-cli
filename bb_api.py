@@ -460,6 +460,92 @@ class BBClient:
     def delete(self, path: str, *, timeout: float | None = None) -> Any:
         return self._request("DELETE", path, timeout=timeout)
 
+    def fetch_redirected_text(
+        self,
+        path: str,
+        *,
+        max_redirects: int = 5,
+        timeout: float | None = None,
+    ) -> str:
+        """Fetch raw text from an endpoint that may return a 3xx redirect
+        to an external host (e.g. pipeline-log download → S3 signed URL).
+
+        Why this exists alongside the regular `get` path:
+
+          * The default opener refuses 3xx (see _NoRedirectHandler). The
+            log endpoint at /pipelines/{uuid}/steps/{uuid}/log returns
+            either an inline log body (200) OR a 307 to a signed S3 URL.
+            The 307 case has to be followed to retrieve the log.
+
+          * We must NEVER send the Bitbucket `Authorization` header to S3.
+            The signed URL has its own auth via the `Signature` query
+            parameter; S3 will reject the request if Basic auth is also
+            present, and even when it didn't, sending the credential to
+            an arbitrary host is a credential-leak.
+
+          * The log body is plain text, not JSON. The regular `get` path
+            assumes JSON.
+
+        Implementation: open with the default opener (refuses redirects);
+        on a 3xx HTTPError, extract `Location`, build a fresh Request
+        WITHOUT Authorization, and follow up to `max_redirects` hops.
+        Cross-host hops are always allowed (the whole point of this
+        method is to follow Bitbucket -> S3); same-host hops keep the
+        auth header in case Bitbucket itself ever redirects internally.
+
+        Returns the body of the final 200 response as a decoded string.
+        Raises BBApiError on too-many-redirects, missing Location header,
+        non-3xx HTTP errors, or transport failures.
+        """
+        url = self.config.api_base + path
+        # The first request carries Bitbucket auth. We rebuild headers on
+        # each hop so a cross-host redirect can drop the credential.
+        bitbucket_host = urllib.parse.urlparse(self.config.api_base).netloc
+        send_auth = True
+
+        for hop in range(max_redirects + 1):
+            headers = {
+                "Accept": "*/*",
+                "User-Agent": "bb-mcp/1.0 (+https://github.com/daniel-pittman/bitbucket-cli)",
+            }
+            if send_auth:
+                headers["Authorization"] = self._auth_header
+
+            req = urllib.request.Request(url, method="GET", headers=headers)
+            effective_timeout = timeout if timeout is not None else self._default_timeout
+            try:
+                with self._opener.open(req, timeout=effective_timeout) as resp:
+                    body = resp.read()
+                    return body.decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                if e.code not in (301, 302, 303, 307, 308):
+                    body_text = ""
+                    try:
+                        body_text = e.read().decode("utf-8", errors="replace")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise BBApiError(e.code, url, body_text) from e
+                # 3xx: extract Location, follow it. urllib's HTTPError
+                # exposes the response headers via e.headers.
+                location = e.headers.get("Location") if e.headers else None
+                if not location:
+                    raise BBApiError(
+                        e.code, url, "redirect response missing Location header"
+                    ) from e
+                new_url = urllib.parse.urljoin(url, location)
+                new_host = urllib.parse.urlparse(new_url).netloc
+                # Strip auth on any cross-host hop. Once stripped, keep it
+                # stripped for all subsequent hops in this chain.
+                if new_host != bitbucket_host:
+                    send_auth = False
+                url = new_url
+            except urllib.error.URLError as e:
+                raise BBApiError(0, url, f"network error: {e.reason}") from e
+
+        raise BBApiError(
+            0, url, f"redirect chain exceeded {max_redirects} hops"
+        )
+
     def paginate(
         self,
         path: str,
