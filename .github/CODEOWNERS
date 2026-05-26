@@ -15,9 +15,20 @@
 # Workflow and CI configuration — the most security-sensitive paths.
 /.github/         @daniel-pittman
 
-# Core source — the bash CLI script.
-# Changes here can affect runtime behaviour or surface secrets.
+# Core source — the bash CLI script and the parallel Python implementation
+# the MCP server uses. Changes to any of these can affect runtime behaviour
+# or surface secrets. The bash script and the Python modules are PARALLEL
+# implementations of the same Bitbucket REST contract; review of one often
+# implies review of the other (see CONTRIBUTING.md for the parity rule).
 /bb               @daniel-pittman
+/bb_api.py        @daniel-pittman
+/bb_ops.py        @daniel-pittman
+/git_ops.py       @daniel-pittman
+/mcp_server.py    @daniel-pittman
 
 # Release versioning. A `VERSION` bump corresponds 1:1 with a release tag.
 /VERSION          @daniel-pittman
+
+# Packaging + agent definition.
+/pyproject.toml   @daniel-pittman
+/agents/          @daniel-pittman
