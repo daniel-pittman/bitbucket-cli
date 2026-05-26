@@ -554,8 +554,10 @@ class BBClient:
                     url = new_url
                 finally:
                     # Explicit close so the underlying socket is released
-                    # immediately on the redirect path; GC would do this
-                    # eventually but explicit-is-better under load.
+                    # immediately on every HTTPError path (both the 3xx
+                    # redirect-extract branch and the non-3xx error-with-
+                    # body branch). GC would do this eventually but
+                    # explicit-is-better under load.
                     try:
                         e.close()
                     except Exception:  # noqa: BLE001
