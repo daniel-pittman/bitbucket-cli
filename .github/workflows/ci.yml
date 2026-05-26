@@ -1,4 +1,4 @@
-# Continuous integration: bash syntax + tooling sanity.
+# Continuous integration: bash syntax + Python tests.
 #
 # This workflow needs NO secrets and is safe to run on every push and PR,
 # including PRs from forks. The secret-sensitive Claude review workflows are
@@ -17,6 +17,16 @@ permissions:
 jobs:
   syntax:
     runs-on: ubuntu-latest
+    strategy:
+      # Enforce the Python compatibility floor advertised in pyproject.toml
+      # (requires-python = ">=3.10"). 3.10 is the floor because bb_api uses
+      # PEP 604 union syntax (`X | None`) and PEP 585 builtin generics
+      # (`list[str]`) as runtime-resolved annotations; both are 3.10 features.
+      # 3.12 catches removed-feature regressions. fail-fast: false so a
+      # problem in one version doesn't mask problems in others.
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       # SHA-pinned actions/checkout v4.2.2
       - name: Check out the repository
@@ -36,3 +46,22 @@ jobs:
           command -v curl >/dev/null || { echo "curl missing"; exit 1; }
           bash --version | head -1
           jq --version
+
+      # SHA-pinned actions/setup-python v5.3.0
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Python syntax check
+        run: python -m py_compile bb_api.py
+
+      # Install pytest only. The MCP server's heavy dependencies (mcp) are
+      # exercised at runtime, not here — the unit tests mock the network and
+      # the MCP transport entirely, so pulling them into CI would just slow
+      # the matrix down for no signal.
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v
