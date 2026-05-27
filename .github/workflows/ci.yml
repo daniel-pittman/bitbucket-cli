@@ -54,7 +54,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Python syntax check
-        run: python -m py_compile bb_api.py bb_ops.py
+        run: python -m py_compile bb_api.py bb_ops.py git_ops.py
 
       # Install pytest only. The MCP server's heavy dependencies (mcp) are
       # exercised at runtime, not here — the unit tests mock the network and
