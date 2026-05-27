@@ -58,7 +58,22 @@ class _MissingGitRunner:
 
     @staticmethod
     def run(*_args: Any, **_kwargs: Any) -> Any:
-        raise FileNotFoundError("[Errno 2] No such file or directory: 'git'")
+        e = FileNotFoundError("[Errno 2] No such file or directory: 'git'")
+        e.filename = "git"
+        raise e
+
+
+class _MissingCwdRunner:
+    """Stand-in that raises FileNotFoundError with the cwd as the
+    filename — simulates `path=/no/such/dir` passed to a git wrapper."""
+
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+
+    def run(self, *_args: Any, **kwargs: Any) -> Any:
+        e = FileNotFoundError(f"[Errno 2] No such file or directory: '{self.cwd}'")
+        e.filename = kwargs.get("cwd") or self.cwd
+        raise e
 
 
 # ===========================================================================
@@ -96,6 +111,15 @@ class TestGitCurrentBranch:
         assert kwargs["errors"] == "replace"
         # Timeout so a wedged git can't hang the MCP server.
         assert kwargs["timeout"] == git_ops._GIT_SUBPROCESS_TIMEOUT
+        # stdin=DEVNULL so a credential prompt fails immediately with
+        # EOF rather than blocking on inherited stdin.
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        # GIT_TERMINAL_PROMPT=0 + GIT_ASKPASS="" in the environment so
+        # git itself refuses to prompt (defence in depth alongside
+        # stdin=DEVNULL).
+        env = kwargs["env"]
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert env["GIT_ASKPASS"] == ""
 
     def test_passes_cwd_when_path_given(self) -> None:
         runner = _RecordingRunner([(0, "main\n", "")])
@@ -119,6 +143,17 @@ class TestGitCurrentBranch:
     def test_missing_git_binary_raises_giterror(self) -> None:
         with pytest.raises(GitOpError, match="git executable not found"):
             git_ops.git_current_branch(runner=_MissingGitRunner)
+
+    def test_missing_cwd_raises_distinct_error(self) -> None:
+        """When `path=` points to a non-existent directory,
+        subprocess.run raises FileNotFoundError with e.filename set to
+        the cwd. Disambiguate from the missing-git case so the agent
+        sees the actual cause instead of chasing a PATH config."""
+        with pytest.raises(GitOpError, match="path does not exist"):
+            git_ops.git_current_branch(
+                path="/no/such/dir",
+                runner=_MissingCwdRunner("/no/such/dir"),
+            )
 
     def test_timeout_raises_giterror_with_parse_returncode(self) -> None:
         """A wedged git (credential-helper prompting on stdin, held
@@ -210,6 +245,22 @@ class TestGitRemoteRepo:
         # output. Sentinel returncode distinguishes this from a real git
         # failure (which carries git's own non-zero exit code).
         assert exc.value.returncode == GIT_PARSE_ERROR_RETURNCODE
+
+    def test_unparseable_url_redacts_embedded_credentials(self) -> None:
+        """If the unparseable URL carries `user:token@` embedded auth
+        (common in CI: https://x-token-auth:abcd@.../), the secret
+        must NOT land in the error message — it would flow through
+        MCP into agent context and downstream logs."""
+        # Construct an unparseable URL (parse_remote_url's regex needs
+        # a `[:/]X/Y` tail; "host-only" doesn't match).
+        sensitive = "https://x-token-auth:supersecret123@bitbucket.org\n"
+        runner = _RecordingRunner([(0, sensitive, "")])
+        with pytest.raises(GitOpError) as exc:
+            git_ops.git_remote_repo(runner=runner)
+        msg = str(exc.value)
+        assert "supersecret123" not in msg
+        assert "x-token-auth" not in msg
+        assert "[redacted]" in msg
 
 
 # ===========================================================================
@@ -304,6 +355,16 @@ STATUS_CORRUPT_XY = """\
 1 X N... 100644 100644 100644 hash1 hash1 single_char_xy.py
 """
 
+# Freshly `git init`'d repo with no commits — branch.head reports the
+# would-be branch (e.g. "main") but branch.oid is "(initial)" signaling
+# unborn state. Normalise to "HEAD" for symmetry with the detached-HEAD
+# convention.
+STATUS_UNBORN = """\
+# branch.oid (initial)
+# branch.head main
+? README.md
+"""
+
 
 class TestGitStatusParser:
     def test_clean_tree(self) -> None:
@@ -380,6 +441,16 @@ class TestGitStatusParser:
         s = git_ops._parse_status_porcelain_v2(STATUS_CORRUPT_XY)
         assert s["staged"] == []
         assert s["modified"] == []
+
+    def test_unborn_branch_normalised_to_HEAD(self) -> None:
+        """branch.oid (initial) signals unborn state. Normalising to
+        "HEAD" gives consistent "weird state" signaling alongside the
+        detached-HEAD convention — git_current_branch raises on the
+        same repo, so the two functions agree they can't give you a
+        regular branch name."""
+        s = git_ops._parse_status_porcelain_v2(STATUS_UNBORN)
+        assert s["branch"] == "HEAD"
+        assert s["untracked"] == ["README.md"]
 
 
 class TestGitStatusDriver:

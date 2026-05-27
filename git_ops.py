@@ -26,10 +26,24 @@ surface a useful message rather than guessing at the failure mode.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from typing import Any
 
 from bb_api import parse_remote_url
+
+
+# Regex for redacting URL-embedded credentials before they land in error
+# messages. Matches the `user:token@` (or `user@`) shape in any URL and
+# replaces with `[redacted]@`. Used in any GitOpError message that
+# echoes a remote URL — we'd rather lose the auth detail than leak a
+# token into the MCP agent's context / downstream logs.
+_URL_CRED_PATTERN = re.compile(r"://[^/@]+@")
+
+
+def _redact_url_creds(url: str) -> str:
+    """Strip `user:token@` from a URL before echoing it in error text."""
+    return _URL_CRED_PATTERN.sub("://[redacted]@", url)
 
 # Subprocess defaults applied to every `git` call:
 #
@@ -108,6 +122,15 @@ def _run_git(
     """
     cmd = ["git", *_GIT_NO_COLOR, *args]
     cwd = str(path) if path is not None else None
+    # Environment hardening (belt + suspenders alongside the 30s timeout):
+    #   GIT_TERMINAL_PROMPT=0 — git itself refuses to prompt for input,
+    #     so a credential-helper-less repo with a 401 fails immediately
+    #     with a clear error instead of wedging for 30s on a hidden
+    #     prompt.
+    #   GIT_ASKPASS="" — disables any GUI askpass helper that would
+    #     otherwise pop up out-of-band (X11 dialog, macOS keychain
+    #     prompt) and block the subprocess.
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
     try:
         result = runner.run(
             cmd,
@@ -118,8 +141,21 @@ def _run_git(
             cwd=cwd,
             check=False,
             timeout=_GIT_SUBPROCESS_TIMEOUT,
+            # stdin=DEVNULL turns any prompt into an immediate EOF
+            # instead of letting git read from whatever stdin the
+            # MCP server inherited.
+            stdin=subprocess.DEVNULL,
+            env=git_env,
         )
     except FileNotFoundError as e:
+        # subprocess raises FileNotFoundError for two distinct cases.
+        # Disambiguate so the agent sees the actual cause:
+        #   - Missing cwd directory: e.filename is the cwd path
+        #   - Missing git binary: e.filename is the executable name (git)
+        if cwd is not None and getattr(e, "filename", None) == cwd:
+            raise GitOpError(
+                cmd, 127, f"path does not exist: {cwd}"
+            ) from e
         raise GitOpError(cmd, 127, "git executable not found on PATH") from e
     except subprocess.TimeoutExpired as e:
         # Wrap so callers always see GitOpError. Use the parse-error
@@ -191,10 +227,16 @@ def git_remote_repo(
     url = _run_git(["remote", "get-url", "origin"], path=path, runner=runner)
     parsed = parse_remote_url(url)
     if parsed is None:
+        # Redact any embedded `user:token@` before the URL lands in the
+        # error message — URL-embedded auth is a common CI pattern
+        # (e.g. `https://x-token-auth:abcd@bitbucket.org/...`), and
+        # this string flows up through MCP into the agent's context
+        # and downstream logs.
+        safe_url = _redact_url_creds(url.strip())
         raise GitOpError(
             ["git", "remote", "get-url", "origin"],
             GIT_PARSE_ERROR_RETURNCODE,
-            f"could not parse workspace/repo from origin URL: {url.strip()!r}",
+            f"could not parse workspace/repo from origin URL: {safe_url!r}",
         )
     return parsed
 
@@ -234,6 +276,10 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
         "untracked": [],
         "unmerged": [],
     }
+    # branch.oid / branch.head order in porcelain v2 output is not
+    # documented as stable. Track unborn state with a flag and apply
+    # the normalisation after the loop so it wins regardless of order.
+    is_unborn = False
     # split("\n") rather than splitlines(): splitlines() also breaks on
     # \r / \v / \f / U+0085 / U+2028 / U+2029, any of which could appear
     # inside a path on platforms / repositories that allow them, causing
@@ -250,6 +296,12 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
             # so cross-checks between git_current_branch and git_status
             # never disagree on the same underlying state.
             out["branch"] = "HEAD" if branch == "(detached)" else branch
+        elif line.startswith("# branch.oid "):
+            # On a freshly `git init`'d repo with no commits, branch.oid
+            # is "(initial)" — flag for the end-of-loop normalisation.
+            oid = line[len("# branch.oid ") :].strip()
+            if oid == "(initial)":
+                is_unborn = True
         elif line.startswith("# branch.upstream "):
             out["upstream"] = line[len("# branch.upstream ") :].strip()
         elif line.startswith("# branch.ab "):
@@ -310,6 +362,12 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
             out["untracked"].append(line[2:])
         # `! ignored` and any other prefixes are ignored intentionally.
 
+    if is_unborn:
+        # Override any branch.head value (which would be the would-be
+        # branch name on the unborn line, e.g. "main") with the HEAD
+        # sentinel so cross-checks with git_current_branch agree on
+        # "this is a weird state, not a regular branch."
+        out["branch"] = "HEAD"
     out["clean"] = (
         not out["staged"]
         and not out["modified"]
@@ -491,7 +549,17 @@ _DIFF_TRUNCATION_MARKER = (
 
 def _cap_diff(text: str) -> str:
     """Truncate a diff string to `_MAX_DIFF_BYTES` if it exceeds the cap,
-    appending an explicit marker so the caller knows what happened."""
+    appending an explicit marker so the caller knows what happened.
+
+    Fast path on `len(text)`: UTF-8 byte count is always >= char count,
+    so if char count fits the cap, the encoded form definitely does.
+    Avoids materialising a transient bytes copy of a multi-GB string
+    just to check its size — the cap exists specifically to defend
+    against multi-GB diffs OOMing the MCP server, and the check
+    itself shouldn't be the trigger.
+    """
+    if len(text) <= _MAX_DIFF_BYTES:
+        return text
     encoded = text.encode("utf-8")
     if len(encoded) <= _MAX_DIFF_BYTES:
         return text
