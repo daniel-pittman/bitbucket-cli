@@ -52,7 +52,16 @@ from typing import Any
 
 _VENV_DIR = Path("/tmp/bbenv")
 _VENV_PY = _VENV_DIR / "bin" / "python3"
-_VENV_DEPS = ("mcp",)  # No heavy deps (no torch / sentence-transformers).
+# Sentinel file written ONLY after the full bootstrap (venv create + pip
+# install) succeeds. If pip is Ctrl-C'd / OOM-killed / disk-full mid-run,
+# _VENV_PY exists but `mcp` doesn't — without this sentinel, every
+# subsequent launch would silently skip reinstall, re-exec into the
+# broken venv, and die on `from mcp.server.fastmcp import FastMCP`.
+_VENV_READY = _VENV_DIR / ".bbenv-ready"
+# Pin to mcp>=1.0,<2 so a breaking mcp 2.x release doesn't silently
+# install on the next /tmp wipe and break every fresh launch. Matches
+# the pyproject.toml [mcp] extra.
+_VENV_DEPS = ("mcp>=1.0,<2",)  # No heavy deps (no torch / sentence-transformers).
 _VENV_MIN_PY = (3, 10)  # bb_api uses PEP 604 unions; mcp also needs >=3.10
 
 
@@ -98,15 +107,25 @@ def _find_builder_python() -> str:
 
 
 def _bootstrap_venv() -> None:
-    """Create /tmp/bbenv on first run, install deps, re-exec under it."""
-    if not _VENV_PY.exists():
+    """Create /tmp/bbenv on first run, install deps, re-exec under it.
+
+    Idempotent: a fully-bootstrapped venv (sentinel file present)
+    re-execs immediately. A partially-bootstrapped venv (venv exists
+    but sentinel doesn't — e.g. previous pip install was Ctrl-C'd or
+    OOM-killed) gets the pip install retried with no manual cleanup
+    needed.
+    """
+    if not _VENV_READY.exists():
         builder = _find_builder_python()
         # Log to stderr so MCP stdio transport isn't corrupted.
         print(
             f"[bb-mcp] bootstrapping {_VENV_DIR} with {builder}",
             file=sys.stderr,
         )
-        subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
+        # Only create the venv if it doesn't already exist (a previous
+        # half-finished bootstrap left _VENV_PY in place).
+        if not _VENV_PY.exists():
+            subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
         subprocess.check_call(
             [str(_VENV_PY), "-m", "pip", "install",
              "--quiet", "--no-cache-dir", "--upgrade", "pip"]
@@ -115,7 +134,20 @@ def _bootstrap_venv() -> None:
             [str(_VENV_PY), "-m", "pip", "install",
              "--quiet", "--no-cache-dir", *_VENV_DEPS]
         )
-    if os.path.realpath(sys.executable) != os.path.realpath(str(_VENV_PY)):
+        # Sentinel last — any earlier failure leaves it absent so the
+        # next launch retries the install.
+        _VENV_READY.touch()
+
+    # Detect "are we already running under the bootstrap venv?" via
+    # sys.prefix rather than realpath(sys.executable). `python -m venv`
+    # on Linux/macOS defaults to --symlinks, so realpath(/tmp/bbenv/bin/
+    # python3) resolves to the SAME canonical path as the builder
+    # interpreter (e.g. /usr/bin/python3.12). Comparing realpaths would
+    # claim "already under venv" when we're actually still under the
+    # system interpreter, skipping the execv and dying on the mcp
+    # import. sys.prefix is set per-interpreter from the venv layout
+    # and is the authoritative signal.
+    if sys.prefix != str(_VENV_DIR):
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
 
 
@@ -213,10 +245,15 @@ def _resolve_repo(repo: str = "") -> tuple[bb_api.BBClient, str, str]:
       - "acme/myrepo"    → use "acme" workspace + "myrepo" slug (overrides
                            BB_WORKSPACE for this call)
 
+    Whitespace is stripped before parsing so a sloppy paste or
+    agent-side string concat ("  acme/widget  ") doesn't slip through
+    as workspace="  acme" and surface as a deep API failure.
+
     Raises bb_api.BBConfigError on missing config or unresolvable remote.
     Raises ValueError on malformed `repo` argument.
     """
     client = _get_client()
+    repo = repo.strip()
 
     if not repo:
         # Auto-detect from git remote.
@@ -264,11 +301,17 @@ def _error_dict(e: Exception) -> dict[str, Any]:
 
 # Exceptions every tool wraps. Other exceptions propagate (they're
 # programmer errors and should crash visibly during development).
+# OSError covers IsADirectoryError, ConnectionResetError, BlockingIOError,
+# and a few other paths that git_ops._run_git doesn't wrap explicitly
+# (only FileNotFoundError / NotADirectoryError / PermissionError do).
+# Also catches os.getcwd() on a deleted cwd, which fires inside
+# _default_repo_path() BEFORE any wrapped git call.
 _TOOL_EXPECTED_EXCEPTIONS = (
     bb_api.BBApiError,
     bb_api.BBConfigError,
     bb_ops.BBOpNotFound,
     git_ops.GitOpError,
+    OSError,
     ValueError,
     TypeError,
 )
@@ -287,13 +330,20 @@ mcp = FastMCP("bb")
 
 
 @mcp.tool()
-def pipelines_list(repo: str = "", count: int = 10, branch: str = "") -> dict[str, Any]:
-    """List recent Bitbucket pipelines (most-recent first).
+def pipelines_list(
+    repo: str = "",
+    count: int = 10,
+    branch: str = "",
+    sort: str = "-created_on",
+) -> dict[str, Any]:
+    """List recent Bitbucket pipelines (most-recent first by default).
 
     Args:
         repo: Repo slug, "workspace/slug", or "" to auto-detect from git.
         count: Maximum number of pipelines to return (paginates if > 100).
         branch: Optional branch filter (e.g. "main", "feat/widget").
+        sort: Sort key (default "-created_on" = newest first).
+              "created_on" for oldest first.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
@@ -301,6 +351,7 @@ def pipelines_list(repo: str = "", count: int = 10, branch: str = "") -> dict[st
             client, workspace, repo_slug,
             count=count,
             branch=branch or None,
+            sort=sort,
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pipelines": pipelines}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
@@ -372,16 +423,31 @@ def pipeline_stop(number: int, repo: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def pipeline_logs(number: int, step_index: int, repo: str = "") -> dict[str, Any]:
+def pipeline_logs(
+    number: int,
+    step_index: int,
+    repo: str = "",
+    timeout: float = 120.0,
+) -> dict[str, Any]:
     """Fetch raw log text for a pipeline step (0-based step index).
 
     The log endpoint may return inline text or redirect to a signed S3
     URL; the underlying fetcher follows the redirect while stripping the
     Bitbucket Authorization header on cross-host hops.
+
+    Args:
+        number: Pipeline build number.
+        step_index: 0-based step position.
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        timeout: Per-call timeout in seconds (default 120). Bump for
+                 pipelines with very large log payloads.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
-        text = bb_ops.pipeline_logs(client, workspace, repo_slug, number, step_index)
+        text = bb_ops.pipeline_logs(
+            client, workspace, repo_slug, number, step_index,
+            timeout=timeout,
+        )
         return {
             "ok": True,
             "workspace": workspace,
@@ -457,8 +523,11 @@ def pr_create(
 
     Args:
         title: PR title (required).
-        source_branch: Source branch name. If empty, auto-detected via
-                       `git rev-parse --abbrev-ref HEAD`.
+        source_branch: Source branch name. If empty/whitespace,
+                       auto-detected via `git rev-parse --abbrev-ref HEAD`.
+                       Detached HEAD / unborn-branch states are rejected
+                       (git returns "HEAD" as the branch literal — not a
+                       valid PR source).
         destination_branch: Destination branch (default: "main").
         repo: Repo slug, "workspace/slug", or "" to auto-detect.
         description: PR description (markdown). Empty/whitespace omitted.
@@ -468,10 +537,20 @@ def pr_create(
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
-        # Default source_branch to the current git branch when omitted —
-        # matches the bash `bb pr-create` behaviour.
-        if not source_branch:
+        # Default source_branch to the current git branch when
+        # empty/whitespace — matches the bash `bb pr-create` behaviour.
+        # `.strip()` so " " (sloppy whitespace) doesn't bypass auto-detect.
+        if not source_branch.strip():
             source_branch = git_ops.git_current_branch(path=_default_repo_path())
+            # `git_current_branch` returns the literal "HEAD" for both
+            # detached and unborn state. Bitbucket would accept this
+            # silently and create a degenerate PR; surface a clear local
+            # error instead.
+            if source_branch == "HEAD":
+                raise ValueError(
+                    "cannot auto-detect source_branch: git reports detached "
+                    "HEAD / unborn branch. Pass source_branch= explicitly."
+                )
         pr = bb_ops.pr_create(
             client, workspace, repo_slug,
             title=title,
@@ -557,11 +636,18 @@ def pr_decline(pr_id: int, repo: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def pr_diff(pr_id: int, repo: str = "") -> dict[str, Any]:
-    """Fetch the unified diff text for a pull request."""
+def pr_diff(pr_id: int, repo: str = "", timeout: float = 120.0) -> dict[str, Any]:
+    """Fetch the unified diff text for a pull request.
+
+    Args:
+        pr_id: Pull request ID.
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        timeout: Per-call timeout in seconds (default 120). Bump for
+                 very large PR diffs.
+    """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
-        diff = bb_ops.pr_diff(client, workspace, repo_slug, pr_id)
+        diff = bb_ops.pr_diff(client, workspace, repo_slug, pr_id, timeout=timeout)
         return {
             "ok": True,
             "workspace": workspace,
@@ -680,11 +766,13 @@ def branch_show(name: str, repo: str = "") -> dict[str, Any]:
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
         branch = bb_ops.branch_show(client, workspace, repo_slug, name)
+        # Echo the stripped name so the response matches what Bitbucket
+        # actually resolved (bb_ops.branch_show strips before encoding).
         return {
             "ok": True,
             "workspace": workspace,
             "repo": repo_slug,
-            "name": name,
+            "name": name.strip(),
             "branch": branch,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
@@ -761,11 +849,17 @@ def git_current_branch(path: str = "") -> dict[str, Any]:
 def git_status(path: str = "") -> dict[str, Any]:
     """Return structured working-tree state (branch / upstream / ahead / behind /
     clean / staged / modified / untracked / unmerged + *_omitted caps).
+
+    The payload is keyed under `working_tree` rather than `status` to
+    avoid collision with the `status` field _error_dict uses for HTTP
+    status codes on BBApiError. Today the collision can't fire
+    (git_status doesn't raise BBApiError), but the rename pre-empts a
+    future broadening hazard.
     """
     try:
         cwd = path or _default_repo_path()
         status = git_ops.git_status(path=cwd)
-        return {"ok": True, "path": cwd, "status": status}
+        return {"ok": True, "path": cwd, "working_tree": status}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict(e)
 

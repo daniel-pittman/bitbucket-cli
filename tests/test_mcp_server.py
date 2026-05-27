@@ -172,6 +172,29 @@ class TestResolveRepo:
         with pytest.raises(ValueError, match="repo must be"):
             mcp_server._resolve_repo(bad)
 
+    def test_strips_whitespace_before_parsing(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """A sloppy paste like '  acme/widget  ' must not slip through
+        as workspace='  acme' and surface as a deep API failure."""
+        client, ws, slug = mcp_server._resolve_repo("  acme/widget  ")
+        assert ws == "acme"
+        assert slug == "widget"
+
+    def test_whitespace_only_triggers_autodetect(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Whitespace-only repo must not slip through; it should trip
+        the same auto-detect path as the empty string."""
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo",
+            lambda path=None: ("from-remote", "ws"),
+        )
+        _, ws, slug = mcp_server._resolve_repo("   ")
+        assert ws == "from-remote"
+
 
 # ---------------------------------------------------------------------------
 # _error_dict
@@ -241,15 +264,26 @@ class TestPipelineTools:
         recorder = _recorder([{"build_number": 42}])
         with patch.object(bb_ops, "pipelines_list", recorder):
             out = mcp_server.pipelines_list(repo="my-repo", count=5, branch="main")
-        # bb_ops.pipelines_list received the resolved (workspace, repo, count, branch).
+        # bb_ops.pipelines_list received the resolved (workspace, repo, count, branch, sort).
         assert recorder.calls[0][0] == (stub_client, "acme", "my-repo")
-        assert recorder.calls[0][1] == {"count": 5, "branch": "main"}
+        assert recorder.calls[0][1] == {
+            "count": 5,
+            "branch": "main",
+            "sort": "-created_on",  # default
+        }
         assert out == {
             "ok": True,
             "workspace": "acme",
             "repo": "my-repo",
             "pipelines": [{"build_number": 42}],
         }
+
+    def test_pipelines_list_sort_kwarg(self, stub_client: bb_api.BBClient) -> None:
+        """`sort=` lets the agent ask for oldest-first or sort-by-completion."""
+        recorder = _recorder([])
+        with patch.object(bb_ops, "pipelines_list", recorder):
+            mcp_server.pipelines_list(repo="my-repo", sort="created_on")
+        assert recorder.calls[0][1]["sort"] == "created_on"
 
     def test_pipelines_list_empty_branch_passes_none(
         self, stub_client: bb_api.BBClient
@@ -304,6 +338,19 @@ class TestPipelineTools:
             out = mcp_server.pipeline_logs(number=42, step_index=0, repo="my-repo")
         assert out["log"] == "+ echo hello\nhello\n"
         assert out["step_index"] == 0
+        # Default timeout passed through.
+        assert recorder.calls[0][1]["timeout"] == 120.0
+
+    def test_pipeline_logs_custom_timeout(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Agent can extend timeout for pipelines with huge log payloads."""
+        recorder = _recorder("")
+        with patch.object(bb_ops, "pipeline_logs", recorder):
+            mcp_server.pipeline_logs(
+                number=42, step_index=0, repo="my-repo", timeout=600.0
+            )
+        assert recorder.calls[0][1]["timeout"] == 600.0
 
 
 class TestPullRequestTools:
@@ -336,6 +383,45 @@ class TestPullRequestTools:
                 repo="my-repo",
             )
         assert recorder.calls[0][1]["source_branch"] == "feat/explicit"
+
+    def test_pr_create_whitespace_source_branch_triggers_autodetect(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Whitespace-only source_branch should NOT slip through to
+        bb_ops (which would then raise) — the whitespace trips the
+        auto-detect path."""
+        monkeypatch.setattr(
+            git_ops, "git_current_branch",
+            lambda path=None: "feat/detected",
+        )
+        recorder = _recorder({"id": 9})
+        with patch.object(bb_ops, "pr_create", recorder):
+            mcp_server.pr_create(title="Hi", source_branch="   ", repo="my-repo")
+        assert recorder.calls[0][1]["source_branch"] == "feat/detected"
+
+    def test_pr_create_rejects_detached_head_autodetect(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """git_current_branch returns the literal 'HEAD' for both
+        detached and unborn state — Bitbucket would accept it silently
+        and create a degenerate PR. Surface a local error instead."""
+        monkeypatch.setattr(
+            git_ops, "git_current_branch",
+            lambda path=None: "HEAD",
+        )
+        # bb_ops.pr_create must NOT be called when source_branch can't
+        # be resolved cleanly.
+        recorder = _recorder({"id": 10})
+        with patch.object(bb_ops, "pr_create", recorder):
+            out = mcp_server.pr_create(title="Hi", repo="my-repo")
+        assert out["ok"] is False
+        assert out["kind"] == "ValueError"
+        assert "detached HEAD" in out["message"] or "HEAD" in out["message"]
+        assert recorder.calls == []  # bb_ops.pr_create not reached
 
     def test_pr_unapprove_dispatches(
         self, stub_client: bb_api.BBClient
@@ -419,13 +505,17 @@ class TestGitTools:
             mcp_server.git_current_branch(path="/explicit/dir")
         assert recorder.calls[0][1]["path"] == "/explicit/dir"
 
-    def test_git_status_wraps_dict(
+    def test_git_status_payload_under_working_tree_key(
         self, stub_client: bb_api.BBClient
     ) -> None:
+        """Payload is keyed under `working_tree`, not `status`, to
+        avoid colliding with the HTTP-status field _error_dict uses
+        for BBApiError."""
         status = {"branch": "main", "clean": True}
         with patch.object(git_ops, "git_status", _recorder(status)):
             out = mcp_server.git_status()
-        assert out["status"] == status
+        assert out["working_tree"] == status
+        assert "status" not in out  # no collision risk
 
     def test_git_recent_commits_passes_count_and_ref(
         self, stub_client: bb_api.BBClient
