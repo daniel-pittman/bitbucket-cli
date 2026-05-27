@@ -76,6 +76,32 @@ class _MissingCwdRunner:
         raise e
 
 
+class _NotADirRunner:
+    """Stand-in that raises NotADirectoryError — simulates passing a
+    regular file (e.g. /etc/passwd) as path=."""
+
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+
+    def run(self, *_args: Any, **kwargs: Any) -> Any:
+        e = NotADirectoryError(f"[Errno 20] Not a directory: '{self.cwd}'")
+        e.filename = kwargs.get("cwd") or self.cwd
+        raise e
+
+
+class _PermissionRunner:
+    """Stand-in that raises PermissionError — simulates cwd unreadable
+    or git binary lacking +x."""
+
+    def __init__(self, filename: str):
+        self.filename = filename
+
+    def run(self, *_args: Any, **kwargs: Any) -> Any:
+        e = PermissionError(f"[Errno 13] Permission denied: '{self.filename}'")
+        e.filename = self.filename
+        raise e
+
+
 # ===========================================================================
 # git_current_branch
 # ===========================================================================
@@ -154,6 +180,36 @@ class TestGitCurrentBranch:
                 path="/no/such/dir",
                 runner=_MissingCwdRunner("/no/such/dir"),
             )
+
+    def test_path_is_regular_file_raises_giterror(self) -> None:
+        """`path=/etc/passwd` (regular file) → NotADirectoryError, which
+        the round-5 fix wraps as GitOpError so callers see the uniform
+        contract instead of a raw OSError leak."""
+        with pytest.raises(GitOpError, match="path is not a directory"):
+            git_ops.git_current_branch(
+                path="/etc/passwd",
+                runner=_NotADirRunner("/etc/passwd"),
+            )
+
+    def test_permission_denied_raises_giterror(self) -> None:
+        """PermissionError (cwd unreadable / git binary not +x) wraps as
+        GitOpError so the agent sees the uniform contract."""
+        with pytest.raises(GitOpError, match="permission denied"):
+            git_ops.git_current_branch(
+                path="/restricted",
+                runner=_PermissionRunner("/restricted"),
+            )
+
+    def test_parse_error_returncode_outside_signal_range(self) -> None:
+        """GIT_PARSE_ERROR_RETURNCODE = -1000 is outside Python's
+        signal-killed convention (subprocess uses -N for signal N, e.g.
+        -1 for SIGHUP, -9 for SIGKILL, -15 for SIGTERM). Picking the
+        sentinel outside that range means callers branching on
+        `err.returncode == GIT_PARSE_ERROR_RETURNCODE` won't
+        misclassify a SIGHUP-killed git as a parse failure."""
+        # No SIGNAL goes below -64 in practice; sentinel at -1000 is
+        # safely outside.
+        assert git_ops.GIT_PARSE_ERROR_RETURNCODE < -100
 
     def test_timeout_raises_giterror_with_parse_returncode(self) -> None:
         """A wedged git (credential-helper prompting on stdin, held
@@ -271,6 +327,23 @@ class TestGitRemoteRepo:
         # `-c color.ui=never`.
         assert "-c" in exc.value.command
         assert "color.ui=never" in exc.value.command
+
+    def test_redaction_handles_at_sign_in_password(self) -> None:
+        """Round-5 regression: a password containing a literal `@`
+        (legal in RFC 3986 syntax) caused the old `[^/@]+@` regex to
+        stop at the first `@`, leaking the tail of the credential.
+        The fixed `[^/]+@` regex is greedy up to the last `@` before
+        the path."""
+        sensitive = "https://x-token-auth:my@token@bitbucket.org\n"
+        runner = _RecordingRunner([(0, sensitive, "")])
+        with pytest.raises(GitOpError) as exc:
+            git_ops.git_remote_repo(runner=runner)
+        msg = str(exc.value)
+        # Neither half of the credential should survive.
+        assert "my" not in msg or "@token" not in msg  # `my@token` fragment
+        assert "token" not in msg
+        assert "x-token-auth" not in msg
+        assert "[redacted]" in msg
 
 
 # ===========================================================================
@@ -445,12 +518,66 @@ class TestGitStatusParser:
         assert s["ahead"] == 0
         assert s["behind"] == 0
 
+    @pytest.mark.parametrize(
+        "ab_line",
+        [
+            "# branch.ab +-3 -1",   # double-sign smuggling: int("-3") = -3
+            "# branch.ab +3 --1",   # double-sign smuggling on behind
+            "# branch.ab ++3 -1",   # not all-digits after sign
+            "# branch.ab +5 -junk", # half-parseable; non-atomic try would
+                                    # have left ahead=5, behind=0
+            "# branch.ab + -",      # empty after sign
+        ],
+    )
+    def test_branch_ab_double_sign_or_junk_rejected(self, ab_line: str) -> None:
+        """Round-5 regression: a startswith-only check accepted '+-3'
+        (parsed as -3) and the non-atomic try/except let '+5 -junk'
+        update ahead while leaving behind at default. Strict isdigit()
+        validation + commit-only-on-full-success closes both."""
+        text = (
+            "# branch.oid 0a1b2c3d4e5f\n"
+            "# branch.head main\n"
+            f"{ab_line}\n"
+        )
+        s = git_ops._parse_status_porcelain_v2(text)
+        # Both fields stay at defaults rather than picking up bogus values.
+        assert s["ahead"] == 0
+        assert s["behind"] == 0
+
     def test_corrupt_xy_field_skipped(self) -> None:
         """Type-1 line with single-char XY (corrupted output) skipped
         defensively rather than raising IndexError on `xy[1]`."""
         s = git_ops._parse_status_porcelain_v2(STATUS_CORRUPT_XY)
         assert s["staged"] == []
         assert s["modified"] == []
+
+    def test_unmerged_xy_width_check_parity(self) -> None:
+        """Type-u (unmerged) parser must also validate XY width — same
+        defensive shape as type-1 / type-2. Round-3 added the check
+        for those two paths but missed unmerged."""
+        # Single-char XY on a u-line. Token count >= 11 but xy is
+        # corrupted; the parser should skip rather than append.
+        text = (
+            "# branch.oid abc\n"
+            "# branch.head main\n"
+            "u U N... 100644 100644 100644 100644 h1 h2 h3 corrupt_u.py\n"
+        )
+        s = git_ops._parse_status_porcelain_v2(text)
+        assert s["unmerged"] == []
+
+    def test_question_mark_prefix_only_skipped(self) -> None:
+        """A literal `'? '` line (prefix with no path body) must NOT
+        append an empty string to untracked — would flip clean=False
+        with a phantom entry."""
+        text = (
+            "# branch.oid abc\n"
+            "# branch.head main\n"
+            "? \n"
+            "? real_untracked.py\n"
+        )
+        s = git_ops._parse_status_porcelain_v2(text)
+        assert s["untracked"] == ["real_untracked.py"]
+        assert s["clean"] is False  # the one real untracked still counts
 
     def test_unborn_branch_normalised_to_HEAD(self) -> None:
         """branch.oid (initial) signals unborn state. Normalising to
@@ -753,6 +880,7 @@ class TestGitUncommittedChanges:
             "staged_diff": "diff --staged\n",
             "working_diff": "diff --working\n",
             "untracked_files": ["untracked1.py", "untracked2.md"],
+            "untracked_files_omitted": 0,
         }
 
     def test_oversize_diff_truncated_with_marker(self) -> None:
@@ -816,7 +944,8 @@ class TestGitUncommittedChanges:
         """A repo that forgot to gitignore node_modules / .venv could
         return hundreds of thousands of untracked paths. Cap at
         _MAX_PATH_LIST so the MCP server doesn't OOM on the JSON
-        serialisation."""
+        serialisation. Omitted count surfaces in a sibling field so
+        callers iterating the list see only real paths."""
         # Produce more paths than the cap allows.
         many_paths = "\n".join(f"file{i:06}.tmp" for i in range(15_000))
         runner = _RecordingRunner(
@@ -827,12 +956,29 @@ class TestGitUncommittedChanges:
             ]
         )
         result = git_ops.git_uncommitted_changes(runner=runner)
-        # Returned list is capped + 1 sentinel entry (the truncation marker).
-        assert len(result["untracked_files"]) == git_ops._MAX_PATH_LIST + 1
-        # Sentinel describes what got cut.
-        assert result["untracked_files"][-1].startswith("<...")
-        assert "5000 more" in result["untracked_files"][-1]
-        assert "cap" in result["untracked_files"][-1]
+        # Returned list is capped to exactly _MAX_PATH_LIST entries —
+        # no in-list sentinel, so callers iterating with os.stat /
+        # Path.exists don't hit a non-path string.
+        assert len(result["untracked_files"]) == git_ops._MAX_PATH_LIST
+        # Every entry is a real-shaped path.
+        assert all(p.startswith("file") for p in result["untracked_files"])
+        # Omitted count surfaces in a sibling field.
+        assert result["untracked_files_omitted"] == 5_000
+
+    def test_untracked_omitted_zero_when_under_cap(self) -> None:
+        """Sibling field is 0 (not missing) when no truncation happened.
+        Lets agents check a single field unconditionally rather than
+        defending against KeyError."""
+        runner = _RecordingRunner(
+            [
+                (0, "", ""),
+                (0, "", ""),
+                (0, "one.py\ntwo.py\n", ""),
+            ]
+        )
+        result = git_ops.git_uncommitted_changes(runner=runner)
+        assert result["untracked_files"] == ["one.py", "two.py"]
+        assert result["untracked_files_omitted"] == 0
 
 
 class TestPathListCap:
@@ -840,37 +986,50 @@ class TestPathListCap:
     from the full git_uncommitted_changes / git_status integration
     paths so the cap behaviour is pinned at one place."""
 
-    def test_under_cap_returns_verbatim(self) -> None:
+    def test_under_cap_returns_verbatim_with_zero_omitted(self) -> None:
         paths = [f"f{i}" for i in range(100)]
-        assert git_ops._truncated_path_list(paths) == paths
+        capped, omitted = git_ops._truncated_path_list(paths)
+        assert capped == paths
+        assert omitted == 0
 
-    def test_at_cap_returns_verbatim(self) -> None:
+    def test_at_cap_returns_verbatim_with_zero_omitted(self) -> None:
         paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST)]
-        assert git_ops._truncated_path_list(paths) == paths
+        capped, omitted = git_ops._truncated_path_list(paths)
+        assert capped == paths
+        assert omitted == 0
 
-    def test_one_over_cap_appends_singular_sentinel(self) -> None:
+    def test_one_over_cap_reports_one_omitted(self) -> None:
         paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST + 1)]
-        result = git_ops._truncated_path_list(paths)
-        assert len(result) == git_ops._MAX_PATH_LIST + 1
-        assert "1 more path " in result[-1]  # singular
+        capped, omitted = git_ops._truncated_path_list(paths)
+        # The returned list is EXACTLY _MAX_PATH_LIST entries — no
+        # sentinel. Callers iterating with os.stat won't trip.
+        assert len(capped) == git_ops._MAX_PATH_LIST
+        assert omitted == 1
+        # Every entry is a real path (no "<..." marker).
+        assert all(p.startswith("f") for p in capped)
 
-    def test_many_over_cap_appends_plural_sentinel(self) -> None:
-        paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST + 5)]
-        result = git_ops._truncated_path_list(paths)
-        assert "5 more paths " in result[-1]  # plural
+    def test_many_over_cap_reports_full_omitted_count(self) -> None:
+        paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST + 50)]
+        capped, omitted = git_ops._truncated_path_list(paths)
+        assert len(capped) == git_ops._MAX_PATH_LIST
+        assert omitted == 50
 
-    def test_git_status_caps_file_lists(self) -> None:
+    def test_git_status_caps_file_lists_with_omitted_siblings(self) -> None:
         """Same cap applies inside _parse_status_porcelain_v2 — staged /
-        modified / untracked / unmerged lists are bounded too."""
-        # 12k untracked entries; status parser caps to _MAX_PATH_LIST + 1.
+        modified / untracked / unmerged lists are bounded, and each has
+        a sibling `<key>_omitted` field surfacing the dropped count."""
         many_untracked = "\n".join(
             f"? file{i:05}.tmp" for i in range(12_000)
         )
         header = "# branch.oid abc\n# branch.head main\n"
         status_text = header + many_untracked
         s = git_ops._parse_status_porcelain_v2(status_text)
-        assert len(s["untracked"]) == git_ops._MAX_PATH_LIST + 1
-        assert s["untracked"][-1].startswith("<...")
+        assert len(s["untracked"]) == git_ops._MAX_PATH_LIST
+        assert s["untracked_omitted"] == 2_000
+        # Other lists were empty, so their omitted siblings are 0.
+        assert s["staged_omitted"] == 0
+        assert s["modified_omitted"] == 0
+        assert s["unmerged_omitted"] == 0
 
     def test_clean_tree_returns_empties(self) -> None:
         runner = _RecordingRunner(
@@ -884,6 +1043,7 @@ class TestPathListCap:
             "staged_diff": "",
             "working_diff": "",
             "untracked_files": [],
+            "untracked_files_omitted": 0,
         }
 
     def test_propagates_giterror_on_failure(self) -> None:

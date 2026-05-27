@@ -38,7 +38,13 @@ from bb_api import parse_remote_url
 # replaces with `[redacted]@`. Used in any GitOpError message that
 # echoes a remote URL — we'd rather lose the auth detail than leak a
 # token into the MCP agent's context / downstream logs.
-_URL_CRED_PATTERN = re.compile(r"://[^/@]+@")
+#
+# `[^/]+` (excludes only `/`, allows `@` inside) so a password
+# containing a literal `@` (legal in RFC 3986 syntax) is greedy-matched
+# up to the LAST `@` before the path. The previous `[^/@]+@` shape
+# would have stopped at the first `@`, leaking the tail of the password
+# (e.g. `https://user:p@ss@host/...` → `https://[redacted]@ss@host/...`).
+_URL_CRED_PATTERN = re.compile(r"://[^/]+@")
 
 
 def _redact_url_creds(url: str) -> str:
@@ -72,11 +78,13 @@ _GIT_NO_COLOR = ["-c", "color.ui=never"]
 
 
 # Sentinel returncode for parse-failure errors (the git command itself
-# exited 0, but our parser couldn't make sense of the output). A real git
-# exit code is always >= 0, so -1 unambiguously distinguishes "git's
-# fault" from "parser's fault" — callers can branch on `err.returncode >= 0`
-# before dispatching on the specific exit-code value.
-GIT_PARSE_ERROR_RETURNCODE = -1
+# exited 0, but our parser couldn't make sense of the output). Picked
+# at -1000 to stay outside Python's signal-killed convention: a
+# subprocess child killed by signal N has returncode = -N (e.g. -1 for
+# SIGHUP, -9 for SIGKILL, -15 for SIGTERM). Callers branching on
+# `err.returncode == GIT_PARSE_ERROR_RETURNCODE` would otherwise
+# misclassify a SIGHUP-killed git as a parse failure.
+GIT_PARSE_ERROR_RETURNCODE = -1000
 
 
 class GitOpError(RuntimeError):
@@ -157,6 +165,18 @@ def _run_git(
                 cmd, 127, f"path does not exist: {cwd}"
             ) from e
         raise GitOpError(cmd, 127, "git executable not found on PATH") from e
+    except NotADirectoryError as e:
+        # cwd is a path that exists but isn't a directory (e.g. a regular
+        # file). Wrap as GitOpError so callers always see the documented
+        # contract instead of a raw OSError.
+        raise GitOpError(
+            cmd, 127, f"path is not a directory: {getattr(e, 'filename', cwd) or cwd!r}"
+        ) from e
+    except PermissionError as e:
+        # cwd unreadable / git binary lacks +x. e.filename indicates which.
+        raise GitOpError(
+            cmd, 126, f"permission denied: {getattr(e, 'filename', cwd) or 'git'!r}"
+        ) from e
     except subprocess.TimeoutExpired as e:
         # Wrap so callers always see GitOpError. Use the parse-error
         # sentinel (-1) — the git process never exited, so there's no
@@ -311,20 +331,27 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
             out["upstream"] = line[len("# branch.upstream ") :].strip()
         elif line.startswith("# branch.ab "):
             # Format: "# branch.ab +N -M" per porcelain v2 spec. Validate
-            # the sign prefixes so a malformed line (negative ahead,
-            # positive behind) doesn't propagate bogus values into the
-            # MCP layer.
+            # strictly: must be exactly "+<digits> -<digits>" with no
+            # double-sign smuggling (the previous startswith-only check
+            # accepted "+-3" → int("-3") → ahead=-3, contradicting the
+            # parser's own promise to reject negative values).
             parts = line[len("# branch.ab ") :].split()
             if (
                 len(parts) == 2
                 and parts[0].startswith("+")
                 and parts[1].startswith("-")
+                and parts[0][1:].isdigit()
+                and parts[1][1:].isdigit()
             ):
-                try:
-                    out["ahead"] = int(parts[0][1:])
-                    out["behind"] = int(parts[1][1:])
-                except ValueError:
-                    pass  # leave defaults
+                # Parse both into locals first, commit only on full
+                # success. Non-atomic try/except previously could leave
+                # ahead updated while behind silently kept the default
+                # 0, producing an internally-inconsistent dict on a
+                # half-malformed line like "+5 -junk".
+                ahead = int(parts[0][1:])
+                behind = int(parts[1][1:])
+                out["ahead"] = ahead
+                out["behind"] = behind
         elif line.startswith("1 "):
             # Ordinary tracked file. Format:
             #   1 XY <sub> <mH> <mI> <mW> <hH> <hI> <path>
@@ -360,11 +387,22 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
             if worktree_status != ".":
                 out["modified"].append(path)
         elif line.startswith("u "):
+            # Unmerged. Format:
+            #   u XY <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+            # XY width check parity with type-1 and type-2 paths.
             tokens = line.split(" ", 10)
             if len(tokens) >= 11:
+                xy = tokens[1]
+                if len(xy) != 2:
+                    continue
                 out["unmerged"].append(tokens[10])
         elif line.startswith("? "):
-            out["untracked"].append(line[2:])
+            # Untracked. Strip the "? " prefix; skip if the remainder is
+            # empty (would otherwise append "" and flip clean=False with
+            # a phantom entry).
+            path = line[2:]
+            if path:
+                out["untracked"].append(path)
         # `! ignored` and any other prefixes are ignored intentionally.
 
     if is_unborn:
@@ -379,11 +417,12 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
         and not out["untracked"]
         and not out["unmerged"]
     )
-    # Cap each file-list field. A repo with millions of untracked
-    # files (forgot-to-gitignore-node_modules onboarding bug) would
-    # otherwise return all of them across MCP.
+    # Cap each file-list field and surface the omitted count in a
+    # sibling field. A repo with millions of untracked files
+    # (forgot-to-gitignore-node_modules onboarding bug) would otherwise
+    # return all of them across MCP.
     for key in ("staged", "modified", "untracked", "unmerged"):
-        out[key] = _truncated_path_list(out[key])
+        out[key], out[f"{key}_omitted"] = _truncated_path_list(out[key])
     return out
 
 
@@ -397,27 +436,44 @@ def git_status(
     Returned dict shape:
 
         {
-            "branch": "feat/widget" | "(detached)",
-            "upstream": "origin/feat/widget" | None,
-            "ahead": 0,
-            "behind": 0,
-            "clean": True/False,
-            "staged":    [path, ...],
-            "modified":  [path, ...],
-            "untracked": [path, ...],
-            "unmerged":  [path, ...],
+            "branch":     "feat/widget" | "HEAD" (detached or unborn),
+            "upstream":   "origin/feat/widget" | None,
+            "ahead":      0,
+            "behind":     0,
+            "clean":      True/False,
+            "staged":     [path, ...],
+            "modified":   [path, ...],
+            "untracked":  [path, ...],
+            "unmerged":   [path, ...],
+            "staged_omitted":    0,
+            "modified_omitted":  0,
+            "untracked_omitted": 0,
+            "unmerged_omitted":  0,
         }
 
     `clean` is True iff there are no staged, modified, untracked, or
     unmerged entries. `ahead`/`behind` are zero when no upstream is set
     or when the branch is in sync.
 
+    `branch` is the literal string "HEAD" for both detached and unborn
+    state (matching what git_current_branch returns for the same
+    states), so cross-checks between the two functions agree on "this
+    is a weird state, not a regular branch."
+
+    Each file-list field is capped at `_MAX_PATH_LIST` entries; the
+    sibling `*_omitted` field carries the count of entries that were
+    dropped (0 when the list fits under the cap). The list itself
+    contains only real paths — no sentinel marker — so callers
+    iterating with `os.stat` etc. don't trip on a non-path entry.
+
     Known limitation: pathnames containing newlines, tabs, double-quotes,
     or non-ASCII control characters are returned in git's C-quoted form
     (e.g. `weird\\"name.py` instead of `weird"name.py`) because we use
     the line-oriented porcelain=v2 output. Switching to `-z` + NUL-split
     would be the robust fix; deferred until a real bug report shows up
-    (this affects 0% of file names in typical use).
+    (this affects 0% of file names in typical use). The same limitation
+    applies to git_uncommitted_changes() which parses `git ls-files`
+    output in line-oriented mode.
     """
     text = _run_git(
         ["status", "--porcelain=v2", "--branch", "--untracked-files=normal"],
@@ -566,19 +622,19 @@ _DIFF_TRUNCATION_MARKER = (
 _MAX_PATH_LIST = 10_000
 
 
-def _truncated_path_list(paths: list[str]) -> list[str]:
-    """Cap a path list at `_MAX_PATH_LIST` entries, appending a
-    sentinel marker so the agent knows the list was truncated and
-    can fall back to a narrower query."""
+def _truncated_path_list(paths: list[str]) -> tuple[list[str], int]:
+    """Cap a path list at `_MAX_PATH_LIST` entries.
+
+    Returns `(truncated_list, omitted_count)`. The truncated list
+    contains ONLY real paths — no sentinel string — so callers
+    iterating it with `os.stat` / `Path.exists()` / `os.path.join`
+    don't trip on a non-path entry. The omitted count goes into a
+    sibling `*_omitted` field on the parent dict so the agent can
+    detect truncation explicitly and fall back to a narrower query.
+    """
     if len(paths) <= _MAX_PATH_LIST:
-        return paths
-    omitted = len(paths) - _MAX_PATH_LIST
-    truncated = paths[:_MAX_PATH_LIST]
-    truncated.append(
-        f"<... {omitted} more path{'s' if omitted != 1 else ''} omitted "
-        f"(cap {_MAX_PATH_LIST} exceeded; use a narrower query)>"
-    )
-    return truncated
+        return paths, 0
+    return paths[:_MAX_PATH_LIST], len(paths) - _MAX_PATH_LIST
 
 
 def _cap_diff(text: str) -> str:
@@ -617,19 +673,24 @@ def git_uncommitted_changes(
     Returned dict:
 
         {
-            "staged_diff":      "<git diff --cached output>",
-            "working_diff":     "<git diff output>",
-            "untracked_files":  [path, ...],
+            "staged_diff":             "<git diff --cached output>",
+            "working_diff":            "<git diff output>",
+            "untracked_files":         [path, ...],
+            "untracked_files_omitted": 0,
         }
 
-    All three may be empty (`""` / `""` / `[]`) when the working tree
-    is clean. Diffs are returned as raw unified-diff text so callers
-    can either show them verbatim or parse them further.
+    Diff strings and the untracked list may be empty (`""` / `""` /
+    `[]`) when the working tree is clean. Diffs are returned as raw
+    unified-diff text so callers can either show them verbatim or
+    parse them further.
 
-    Each diff is capped at `_MAX_DIFF_BYTES` (1 MiB). Diffs that exceed
-    the cap are truncated with an explicit marker; the caller (typically
-    an MCP agent) sees the truncation and can fall back to `git diff
-    --stat` or a path-narrowed diff.
+    Each diff is capped at `_MAX_DIFF_BYTES` (1 MiB) plus a small
+    truncation marker; diffs that exceed the cap are truncated and
+    the marker tells the caller (typically the MCP agent) to fall
+    back to `git diff --stat` or a path-narrowed diff. The
+    `untracked_files` list is capped at `_MAX_PATH_LIST` entries;
+    the `untracked_files_omitted` sibling field carries the count
+    of paths that were dropped (0 when the list fits).
     """
     staged_diff = _cap_diff(
         _run_git(["diff", "--cached"], path=path, runner=runner)
@@ -643,8 +704,10 @@ def git_uncommitted_changes(
     # split("\n") for the same reason as git_status / git_recent_commits:
     # avoid splitlines() collapsing paths that contain \r etc.
     untracked = [line for line in untracked_text.split("\n") if line]
+    untracked_capped, untracked_omitted = _truncated_path_list(untracked)
     return {
         "staged_diff": staged_diff,
         "working_diff": working_diff,
-        "untracked_files": _truncated_path_list(untracked),
+        "untracked_files": untracked_capped,
+        "untracked_files_omitted": untracked_omitted,
     }
