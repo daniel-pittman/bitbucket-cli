@@ -69,7 +69,7 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 - `repo_show(repo?)` — single-repo metadata.
 - `branches_list(repo?, count?, sort?, query?)` — branches, default sort is most-recently-updated first.
 - `branch_show(name, repo?)` — single branch detail; URL-encodes slashes in the name.
-- `commits_list(repo?, branch?, count?)` — recent commits. With `branch=None`, lists across all branches; with a branch name, lists commits reachable from that branch.
+- `commits_list(repo?, branch?, count?)` — recent commits. With `branch` omitted (or `""`), lists across all branches; with a branch name, lists commits reachable from that branch.
 - `vars_list(repo?, count?)` — pipeline configuration variables (with `secured` flag).
 - `downloads_list(repo?, count?)` — repository download artifacts.
 
@@ -185,7 +185,7 @@ Summarize the result as a status snapshot ("3 PRs open, 2 with comments; pipelin
 ```
 pr_show(pr_id=42)                # Title, source/dest, reviewers, state.
 pr_activity(pr_id=42, count=30)  # Approval / comment timeline.
-pr_diff(pr_id=42)                # Unified diff (capped at 1 MiB).
+pr_diff(pr_id=42)                # Unified diff (streamed in full; bump timeout= for very large PRs).
 pr_comments_list(pr_id=42)       # Inline + top-level comments.
 ```
 
@@ -199,7 +199,7 @@ pipeline_steps(number=142)       # Identify which step failed.
 pipeline_logs(number=142, step_index=2)  # 0-based; pull the step's raw log.
 ```
 
-Surface the log's relevant tail (last ~50 lines or the stderr region around the failure) rather than dumping the whole stream. For logs > 1 MiB the redirect-fetch helper truncates with a marker; tell the user when truncation happened and offer to re-fetch with a longer `timeout=` if they need more.
+Surface the log's relevant tail (last ~50 lines or the stderr region around the failure) rather than dumping the whole stream. For very large logs the call can hit `timeout=` mid-read and raise `BBApiError` — re-fetch with a longer `timeout=` if that happens.
 
 ---
 
