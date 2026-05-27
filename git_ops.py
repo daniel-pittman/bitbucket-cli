@@ -31,6 +31,31 @@ from typing import Any
 
 from bb_api import parse_remote_url
 
+# Subprocess defaults applied to every `git` call:
+#
+#   timeout=30s — a wedged git (stuck on a credential-helper prompt, a
+#     held `.git/index.lock`, an NFS mount whose server went away) would
+#     otherwise hang the MCP server thread forever with no recovery path.
+#
+#   encoding="utf-8" — `text=True` alone defers to
+#     locale.getpreferredencoding(), which on minimal Docker / cron /
+#     systemd contexts is ASCII or C, blowing up with UnicodeDecodeError
+#     on a UTF-8 filename or author name BEFORE we can wrap as GitOpError.
+#
+#   errors="replace" — never crash on a non-UTF-8 byte; substitute U+FFFD
+#     and keep going. The caller would rather see a single replacement
+#     character than an exception inside subprocess.run.
+_GIT_SUBPROCESS_TIMEOUT = 30.0
+
+# `-c color.ui=never` injected into every git invocation. A developer
+# with `color.ui = always` in ~/.gitconfig forces git to emit ANSI
+# escape sequences even when stdout is a pipe — the MCP agent (and
+# any other consumer) would see `\x1b[31m...\x1b[m` garbage in diffs
+# and log output. Disabling color at the command level overrides the
+# config and matches what every other "machine-readable git" wrapper
+# does.
+_GIT_NO_COLOR = ["-c", "color.ui=never"]
+
 
 # Sentinel returncode for parse-failure errors (the git command itself
 # exited 0, but our parser couldn't make sense of the output). A real git
@@ -70,19 +95,41 @@ def _run_git(
 ) -> str:
     """Run `git <args>` and return stdout text. Mirrors `bb_api.detect_repo`'s
     runner-injection pattern so tests can substitute a fake subprocess
-    without monkey-patching the module."""
-    cmd = ["git", *args]
+    without monkey-patching the module.
+
+    Every call is wrapped with:
+      - `git -c color.ui=never` so ANSI escapes never leak into diffs
+        / log output regardless of the user's gitconfig.
+      - `timeout=_GIT_SUBPROCESS_TIMEOUT` so a wedged git can't hang
+        the MCP server.
+      - `encoding="utf-8", errors="replace"` so non-ASCII filenames
+        / author names don't trip the locale-default decoder in
+        minimal-environment containers.
+    """
+    cmd = ["git", *_GIT_NO_COLOR, *args]
     cwd = str(path) if path is not None else None
     try:
         result = runner.run(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=cwd,
             check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
     except FileNotFoundError as e:
         raise GitOpError(cmd, 127, "git executable not found on PATH") from e
+    except subprocess.TimeoutExpired as e:
+        # Wrap so callers always see GitOpError. Use the parse-error
+        # sentinel (-1) — the git process never exited, so there's no
+        # real returncode to surface.
+        raise GitOpError(
+            cmd,
+            GIT_PARSE_ERROR_RETURNCODE,
+            f"git invocation timed out after {_GIT_SUBPROCESS_TIMEOUT}s",
+        ) from e
 
     if result.returncode != 0:
         raise GitOpError(cmd, result.returncode, result.stderr or "")
@@ -101,10 +148,10 @@ def git_current_branch(
 ) -> str:
     """Return the current branch name.
 
-    Detached HEAD returns the literal string `"HEAD"` — same shape as
-    `git rev-parse --abbrev-ref HEAD` produces, with no special-case
-    handling. Callers that need to distinguish "on a branch" from
-    "detached" check for `"HEAD"` explicitly.
+    Detached HEAD returns the literal string `"HEAD"`. The companion
+    `git_status` function normalises porcelain v2's `"(detached)"` to
+    the same `"HEAD"` sentinel so cross-checks between the two
+    functions agree on the same underlying state.
     """
     out = _run_git(
         ["rev-parse", "--abbrev-ref", "HEAD"], path=path, runner=runner
@@ -187,18 +234,38 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
         "untracked": [],
         "unmerged": [],
     }
-    for line in text.splitlines():
+    # split("\n") rather than splitlines(): splitlines() also breaks on
+    # \r / \v / \f / U+0085 / U+2028 / U+2029, any of which could appear
+    # inside a path on platforms / repositories that allow them, causing
+    # one logical record to fragment into multiple "lines" that each
+    # fail the per-line guards and get silently dropped.
+    for line in text.split("\n"):
+        if not line:
+            continue
         if line.startswith("# branch.head "):
-            out["branch"] = line[len("# branch.head ") :].strip()
+            branch = line[len("# branch.head ") :].strip()
+            # Porcelain v2 emits "(detached)" for detached HEAD; the
+            # `git rev-parse --abbrev-ref HEAD` path emits the literal
+            # string "HEAD" for the same state. Normalise to "HEAD" here
+            # so cross-checks between git_current_branch and git_status
+            # never disagree on the same underlying state.
+            out["branch"] = "HEAD" if branch == "(detached)" else branch
         elif line.startswith("# branch.upstream "):
             out["upstream"] = line[len("# branch.upstream ") :].strip()
         elif line.startswith("# branch.ab "):
-            # Format: "# branch.ab +N -M"
+            # Format: "# branch.ab +N -M" per porcelain v2 spec. Validate
+            # the sign prefixes so a malformed line (negative ahead,
+            # positive behind) doesn't propagate bogus values into the
+            # MCP layer.
             parts = line[len("# branch.ab ") :].split()
-            if len(parts) == 2:
+            if (
+                len(parts) == 2
+                and parts[0].startswith("+")
+                and parts[1].startswith("-")
+            ):
                 try:
-                    out["ahead"] = int(parts[0].lstrip("+"))
-                    out["behind"] = int(parts[1].lstrip("-"))
+                    out["ahead"] = int(parts[0][1:])
+                    out["behind"] = int(parts[1][1:])
                 except ValueError:
                     pass  # leave defaults
         elif line.startswith("1 "):
@@ -209,6 +276,8 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
             if len(tokens) < 9:
                 continue
             xy, path = tokens[1], tokens[8]
+            if len(xy) != 2:
+                continue  # malformed XY field
             staged_status, worktree_status = xy[0], xy[1]
             if staged_status != ".":
                 out["staged"].append(path)
@@ -225,6 +294,8 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
             if len(tokens) < 10:
                 continue
             xy, path_field = tokens[1], tokens[9]
+            if len(xy) != 2:
+                continue
             path = path_field.split("\t", 1)[0]
             staged_status, worktree_status = xy[0], xy[1]
             if staged_status != ".":
@@ -294,11 +365,14 @@ def git_status(
 
 
 # Unit Separator (0x1F) — a control character that almost never appears
-# in commit subjects, author names, or dates in practice. Using it as
-# the field separator means we don't have to worry about subject lines
-# containing pipes / tabs / whatever-else-the-author-felt-like. git
-# stores arbitrary bytes so it technically could appear; the parser
-# handles malformed lines defensively below by skipping them.
+# in commit subjects, author names, or dates in practice. git stores
+# arbitrary bytes, so a commit message could technically contain
+# U+001F; the parser handles malformed lines defensively below by
+# skipping them. The trade-off accepted here is "rare data loss on a
+# pathological commit" vs "a robust separator that won't collide with
+# common subject content like pipes, tabs, or colons." A NUL-separated
+# `git log -z --pretty=...%x00` shape is the genuinely safe variant if
+# this ever bites a real user.
 _LOG_FIELD_SEP = "\x1f"
 
 # Upper bound on `git log -n<count>` requests. Without this, an agent
@@ -362,16 +436,28 @@ def git_recent_commits(
     )
 
     commits: list[dict[str, Any]] = []
-    for line in text.splitlines():
+    # split("\n") rather than splitlines(): splitlines() treats \r / \v /
+    # \f / U+0085 / U+2028 / U+2029 as record terminators too, so a
+    # commit subject containing \r (legal in git; happens when an author
+    # pastes Windows-line-ended text into `git commit -F`) would
+    # fragment into two "lines" that each fail the parts-count check
+    # and the entire commit would silently vanish from the result.
+    for line in text.split("\n"):
         if not line:
             continue
         parts = line.split(_LOG_FIELD_SEP)
         if len(parts) != 5:
-            # Malformed line — skip rather than crash. A real git output
-            # would never emit this; if we see it, something injected the
-            # separator into a field (extremely unlikely with U+001F).
+            # Malformed line — skip rather than crash. Either git
+            # changed format unexpectedly or a commit message contained
+            # the separator character. Defensive but quiet.
             continue
         sha, short, subject, author, date = parts
+        # Reject all-empty (or no-SHA) records — a line of pure
+        # separators ("\x1f\x1f\x1f\x1f") would otherwise pass the
+        # parts-count guard and append a degenerate
+        # {"sha": "", "short": "", ...} entry.
+        if not sha:
+            continue
         commits.append(
             {
                 "sha": sha,
@@ -387,6 +473,32 @@ def git_recent_commits(
 # ---------------------------------------------------------------------------
 # Uncommitted changes (staged diff + working diff + untracked file list)
 # ---------------------------------------------------------------------------
+
+
+# Maximum bytes returned per diff. A stray multi-GB generated file
+# (binary blob, vendored deps, ML model checkpoint) accidentally staged
+# in a monorepo would otherwise materialise the entire diff in RAM and
+# ship it across the MCP boundary as a single string — almost certainly
+# OOM-killing the MCP server. 1 MiB per diff is generous for any
+# realistic code change and bounded enough that an agent receiving a
+# truncated diff can ask for a `--stat` summary instead.
+_MAX_DIFF_BYTES = 1024 * 1024
+_DIFF_TRUNCATION_MARKER = (
+    "\n\n[... diff truncated by bb MCP server: exceeded "
+    f"{_MAX_DIFF_BYTES} bytes. Use `git diff --stat` for a summary.]\n"
+)
+
+
+def _cap_diff(text: str) -> str:
+    """Truncate a diff string to `_MAX_DIFF_BYTES` if it exceeds the cap,
+    appending an explicit marker so the caller knows what happened."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _MAX_DIFF_BYTES:
+        return text
+    # Truncate at the byte cap then decode; errors="replace" handles the
+    # case where we sliced a multibyte character in half.
+    truncated = encoded[:_MAX_DIFF_BYTES].decode("utf-8", errors="replace")
+    return truncated + _DIFF_TRUNCATION_MARKER
 
 
 def git_uncommitted_changes(
@@ -407,15 +519,24 @@ def git_uncommitted_changes(
     All three may be empty (`""` / `""` / `[]`) when the working tree
     is clean. Diffs are returned as raw unified-diff text so callers
     can either show them verbatim or parse them further.
+
+    Each diff is capped at `_MAX_DIFF_BYTES` (1 MiB). Diffs that exceed
+    the cap are truncated with an explicit marker; the caller (typically
+    an MCP agent) sees the truncation and can fall back to `git diff
+    --stat` or a path-narrowed diff.
     """
-    staged_diff = _run_git(["diff", "--cached"], path=path, runner=runner)
-    working_diff = _run_git(["diff"], path=path, runner=runner)
+    staged_diff = _cap_diff(
+        _run_git(["diff", "--cached"], path=path, runner=runner)
+    )
+    working_diff = _cap_diff(_run_git(["diff"], path=path, runner=runner))
     untracked_text = _run_git(
         ["ls-files", "--others", "--exclude-standard"],
         path=path,
         runner=runner,
     )
-    untracked = [line for line in untracked_text.splitlines() if line]
+    # split("\n") for the same reason as git_status / git_recent_commits:
+    # avoid splitlines() collapsing paths that contain \r etc.
+    untracked = [line for line in untracked_text.split("\n") if line]
     return {
         "staged_diff": staged_diff,
         "working_diff": working_diff,
