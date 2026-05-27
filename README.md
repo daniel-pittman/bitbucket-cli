@@ -212,7 +212,9 @@ A Python MCP server (`mcp_server.py`) ships as a peer to the `bb` bash script. B
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
 | Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
-| Meta | `whoami` (resolves config + workspace-reachability probe with 10 s timeout; never echoes `BB_TOKEN`. Probe requires `repository:read` scope — narrower workspace-scoped tokens may report `auth.ok=False` even though pipeline/PR tools still work) |
+| Meta | `whoami` *(see footnote)* |
+
+*Footnote on `whoami`*: resolves config + git context + a workspace-reachability probe (single low-cost `GET /repositories/{workspace}?pagelen=1`, 10 s timeout). Never echoes `BB_TOKEN`. The probe requires `repository:read` scope — a workspace-scoped token granting only `pipelines:read` or `pullrequest:read` will report `auth.ok=False` even though pipeline/PR tools still work, so treat the probe as a scope hint rather than a global credential verdict.
 
 Every tool that takes a repo argument supports auto-detection (omit `repo` to resolve from the current git checkout's `origin` remote) and workspace override (`workspace/repo` shape).
 
@@ -228,8 +230,13 @@ Every tool that takes a repo argument supports auto-detection (omit `repo` to re
 
 # 2. Register the MCP server with Claude Code (user scope = all sessions on this machine):
 claude mcp add --scope user bitbucket \
-    /usr/bin/python3 \
+    python3 \
     /absolute/path/to/bitbucket-cli/mcp_server.py
+
+# `python3` is intentionally bare — `claude mcp add` inherits PATH, so a
+# Homebrew or pyenv Python 3.10+ resolves naturally. Do NOT hardcode
+# /usr/bin/python3 on macOS: Apple's bundled Python at that path is 3.9,
+# which is below the MCP server's 3.10 minimum.
 
 # 3. On first invocation, the server self-bootstraps a durable venv at
 #    $XDG_DATA_HOME/bitbucket-cli/venv (default: ~/.local/share/bitbucket-cli/venv)
@@ -245,13 +252,13 @@ claude mcp list
 
 ### Other MCP clients
 
-`mcp_server.py` is a stdio MCP server, so any client that speaks MCP-over-stdio can use it. The command is `/usr/bin/python3 /absolute/path/to/bitbucket-cli/mcp_server.py`; credentials come from `~/.config/bb/config` or environment variables (no per-server env block needed if the user has a config file).
+`mcp_server.py` is a stdio MCP server, so any client that speaks MCP-over-stdio can use it. The command is `python3 /absolute/path/to/bitbucket-cli/mcp_server.py` (resolved against the client's PATH — must be 3.10+; on macOS prefer Homebrew or pyenv over Apple's bundled 3.9 at `/usr/bin/python3`). Credentials come from `~/.config/bb/config` or environment variables; clients that strip `HOME` from the subprocess environment need to pass `BB_USER` / `BB_TOKEN` / `BB_WORKSPACE` explicitly instead.
 
 ### Environment overrides
 
 | Variable | Purpose |
 |---|---|
-| `BB_DEFAULT_REPO_PATH` | Default git checkout directory to resolve `repo=""` against when the tool call omits the repo. |
+| `BB_DEFAULT_REPO_PATH` | Default working directory for repo auto-detection (when a Bitbucket tool is called with `repo=""`) AND for the `git_*` tools' default `path=""` resolution. Defaults to the MCP server's launch cwd. |
 | `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/venv`). |
 
 ### Security
@@ -291,12 +298,13 @@ The agent description tells Claude Code's orchestrator when to delegate to it au
 
 What the agent enforces on top of the raw tools:
 
+The MCP tools already do per-call auto-detection on their own (source-branch auto-detect on `pr_create`, repo auto-detect on every Bitbucket tool given `repo=""`) — the agent doesn't re-implement those. What the agent adds:
+
 | Behavior | Without agent | With agent |
 |---|---|---|
 | **Destructive ops** (`pr_merge`, `pr_decline`, `pipeline_stop`, `pr_unapprove`) | Fired immediately when invoked | Propose-first: show diff / activity / current state, confirm with user, then act |
-| **PR creation** | Caller must supply source branch | Auto-detects from `git rev-parse --abbrev-ref HEAD`; rejects detached-HEAD state with a clear local error |
 | **Pipeline failure investigation** | Caller must navigate `pipeline_show` → `pipeline_steps` → `pipeline_logs` manually | Triages in that order, surfaces the relevant log tail (last ~50 lines around the failure) instead of dumping the whole stream |
-| **Git context resolution** | Caller passes `workspace/repo` per call | Resolves once from `git remote get-url origin` via `git_remote_repo` then auto-detects on subsequent calls |
+| **Avoiding redundant probes** | Caller may re-fetch `git_current_branch` / `git_remote_repo` per call even when the tool would auto-detect | Lets tool-level auto-detect carry the call (passes `repo=""` and omits `source_branch=` instead of pre-fetching git context just to echo it back) |
 | **`bb`-CLI maintenance** (delegated) | Re-discovers the parity rule, naming conventions, redaction patterns per session | Owns the design → implement → test → docs → PR cycle with the rules already baked in |
 | **Project conventions** | Re-discovered each session | Read from the agent file's "Project-specific conventions" section (your local copy) before any write op |
 
