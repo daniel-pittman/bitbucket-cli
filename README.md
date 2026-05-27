@@ -198,56 +198,13 @@ bb open my-repo settings
 
 ## MCP server (for Claude Code / AI agents)
 
-`bb` ships with a [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes 30 tools — pipelines, pull requests, repos, branches, commits, repo variables, and git-context helpers — so [Claude Code](https://docs.claude.com/en/docs/claude-code) (or any other MCP-aware client) can drive Bitbucket Cloud as native tools.
+A Python MCP server (`mcp_server.py`) ships as a peer to the `bb` bash script. Both implement the **same Bitbucket Cloud REST contract** independently — the MCP server does not shell out to `bb`; it speaks HTTP directly via Python stdlib (no `requests` etc.). Any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive Bitbucket Cloud as native tools without invoking the CLI.
 
-The MCP server is a **parallel implementation** of the same Bitbucket REST contract as the bash CLI — it does not shell out to `bb`. It speaks HTTP directly via Python stdlib (no `requests` etc.).
+### What it exposes
 
-### Requirements
+30 tools covering pipelines, pull requests, repos, branches, commits, pipeline variables, and git-context helpers:
 
-- Python 3.10+ (only required for the MCP server; the bash CLI does not need Python)
-- The same `BB_USER` / `BB_TOKEN` / `BB_WORKSPACE` credentials as the CLI
-
-### Install
-
-The MCP server self-bootstraps a virtual environment on first run, so installation is just two steps: clone the repo (see [Installation](#installation) step 1), then point your MCP client at `mcp_server.py`. The first invocation creates `~/.local/share/bitbucket-cli/venv` (relocate by setting `XDG_DATA_HOME`; the venv then lives at `$XDG_DATA_HOME/bitbucket-cli/venv`) and installs the `mcp` package. Subsequent invocations reuse the venv — startup is fast.
-
-### Claude Code (`.mcp.json` or `claude mcp add`)
-
-Add the server to your Claude Code MCP config. The simplest form:
-
-```json
-{
-  "mcpServers": {
-    "bitbucket": {
-      "command": "python3",
-      "args": ["/absolute/path/to/bitbucket-cli/mcp_server.py"],
-      "env": {
-        "BB_USER": "your-email@example.com",
-        "BB_TOKEN": "your-api-token",
-        "BB_WORKSPACE": "your-workspace"
-      }
-    }
-  }
-}
-```
-
-Or via the CLI:
-
-```bash
-claude mcp add bitbucket \
-  --env BB_USER=your-email@example.com \
-  --env BB_TOKEN=your-api-token \
-  --env BB_WORKSPACE=your-workspace \
-  -- python3 /absolute/path/to/bitbucket-cli/mcp_server.py
-```
-
-### Other MCP clients
-
-`mcp_server.py` is a stdio MCP server, so any client that speaks MCP-over-stdio can use it. The `command` is `python3 /absolute/path/to/bitbucket-cli/mcp_server.py`; environment variables are the same three credentials above.
-
-### Tool surface (30 tools)
-
-| Area | Tools |
+| Category | Tools |
 |---|---|
 | Pipelines (read) | `pipelines_list`, `pipeline_show`, `pipeline_steps`, `pipeline_logs` |
 | Pipelines (write) | `pipeline_trigger`, `pipeline_stop` |
@@ -255,13 +212,47 @@ claude mcp add bitbucket \
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
 | Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
-| Meta | `whoami` (resolves config + workspace-reachability probe with 10s timeout; never echoes `BB_TOKEN`. Probe requires `repository:read` scope — narrower workspace-scoped tokens may report `auth.ok=False` even though pipeline/PR tools still work) |
+| Meta | `whoami` (resolves config + workspace-reachability probe with 10 s timeout; never echoes `BB_TOKEN`. Probe requires `repository:read` scope — narrower workspace-scoped tokens may report `auth.ok=False` even though pipeline/PR tools still work) |
 
 Every tool that takes a repo argument supports auto-detection (omit `repo` to resolve from the current git checkout's `origin` remote) and workspace override (`workspace/repo` shape).
 
-### Agent definition
+### Requirements
 
-A generic agent definition that documents the tool surface, operating principles (resolve-git-context-first, show-diffs-before-destructive-ops, parity discipline), and worked examples lives at [`agents/bitbucket.md`](agents/bitbucket.md). Copy it into your Claude Code agent directory if you want a dedicated subagent for Bitbucket work.
+- Python 3.10+ available on PATH (the bash CLI doesn't need Python — only the MCP server does).
+- The same `~/.config/bb/config` (or `BB_USER` / `BB_TOKEN` / `BB_WORKSPACE` env vars) as the CLI — see [Configuration](#configuration) above.
+
+### Installation
+
+```bash
+# 1. Make sure bb itself is installed and configured (see Configuration above).
+
+# 2. Register the MCP server with Claude Code (user scope = all sessions on this machine):
+claude mcp add --scope user bitbucket \
+    /usr/bin/python3 \
+    /absolute/path/to/bitbucket-cli/mcp_server.py
+
+# 3. On first invocation, the server self-bootstraps a durable venv at
+#    $XDG_DATA_HOME/bitbucket-cli/venv (default: ~/.local/share/bitbucket-cli/venv)
+#    and installs the `mcp` package into it. Subsequent launches reuse the venv.
+#
+#    To force a clean rebuild: `rm -rf ~/.local/share/bitbucket-cli/venv` and
+#    relaunch the MCP server.
+
+# 4. Verify:
+claude mcp list
+# Should show: bitbucket: ... - ✓ Connected
+```
+
+### Other MCP clients
+
+`mcp_server.py` is a stdio MCP server, so any client that speaks MCP-over-stdio can use it. The command is `/usr/bin/python3 /absolute/path/to/bitbucket-cli/mcp_server.py`; credentials come from `~/.config/bb/config` or environment variables (no per-server env block needed if the user has a config file).
+
+### Environment overrides
+
+| Variable | Purpose |
+|---|---|
+| `BB_DEFAULT_REPO_PATH` | Default git checkout directory to resolve `repo=""` against when the tool call omits the repo. |
+| `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/venv`). |
 
 ### Security
 
@@ -269,6 +260,47 @@ A generic agent definition that documents the tool surface, operating principles
 - URL credentials (`https://user:token@host/...`) and signed-URL query parameters (AWS / Azure / GCP / bearer / access_token / api_key) are stripped from every error message.
 - Cross-host `Authorization` headers are stripped on redirect so the Bitbucket Basic header never reaches S3 when fetching pipeline logs.
 - Pipeline variable values are masked as `KEY=***` when echoed back.
+
+### Optional: install the bundled `bitbucket` agent for delegated use
+
+The MCP server exposes the *tools*; the bundled **agent** (`agents/bitbucket.md` in this repo) is the *behavioral layer* that makes a Claude Code session use those tools intelligently — propose-first protocol for destructive ops (`pr_merge`, `pr_decline`, `pipeline_stop`, `pr_unapprove`), resolve-git-context-first before any Bitbucket call, show-diffs-before-merge discipline, bash/Python parity rule for delegated CLI maintenance, and the project-conventions checklist for tracking per-workspace defaults.
+
+The bundled `agents/bitbucket.md` is a **deliberately-generic template** — it ships with placeholder examples (`acme/widget-service`, fictional reviewers, generic custom-pipeline patterns like `deploy-prod`) and an explicitly-blank "Project-specific conventions" section at the bottom. After copying it to `~/.claude/agents/bitbucket.md`, personalize your local copy with your default workspace, required reviewers, custom pipeline patterns, branch naming conventions, and any other non-generic context. **Anything you contribute back to this repo via PR should be re-genericized first** — real workspace slugs, real ticket titles, real reviewer handles, and project-specific custom-pipeline patterns belong only in your personal `~/.claude/agents/` copy, never in the upstream-tracked version.
+
+The agent is a single Markdown file with frontmatter. To install:
+
+```bash
+# 1. Copy the agent definition into user-scope agents.
+mkdir -p ~/.claude/agents
+cp agents/bitbucket.md ~/.claude/agents/bitbucket.md
+
+# 2. Customize the "Project-specific conventions" section near the bottom
+#    for your project(s) — default workspace, required reviewers, custom
+#    pipeline patterns, sensitive variable names. The file ships with a
+#    checklist of what to capture per project.
+
+# 3. (No restart needed for new sessions.) In any Claude Code session on
+#    this machine you can now delegate to it:
+#
+#    "Use the bitbucket agent to merge PR 42"
+#    "Have the bitbucket agent watch pipeline 142"
+#    "Ask the bitbucket agent to trigger a deploy-prod run on main"
+```
+
+The agent description tells Claude Code's orchestrator when to delegate to it automatically (e.g. when the user mentions Bitbucket pipeline / PR / repo operations). You don't have to invoke it by name.
+
+What the agent enforces on top of the raw tools:
+
+| Behavior | Without agent | With agent |
+|---|---|---|
+| **Destructive ops** (`pr_merge`, `pr_decline`, `pipeline_stop`, `pr_unapprove`) | Fired immediately when invoked | Propose-first: show diff / activity / current state, confirm with user, then act |
+| **PR creation** | Caller must supply source branch | Auto-detects from `git rev-parse --abbrev-ref HEAD`; rejects detached-HEAD state with a clear local error |
+| **Pipeline failure investigation** | Caller must navigate `pipeline_show` → `pipeline_steps` → `pipeline_logs` manually | Triages in that order, surfaces the relevant log tail (last ~50 lines around the failure) instead of dumping the whole stream |
+| **Git context resolution** | Caller passes `workspace/repo` per call | Resolves once from `git remote get-url origin` via `git_remote_repo` then auto-detects on subsequent calls |
+| **`bb`-CLI maintenance** (delegated) | Re-discovers the parity rule, naming conventions, redaction patterns per session | Owns the design → implement → test → docs → PR cycle with the rules already baked in |
+| **Project conventions** | Re-discovered each session | Read from the agent file's "Project-specific conventions" section (your local copy) before any write op |
+
+The agent file is genuinely portable — strip the example "Project-specific conventions" section and you have a clean template that works for any Bitbucket Cloud workspace.
 
 ## License
 
