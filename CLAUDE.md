@@ -32,7 +32,7 @@ bitbucket-cli/
 
 ## Key Technical Details
 
-- **Languages**: bash (4.0+) and Python (3.10+)
+- **Languages**: bash (3.2+ — macOS system bash is supported) and Python (3.10+)
 - **API**: Bitbucket Cloud REST API v2.0 (`https://api.bitbucket.org/2.0`)
 - **Auth**: HTTP Basic using Atlassian API tokens
   - `BB_USER`: Bitbucket account email

@@ -66,16 +66,21 @@ choco install jq
 
 3. Symlink to your PATH. Pick the directory that's on your PATH and that you own:
    ```bash
-   # macOS with Homebrew (no sudo needed):
-   ln -s "$(pwd)/bb" /opt/homebrew/bin/bb
+   # macOS with Homebrew (no sudo needed; resolves to /opt/homebrew on
+   # Apple Silicon, /usr/local on Intel Macs):
+   ln -s "$(pwd)/bb" "$(brew --prefix)/bin/bb"
 
    # macOS without Homebrew, or Linux (needs sudo on most setups):
    sudo ln -s "$(pwd)/bb" /usr/local/bin/bb
    ```
 
-   Or add the directory to your PATH:
+   Or add the directory to your PATH (pick the rc file your shell uses;
+   macOS defaults to zsh since Catalina):
    ```bash
+   # bash:
    echo 'export PATH="$PATH:/path/to/bitbucket-cli"' >> ~/.bashrc
+   # zsh (default on macOS):
+   echo 'export PATH="$PATH:/path/to/bitbucket-cli"' >> ~/.zshrc
    ```
 
 ## Configuration
