@@ -871,9 +871,40 @@ class TestWhoami:
         self._stub_auth_ok(stub_client)
         out = mcp_server.whoami()
         assert out["ok"] is True  # config still loaded
-        # When _default_repo_path raises, both git_branch/git_remote
-        # probes are skipped — only cwd_error is recorded.
-        assert "git_branch_error" in out or "cwd_error" in out
+        # The autouse fixture sets BB_DEFAULT_REPO_PATH so cwd resolves
+        # cleanly — both git probes run and both capture their failures.
+        assert "git_branch_error" in out
+        assert "git_remote_error" in out
+
+    def test_cwd_error_skips_git_probes(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When _default_repo_path raises (e.g. cwd was deleted out from
+        under the process), the per-probe git calls must be SKIPPED — not
+        called with path=None and not silently swallowed. cwd_error
+        captures the failure; no git_branch_error / git_remote_error
+        keys are written."""
+        def raise_cwd() -> str:
+            raise OSError("[Errno 2] No such file or directory")
+
+        monkeypatch.setattr(mcp_server, "_default_repo_path", raise_cwd)
+        # Tripwires — if either gets called we want a loud test failure,
+        # not a silent pass.
+        def boom(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("git probe ran despite cwd_error")
+        monkeypatch.setattr(git_ops, "git_current_branch", boom)
+        monkeypatch.setattr(git_ops, "git_remote_repo", boom)
+        self._stub_auth_ok(stub_client)
+        out = mcp_server.whoami()
+        assert out["ok"] is True
+        assert "cwd_error" in out
+        assert "git_branch_error" not in out
+        assert "git_remote_error" not in out
+        assert "cwd" not in out
+        # Phase 3 still runs — auth is independent of cwd.
+        assert out["auth"] == {"ok": True}
 
     def test_config_error_flips_ok_false(
         self, monkeypatch: pytest.MonkeyPatch
