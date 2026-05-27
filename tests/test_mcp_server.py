@@ -195,6 +195,47 @@ class TestResolveRepo:
         _, ws, slug = mcp_server._resolve_repo("   ")
         assert ws == "from-remote"
 
+    def test_none_treated_as_empty(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """JSON `null` from the MCP client deserialises to None.
+        Without normalisation, .strip() would crash uncaught with
+        AttributeError."""
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo",
+            lambda path=None: ("from-remote", "ws"),
+        )
+        _, ws, _ = mcp_server._resolve_repo(None)
+        assert ws == "from-remote"
+
+    def test_inner_slug_parts_stripped(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """'acme/ widget' (whitespace on the slug-half after split)
+        must not slip through as ws='acme', slug=' widget' and 404
+        on `/repositories/acme/%20widget`."""
+        client, ws, slug = mcp_server._resolve_repo("acme/ widget")
+        assert ws == "acme"
+        assert slug == "widget"
+
+    def test_repo_validated_before_get_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh-machine user without config + a malformed slug
+        should see the ValueError (real cause) not BBConfigError
+        (masking failure)."""
+        mcp_server._reset_client_cache()
+        def raise_config(*_args: Any, **_kwargs: Any) -> Any:
+            raise bb_api.BBConfigError("Missing BB_USER")
+        monkeypatch.setattr(bb_api, "load_config", raise_config)
+        # Malformed repo: three parts. Should raise ValueError, NOT
+        # BBConfigError — proves the shape check runs before
+        # _get_client().
+        with pytest.raises(ValueError, match="repo must be"):
+            mcp_server._resolve_repo("a/b/c")
+
 
 # ---------------------------------------------------------------------------
 # _error_dict
@@ -210,6 +251,35 @@ class TestErrorDict:
         assert d["status"] == 404
         assert d["url"] == "https://x/y"
         assert "nope" in d["body"]
+
+    def test_bbapierror_redacts_signed_s3_url(self) -> None:
+        """Round-2 SECURITY finding: pipeline_logs / pr_diff follow
+        Bitbucket's 307 to a signed S3 URL. If S3 then returns non-3xx
+        (clock skew, expired, network hiccup), BBApiError.url carries
+        the signed URL with AWS credentials in the query string. The
+        agent error dict must NOT propagate it."""
+        signed = (
+            "https://bbuseruploads.s3.amazonaws.com/path/to/log?"
+            "X-Amz-Signature=abcd1234supersecret&X-Amz-Credential=AKIAEXAMPLE"
+            "&Expires=12345"
+        )
+        e = bb_api.BBApiError(403, signed, "AccessDenied")
+        d = mcp_server._error_dict(e)
+        assert "abcd1234supersecret" not in d["url"]
+        assert "AKIAEXAMPLE" not in d["url"]
+        assert "redacted-signed-url-params" in d["url"]
+        # Path part preserved so the agent knows what host was called.
+        assert "bbuseruploads.s3.amazonaws.com" in d["url"]
+
+    def test_bbapierror_redacts_embedded_creds(self) -> None:
+        e = bb_api.BBApiError(
+            401,
+            "https://user:supersecret@api.bitbucket.org/2.0/foo",
+            "Unauthorized",
+        )
+        d = mcp_server._error_dict(e)
+        assert "supersecret" not in d["url"]
+        assert "[redacted]" in d["url"]
 
     def test_bbopnotfound_kind(self) -> None:
         e = bb_ops.BBOpNotFound("pipeline #42 not found")
@@ -306,6 +376,10 @@ class TestPipelineTools:
         assert out["ok"] is False
         assert out["kind"] == "BBOpNotFound"
         assert "#999" in out["message"]
+        # Request identifier threaded into the error dict so an agent
+        # running parallel pipeline_show calls can correlate failures
+        # with originating requests.
+        assert out["number"] == 999
 
     def test_pipeline_show_wraps_bbapierror(
         self, stub_client: bb_api.BBClient
@@ -318,6 +392,7 @@ class TestPipelineTools:
         assert out["ok"] is False
         assert out["status"] == 403
         assert "forbidden" in out["body"]
+        assert out["number"] == 42
 
     def test_pipeline_trigger_empty_pattern_passes_none(
         self, stub_client: bb_api.BBClient
@@ -467,6 +542,25 @@ class TestRepoTools:
         with patch.object(bb_ops, "repos_list", recorder):
             mcp_server.repos_list(workspace="other")
         assert recorder.calls[0][1]["workspace"] == "other"
+
+    def test_repos_list_strips_workspace_whitespace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """' acme' / 'acme ' must not slip through and 404 on
+        `/repositories/%20acme`."""
+        recorder = _recorder([])
+        with patch.object(bb_ops, "repos_list", recorder):
+            mcp_server.repos_list(workspace="  other-org  ")
+        assert recorder.calls[0][1]["workspace"] == "other-org"
+
+    def test_repos_list_whitespace_only_workspace_falls_back(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Whitespace-only workspace falls back to config workspace."""
+        recorder = _recorder([])
+        with patch.object(bb_ops, "repos_list", recorder):
+            mcp_server.repos_list(workspace="   ")
+        assert recorder.calls[0][1]["workspace"] == "acme"  # from config
 
     def test_branch_show_passes_name(self, stub_client: bb_api.BBClient) -> None:
         recorder = _recorder({"name": "feat/widget"})

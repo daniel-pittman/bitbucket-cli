@@ -39,6 +39,7 @@ Environment overrides:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -106,6 +107,25 @@ def _find_builder_python() -> str:
     )
 
 
+def _pip_install_or_diagnose(args: list[str]) -> None:
+    """Run pip install, capturing stderr so a failure surfaces with the
+    real diagnostic (network blip, version yank, SSL cert, proxy) rather
+    than `CalledProcessError: returned non-zero exit status 1`.
+
+    Dropping `--quiet` AND capture_output=True so the user sees pip's
+    actual error in the bootstrap-failure message.
+    """
+    try:
+        subprocess.run(args, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        # Re-raise with the captured stderr inlined so the user can act
+        # on it. The original CalledProcessError loses pip's diagnostic.
+        diag = (e.stderr or e.stdout or "").strip()
+        raise RuntimeError(
+            f"[bb-mcp] pip install failed (exit {e.returncode}):\n{diag}"
+        ) from e
+
+
 def _bootstrap_venv() -> None:
     """Create /tmp/bbenv on first run, install deps, re-exec under it.
 
@@ -126,28 +146,26 @@ def _bootstrap_venv() -> None:
         # half-finished bootstrap left _VENV_PY in place).
         if not _VENV_PY.exists():
             subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
-        subprocess.check_call(
+        _pip_install_or_diagnose(
             [str(_VENV_PY), "-m", "pip", "install",
-             "--quiet", "--no-cache-dir", "--upgrade", "pip"]
+             "--no-cache-dir", "--upgrade", "pip"]
         )
-        subprocess.check_call(
+        _pip_install_or_diagnose(
             [str(_VENV_PY), "-m", "pip", "install",
-             "--quiet", "--no-cache-dir", *_VENV_DEPS]
+             "--no-cache-dir", *_VENV_DEPS]
         )
         # Sentinel last — any earlier failure leaves it absent so the
         # next launch retries the install.
         _VENV_READY.touch()
 
     # Detect "are we already running under the bootstrap venv?" via
-    # sys.prefix rather than realpath(sys.executable). `python -m venv`
-    # on Linux/macOS defaults to --symlinks, so realpath(/tmp/bbenv/bin/
-    # python3) resolves to the SAME canonical path as the builder
-    # interpreter (e.g. /usr/bin/python3.12). Comparing realpaths would
-    # claim "already under venv" when we're actually still under the
-    # system interpreter, skipping the execv and dying on the mcp
-    # import. sys.prefix is set per-interpreter from the venv layout
-    # and is the authoritative signal.
-    if sys.prefix != str(_VENV_DIR):
+    # resolved sys.prefix. Both `python -m venv` on Linux/macOS (which
+    # symlinks the interpreter) and macOS's `/tmp -> /private/tmp`
+    # mean we must resolve BOTH sides through realpath, not just rely
+    # on string equality. Without the resolve, /tmp/bbenv vs
+    # /private/tmp/bbenv would compare unequal forever and trigger an
+    # infinite execv loop.
+    if Path(sys.prefix).resolve() != _VENV_DIR.resolve():
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
 
 
@@ -161,7 +179,22 @@ _MCP_SKIP_BOOTSTRAP = os.environ.get("BB_MCP_SKIP_BOOTSTRAP", "") == "1"
 
 if not _MCP_SKIP_BOOTSTRAP:
     _bootstrap_venv()
-    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+    try:
+        from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+    except ImportError as e:
+        # Sentinel-present launch found `mcp` missing — manual `pip
+        # uninstall`, partial /tmp cleanup that wiped the package dir
+        # but spared the touch file, or an image-layer accident. Tell
+        # the user the recovery path explicitly rather than letting
+        # them chase a bare ModuleNotFoundError.
+        raise ImportError(
+            f"[bb-mcp] FastMCP import failed even though {_VENV_READY} "
+            f"says the venv is ready ({e}). The mcp package was probably "
+            f"removed out-of-band. Recover with:\n"
+            f"  rm {_VENV_READY}\n"
+            f"…then relaunch — bootstrap will reinstall. Or nuke the "
+            f"whole venv with `rm -rf {_VENV_DIR}` if state is corrupt."
+        ) from e
 else:
     # Minimal no-op stub. `@mcp.tool()` returns the function unchanged so
     # tests can call the wrapped tool directly. The stub class is callable
@@ -230,45 +263,64 @@ def _default_repo_path() -> str:
     """Working directory for git auto-detection. Priority:
       1. BB_DEFAULT_REPO_PATH environment variable
       2. Current working directory at MCP server launch time
+
+    `os.environ.get("KEY", os.getcwd())` evaluates the default
+    eagerly — `os.getcwd()` would run even when the env var is set,
+    meaning the env-var override never actually protects against a
+    deleted cwd. Use `... or os.getcwd()` so the override is lazy.
     """
-    return os.environ.get("BB_DEFAULT_REPO_PATH", os.getcwd())
+    return os.environ.get("BB_DEFAULT_REPO_PATH") or os.getcwd()
 
 
-def _resolve_repo(repo: str = "") -> tuple[bb_api.BBClient, str, str]:
+def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
     """Resolve (client, workspace, repo_slug) from a single repo argument.
 
     Accepted shapes for `repo`:
-      - ""               → auto-detect via `git remote get-url origin` from
-                           BB_DEFAULT_REPO_PATH (or cwd). Workspace + slug
-                           come from the remote URL.
+      - "" / None        → auto-detect via `git remote get-url origin`
+                           from BB_DEFAULT_REPO_PATH (or cwd). Workspace +
+                           slug come from the remote URL.
       - "myrepo"         → use config workspace (BB_WORKSPACE) + "myrepo"
-      - "acme/myrepo"    → use "acme" workspace + "myrepo" slug (overrides
-                           BB_WORKSPACE for this call)
+      - "acme/myrepo"    → use "acme" workspace + "myrepo" slug
+                           (overrides BB_WORKSPACE for this call)
 
-    Whitespace is stripped before parsing so a sloppy paste or
-    agent-side string concat ("  acme/widget  ") doesn't slip through
-    as workspace="  acme" and surface as a deep API failure.
+    Whitespace stripped on the whole arg AND on each slug-part after
+    split, so " acme/widget " AND "acme/ widget" both normalise to
+    ("acme", "widget"). A `None` from a deserialised JSON `null` is
+    treated the same as `""` (auto-detect path), not a crash.
 
-    Raises bb_api.BBConfigError on missing config or unresolvable remote.
+    Validation happens BEFORE _get_client() so a malformed slug on a
+    fresh-machine user without ~/.config/bb/config surfaces as a clean
+    ValueError, not a BBConfigError that masks the real cause.
+
+    Raises bb_api.BBConfigError on missing config (only AFTER repo is
+    validated).
     Raises ValueError on malformed `repo` argument.
     """
-    client = _get_client()
-    repo = repo.strip()
+    # Normalise: None → "", strip whitespace. JSON `null` from the MCP
+    # client deserialises to None; without this guard, .strip() crashes
+    # uncaught with AttributeError.
+    repo = (repo or "").strip()
 
     if not repo:
-        # Auto-detect from git remote.
+        # Auto-detect path. _get_client AFTER any structural validation.
+        client = _get_client()
         workspace, repo_slug = git_ops.git_remote_repo(path=_default_repo_path())
         return client, workspace, repo_slug
 
     if "/" in repo:
-        parts = repo.split("/")
+        # Strip every part to handle "acme/ widget" → ("acme", "widget").
+        parts = [p.strip() for p in repo.split("/")]
         if len(parts) != 2 or not parts[0] or not parts[1]:
             raise ValueError(
                 f"repo must be 'workspace/repo' or 'repo'; got {repo!r}"
             )
+        client = _get_client()
         return client, parts[0], parts[1]
 
-    # Bare slug → use configured workspace.
+    # Bare slug → use configured workspace. _get_client comes AFTER
+    # the shape check above so a malformed arg surfaces as ValueError
+    # even on a machine without config.
+    client = _get_client()
     return client, client.config.workspace, repo
 
 
@@ -280,18 +332,53 @@ def _resolve_repo(repo: str = "") -> tuple[bb_api.BBClient, str, str]:
 # Keeping a consistent shape means the MCP agent can branch on `ok` once and
 # render the result vs. error path uniformly.
 
+# Match a URL with embedded credentials OR an AWS-style signed URL with
+# a `Signature` / `X-Amz-Signature` / `X-Amz-Credential` query parameter.
+# Either shape would leak a high-value secret if echoed into an error
+# message that flows up through MCP into agent context / downstream logs.
+_URL_CRED_PATTERN = re.compile(r"://[^/]+@")
+_SIGNED_URL_INDICATORS = ("X-Amz-Signature=", "X-Amz-Credential=", "Signature=")
+
+
+def _redact_url(url: str) -> str:
+    """Strip URL-embedded credentials AND replace signed URLs whose
+    query string contains a meaningful credential parameter. Used in
+    `_error_dict` to defend against `pipeline_logs` / `pr_diff`
+    redirect chains landing on Bitbucket's signed S3 URLs — bb_api's
+    fetch_redirected_text follows the redirect and (on a downstream
+    failure like S3 clock skew → 403) raises BBApiError(url=<signed
+    S3 URL>). The signed URL embeds AWS credentials in the query and
+    must not flow into agent context or downstream logs.
+    """
+    if not url:
+        return url
+    # `user:token@host` form (Bitbucket basic-auth-embedded URLs).
+    redacted = _URL_CRED_PATTERN.sub("://[redacted]@", url)
+    # Presigned-URL detection — if any of the credential-bearing query
+    # parameters are present, replace the whole query string with a
+    # marker. Path is preserved so the agent knows what host/path was
+    # called.
+    if "?" in redacted:
+        path_part, _, query_part = redacted.partition("?")
+        if any(ind in query_part for ind in _SIGNED_URL_INDICATORS):
+            redacted = f"{path_part}?[redacted-signed-url-params]"
+    return redacted
+
+
 def _error_dict(e: Exception) -> dict[str, Any]:
     """Translate any tool-side exception into a structured error dict.
 
-    The agent sees `kind`, `message`, and (for BBApiError) the HTTP status
-    + URL so it can branch on `kind == "BBApiError" and status == 404`
-    without parsing the message string.
+    The agent sees `kind`, `message`, and (for BBApiError) the HTTP
+    status + redacted URL so it can branch on `kind == "BBApiError"
+    and status == 404` without parsing the message string. URLs are
+    routed through `_redact_url` so embedded credentials AND AWS
+    signed-URL parameters never leak into the agent context.
     """
     kind = type(e).__name__
     out: dict[str, Any] = {"ok": False, "kind": kind, "message": str(e)}
     if isinstance(e, bb_api.BBApiError):
         out["status"] = e.status
-        out["url"] = e.url
+        out["url"] = _redact_url(e.url)
         out["body"] = e.body
     elif isinstance(e, git_ops.GitOpError):
         out["returncode"] = e.returncode
@@ -299,21 +386,42 @@ def _error_dict(e: Exception) -> dict[str, Any]:
     return out
 
 
+def _error_dict_with(e: Exception, **extras: Any) -> dict[str, Any]:
+    """Like `_error_dict` but threads caller-supplied identifiers
+    (pr_id, step_index, number, ...) into the error response so the
+    agent can correlate fan-out failures with their originating
+    requests. Without this, parallel pipeline_logs / pr_show calls
+    fail with no way to tell which call's error went to which result
+    slot."""
+    return {**_error_dict(e), **extras}
+
+
 # Exceptions every tool wraps. Other exceptions propagate (they're
 # programmer errors and should crash visibly during development).
-# OSError covers IsADirectoryError, ConnectionResetError, BlockingIOError,
-# and a few other paths that git_ops._run_git doesn't wrap explicitly
-# (only FileNotFoundError / NotADirectoryError / PermissionError do).
-# Also catches os.getcwd() on a deleted cwd, which fires inside
-# _default_repo_path() BEFORE any wrapped git call.
+#
+# Includes:
+#   - OSError covers IsADirectoryError, ConnectionResetError,
+#     BlockingIOError, ChildProcessError — paths git_ops._run_git
+#     doesn't wrap explicitly (only FileNotFoundError /
+#     NotADirectoryError / PermissionError do). Also catches
+#     os.getcwd() on a deleted cwd inside _default_repo_path().
+#   - AttributeError covers the JSON-null-into-string-arg case where
+#     an MCP client sends {"repo": null} and `.strip()` would
+#     otherwise crash uncaught.
+#
+# Deliberately EXCLUDES TypeError — a refactor that renames a bb_ops
+# kwarg should surface as an obvious dev-time crash, not a fake
+# Bitbucket failure the agent reports back. The only intentional
+# TypeError raise is in bb_api._validate_query_value, which is at
+# a layer no MCP wrapper drives directly.
 _TOOL_EXPECTED_EXCEPTIONS = (
     bb_api.BBApiError,
     bb_api.BBConfigError,
     bb_ops.BBOpNotFound,
     git_ops.GitOpError,
     OSError,
+    AttributeError,
     ValueError,
-    TypeError,
 )
 
 
@@ -322,6 +430,18 @@ _TOOL_EXPECTED_EXCEPTIONS = (
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("bb")
+
+
+def _opt_str(value: str | None) -> str | None:
+    """Normalise an MCP-string-or-null arg to a non-empty stripped string
+    or None. Used for optional string parameters (branch, pattern,
+    query, message) so that "", "   ", and None all funnel to None
+    rather than getting inconsistently reported as different errors
+    by the bb_ops layer."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 # =============================================================================
@@ -350,7 +470,7 @@ def pipelines_list(
         pipelines = bb_ops.pipelines_list(
             client, workspace, repo_slug,
             count=count,
-            branch=branch or None,
+            branch=_opt_str(branch),
             sort=sort,
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pipelines": pipelines}
@@ -366,7 +486,7 @@ def pipeline_show(number: int, repo: str = "") -> dict[str, Any]:
         pipeline = bb_ops.pipeline_show(client, workspace, repo_slug, number)
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pipeline": pipeline}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, number=number)
 
 
 @mcp.tool()
@@ -377,7 +497,7 @@ def pipeline_steps(number: int, repo: str = "") -> dict[str, Any]:
         steps = bb_ops.pipeline_steps(client, workspace, repo_slug, number)
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "steps": steps}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, number=number)
 
 
 @mcp.tool()
@@ -403,7 +523,7 @@ def pipeline_trigger(
         pipeline = bb_ops.pipeline_trigger(
             client, workspace, repo_slug,
             branch=branch,
-            pattern=pattern or None,
+            pattern=_opt_str(pattern),
             variables=variables,
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pipeline": pipeline}
@@ -419,7 +539,7 @@ def pipeline_stop(number: int, repo: str = "") -> dict[str, Any]:
         result = bb_ops.pipeline_stop(client, workspace, repo_slug, number)
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "result": result}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, number=number)
 
 
 @mcp.tool()
@@ -456,7 +576,7 @@ def pipeline_logs(
             "log": text,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, number=number, step_index=step_index)
 
 
 # =============================================================================
@@ -489,7 +609,7 @@ def pr_show(pr_id: int, repo: str = "") -> dict[str, Any]:
         pr = bb_ops.pr_show(client, workspace, repo_slug, pr_id)
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pr": pr}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -506,7 +626,7 @@ def pr_activity(pr_id: int, repo: str = "", count: int = 50) -> dict[str, Any]:
             "activity": activity,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -579,7 +699,7 @@ def pr_approve(pr_id: int, repo: str = "") -> dict[str, Any]:
             "approval": result,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -596,7 +716,7 @@ def pr_unapprove(pr_id: int, repo: str = "") -> dict[str, Any]:
             "result": result,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -617,11 +737,11 @@ def pr_merge(
             client, workspace, repo_slug, pr_id,
             strategy=strategy,
             close_source_branch=close_source_branch,
-            message=message or None,
+            message=_opt_str(message),
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pr": result}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -632,7 +752,7 @@ def pr_decline(pr_id: int, repo: str = "") -> dict[str, Any]:
         result = bb_ops.pr_decline(client, workspace, repo_slug, pr_id)
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pr": result}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -656,7 +776,7 @@ def pr_diff(pr_id: int, repo: str = "", timeout: float = 120.0) -> dict[str, Any
             "diff": diff,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -673,7 +793,7 @@ def pr_comments_list(pr_id: int, repo: str = "", count: int = 100) -> dict[str, 
             "comments": comments,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 @mcp.tool()
@@ -690,7 +810,7 @@ def pr_comment_add(pr_id: int, body: str, repo: str = "") -> dict[str, Any]:
             "comment": comment,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, pr_id=pr_id)
 
 
 # =============================================================================
@@ -715,13 +835,16 @@ def repos_list(
     """
     try:
         client = _get_client()
-        ws = workspace or client.config.workspace
+        # Strip + fall back so " acme" / "acme " don't slip through and
+        # end up as `/repositories/%20acme` (404). Whitespace-only
+        # workspace falls back to the configured one.
+        ws = (workspace or "").strip() or client.config.workspace
         repos = bb_ops.repos_list(
             client,
             workspace=ws,
             count=count,
             sort=sort,
-            query=query or None,
+            query=_opt_str(query),
         )
         return {"ok": True, "workspace": ws, "repos": repos}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
@@ -753,7 +876,7 @@ def branches_list(
             client, workspace, repo_slug,
             count=count,
             sort=sort,
-            query=query or None,
+            query=_opt_str(query),
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "branches": branches}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
@@ -813,16 +936,17 @@ def commits_list(repo: str = "", branch: str = "", count: int = 10) -> dict[str,
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
+        normalised_branch = _opt_str(branch)
         commits = bb_ops.commits_list(
             client, workspace, repo_slug,
-            branch=branch or None,
+            branch=normalised_branch,
             count=count,
         )
         return {
             "ok": True,
             "workspace": workspace,
             "repo": repo_slug,
-            "branch": branch or None,
+            "branch": normalised_branch,
             "commits": commits,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
@@ -880,8 +1004,11 @@ def git_recent_commits(path: str = "", count: int = 10, ref: str = "HEAD") -> di
     """List the most recent `count` commits reachable from `ref`."""
     try:
         cwd = path or _default_repo_path()
-        commits = git_ops.git_recent_commits(path=cwd, count=count, ref=ref)
-        return {"ok": True, "path": cwd, "ref": ref, "commits": commits}
+        # Echo the stripped ref so the response matches what git
+        # actually ran (git_ops.git_recent_commits strips internally).
+        stripped_ref = ref.strip() if ref else "HEAD"
+        commits = git_ops.git_recent_commits(path=cwd, count=count, ref=stripped_ref)
+        return {"ok": True, "path": cwd, "ref": stripped_ref, "commits": commits}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict(e)
 
@@ -911,33 +1038,49 @@ def whoami() -> dict[str, Any]:
 
     Useful as a connectivity / config smoke test before more invasive
     operations. Does NOT echo the token.
+
+    Two-phase: (1) config (fatal — flips ok=False on failure);
+    (2) git context (best-effort — failures stored as structured
+    sub-errors but don't flip ok=False, since the server is useful
+    even outside a git repo).
     """
     out: dict[str, Any] = {"ok": True}
+
+    # Phase 1: config. Wrap the full breadth of expected exceptions
+    # (including OSError for os.getcwd-on-deleted-cwd inside the
+    # whoami body itself).
     try:
         client = _get_client()
         out["user"] = client.config.user
         out["workspace"] = client.config.workspace
         out["api_base"] = client.config.api_base
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        # Config error is half-fatal — the user still wants to know what
-        # we tried to load. Report partial state with kind/message.
         err = _error_dict(e)
         out.update({"ok": False, **err})
 
-    # Best-effort git context. Failures here don't flip ok=False (the
-    # MCP server is useful even outside a git repo).
-    cwd = _default_repo_path()
+    # Phase 2: git context. Use _TOOL_EXPECTED_EXCEPTIONS (not narrow
+    # GitOpError) so an unwrapped OSError from a deleted cwd inside
+    # _default_repo_path() lands here instead of escaping. Store
+    # failures as the full structured error dict so an agent
+    # branching on returncode / kind / stderr has the same shape
+    # available as every other tool.
+    try:
+        cwd = _default_repo_path()
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        out["cwd_error"] = _error_dict(e)
+        return out
     out["cwd"] = cwd
+
     try:
         out["git_branch"] = git_ops.git_current_branch(path=cwd)
-    except git_ops.GitOpError as e:
-        out["git_branch_error"] = str(e)
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        out["git_branch_error"] = _error_dict(e)
     try:
         ws, slug = git_ops.git_remote_repo(path=cwd)
         out["git_workspace"] = ws
         out["git_repo"] = slug
-    except git_ops.GitOpError as e:
-        out["git_remote_error"] = str(e)
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        out["git_remote_error"] = _error_dict(e)
 
     return out
 
