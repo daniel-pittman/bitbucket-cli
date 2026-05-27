@@ -166,7 +166,14 @@ def _bootstrap_venv() -> None:
     # /private/tmp/bbenv would compare unequal forever and trigger an
     # infinite execv loop.
     if Path(sys.prefix).resolve() != _VENV_DIR.resolve():
-        os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
+        # Resolve __file__ so a relative-launch (`python3 mcp_server.py`
+        # from inside the repo) followed by any future chdir between
+        # launch and execv doesn't leave the venv python with an
+        # unresolvable script path.
+        os.execv(
+            str(_VENV_PY),
+            [str(_VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
 
 
 # Test-mode escape hatch: setting BB_MCP_SKIP_BOOTSTRAP=1 in the environment
@@ -317,9 +324,14 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
         client = _get_client()
         return client, parts[0], parts[1]
 
-    # Bare slug → use configured workspace. _get_client comes AFTER
-    # the shape check above so a malformed arg surfaces as ValueError
-    # even on a machine without config.
+    # Bare slug → use configured workspace. Validate against the same
+    # rules bb_api.repo_path enforces (no `.` / `..`) BEFORE calling
+    # _get_client(), so a malformed slug on a config-less machine
+    # surfaces as ValueError rather than the misleading BBConfigError.
+    if repo in (".", ".."):
+        raise ValueError(
+            f"repo must not be '.' or '..'; got {repo!r}"
+        )
     client = _get_client()
     return client, client.config.workspace, repo
 
@@ -337,7 +349,14 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
 # Either shape would leak a high-value secret if echoed into an error
 # message that flows up through MCP into agent context / downstream logs.
 _URL_CRED_PATTERN = re.compile(r"://[^/]+@")
-_SIGNED_URL_INDICATORS = ("X-Amz-Signature=", "X-Amz-Credential=", "Signature=")
+# Lowercase signed-URL indicators; comparison lowercases the query part
+# first so MinIO / R2 / Backblaze / mixed-case AWS variants don't slip
+# past the redaction.
+_SIGNED_URL_INDICATORS_LOWER = (
+    "x-amz-signature=",
+    "x-amz-credential=",
+    "signature=",
+)
 
 
 def _redact_url(url: str) -> str:
@@ -349,6 +368,9 @@ def _redact_url(url: str) -> str:
     failure like S3 clock skew → 403) raises BBApiError(url=<signed
     S3 URL>). The signed URL embeds AWS credentials in the query and
     must not flow into agent context or downstream logs.
+
+    Case-insensitive match on query params so MinIO / R2 / Backblaze /
+    mixed-case AWS variants don't slip past.
     """
     if not url:
         return url
@@ -360,9 +382,34 @@ def _redact_url(url: str) -> str:
     # called.
     if "?" in redacted:
         path_part, _, query_part = redacted.partition("?")
-        if any(ind in query_part for ind in _SIGNED_URL_INDICATORS):
+        query_lower = query_part.lower()
+        if any(ind in query_lower for ind in _SIGNED_URL_INDICATORS_LOWER):
             redacted = f"{path_part}?[redacted-signed-url-params]"
     return redacted
+
+
+def _redact_message(message: str) -> str:
+    """Redact any URLs embedded in a free-form error message text.
+
+    Necessary because `BBApiError.__str__` constructs its message from
+    the raw URL: `f"HTTP {status} from {url}: {body[:500]}"`. The
+    round-2 security fix only redacted the `url` FIELD on the error
+    dict but left the `message` field carrying the same URL verbatim.
+    Now both fields route through redaction.
+
+    Cheap shape: scan for `http(s)://...` substrings and pass each
+    through `_redact_url`. Conservative — anything that looks like a
+    URL gets redacted, even ones without credentials (those are
+    no-ops through _redact_url).
+    """
+    if not message:
+        return message
+    # Match http:// or https:// up to the next whitespace / quote /
+    # angle-bracket / closing-paren — covers URLs embedded in typical
+    # log / error message shapes.
+    def _sub(m: re.Match[str]) -> str:
+        return _redact_url(m.group(0))
+    return re.sub(r"https?://[^\s'\"<>)]+", _sub, message)
 
 
 def _error_dict(e: Exception) -> dict[str, Any]:
@@ -371,11 +418,15 @@ def _error_dict(e: Exception) -> dict[str, Any]:
     The agent sees `kind`, `message`, and (for BBApiError) the HTTP
     status + redacted URL so it can branch on `kind == "BBApiError"
     and status == 404` without parsing the message string. URLs are
-    routed through `_redact_url` so embedded credentials AND AWS
-    signed-URL parameters never leak into the agent context.
+    routed through `_redact_url` (for the `url` field) AND the
+    `message` field is routed through `_redact_message`, so embedded
+    credentials AND AWS signed-URL parameters never leak through
+    EITHER channel into the agent context.
     """
     kind = type(e).__name__
-    out: dict[str, Any] = {"ok": False, "kind": kind, "message": str(e)}
+    # str(e) may contain the raw URL (BBApiError.__str__ embeds it
+    # verbatim); route through the message-level redactor.
+    out: dict[str, Any] = {"ok": False, "kind": kind, "message": _redact_message(str(e))}
     if isinstance(e, bb_api.BBApiError):
         out["status"] = e.status
         out["url"] = _redact_url(e.url)
@@ -520,9 +571,19 @@ def pipeline_trigger(
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
+        # Strip the branch so " main" / "main " don't slip through to a
+        # 4xx with an opaque body. bb_ops.pipeline_trigger checks
+        # `if not branch` (catches empty) but not whitespace-only or
+        # trailing whitespace — symmetric with _opt_str() everywhere
+        # else, but required here (cannot funnel to None).
+        normalised_branch = (branch or "").strip()
+        if not normalised_branch:
+            raise ValueError(
+                f"branch is required and must be non-empty/non-whitespace; got {branch!r}"
+            )
         pipeline = bb_ops.pipeline_trigger(
             client, workspace, repo_slug,
-            branch=branch,
+            branch=normalised_branch,
             pattern=_opt_str(pattern),
             variables=variables,
         )
@@ -662,15 +723,14 @@ def pr_create(
         # `.strip()` so " " (sloppy whitespace) doesn't bypass auto-detect.
         if not source_branch.strip():
             source_branch = git_ops.git_current_branch(path=_default_repo_path())
-            # `git_current_branch` returns the literal "HEAD" for both
-            # detached and unborn state. Bitbucket would accept this
-            # silently and create a degenerate PR; surface a clear local
-            # error instead.
-            if source_branch == "HEAD":
-                raise ValueError(
-                    "cannot auto-detect source_branch: git reports detached "
-                    "HEAD / unborn branch. Pass source_branch= explicitly."
-                )
+        # Reject "HEAD" regardless of whether it came from auto-detect
+        # or was supplied explicitly. Bitbucket would silently create a
+        # degenerate PR named after the literal `HEAD` ref.
+        if source_branch.strip() == "HEAD":
+            raise ValueError(
+                "source_branch cannot be 'HEAD' (detached HEAD / unborn "
+                "branch state). Pass a real branch name explicitly."
+            )
         pr = bb_ops.pr_create(
             client, workspace, repo_slug,
             title=title,
@@ -682,7 +742,9 @@ def pr_create(
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pr": pr}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        # Thread title for parallel-call correlation (e.g. agent fanning
+        # out one pr_create per stacked branch in a PR train).
+        return _error_dict_with(e, title=title)
 
 
 @mcp.tool()

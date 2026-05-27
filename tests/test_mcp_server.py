@@ -236,6 +236,21 @@ class TestResolveRepo:
         with pytest.raises(ValueError, match="repo must be"):
             mcp_server._resolve_repo("a/b/c")
 
+    @pytest.mark.parametrize("bare", [".", ".."])
+    def test_bare_dot_slug_validated_before_get_client(
+        self, monkeypatch: pytest.MonkeyPatch, bare: str
+    ) -> None:
+        """Round-3 finding: the bare-slug fallback bypassed the same
+        validation the slash-containing branch got. A fresh-machine
+        user with `repo='.'` should see the actual ValueError, not
+        BBConfigError masking it."""
+        mcp_server._reset_client_cache()
+        def raise_config(*_args: Any, **_kwargs: Any) -> Any:
+            raise bb_api.BBConfigError("Missing BB_USER")
+        monkeypatch.setattr(bb_api, "load_config", raise_config)
+        with pytest.raises(ValueError, match=r"'\.'"):
+            mcp_server._resolve_repo(bare)
+
 
 # ---------------------------------------------------------------------------
 # _error_dict
@@ -257,7 +272,9 @@ class TestErrorDict:
         Bitbucket's 307 to a signed S3 URL. If S3 then returns non-3xx
         (clock skew, expired, network hiccup), BBApiError.url carries
         the signed URL with AWS credentials in the query string. The
-        agent error dict must NOT propagate it."""
+        agent error dict must NOT propagate it through ANY field —
+        round-3 found the round-2 fix only covered `url`, leaving
+        `message` (built from str(e)) still leaking."""
         signed = (
             "https://bbuseruploads.s3.amazonaws.com/path/to/log?"
             "X-Amz-Signature=abcd1234supersecret&X-Amz-Credential=AKIAEXAMPLE"
@@ -265,11 +282,19 @@ class TestErrorDict:
         )
         e = bb_api.BBApiError(403, signed, "AccessDenied")
         d = mcp_server._error_dict(e)
-        assert "abcd1234supersecret" not in d["url"]
-        assert "AKIAEXAMPLE" not in d["url"]
-        assert "redacted-signed-url-params" in d["url"]
-        # Path part preserved so the agent knows what host was called.
+        # Both `url` AND `message` must be free of the secret. The
+        # round-2 fix only checked `url`, hiding the regression where
+        # `message` still carried the raw URL.
+        for field in ("url", "message"):
+            assert "abcd1234supersecret" not in d[field], (
+                f"secret leaked through {field}: {d[field]!r}"
+            )
+            assert "AKIAEXAMPLE" not in d[field], (
+                f"AWS access key leaked through {field}: {d[field]!r}"
+            )
+        # Path part preserved in url so the agent knows what host was called.
         assert "bbuseruploads.s3.amazonaws.com" in d["url"]
+        assert "redacted-signed-url-params" in d["url"]
 
     def test_bbapierror_redacts_embedded_creds(self) -> None:
         e = bb_api.BBApiError(
@@ -278,8 +303,37 @@ class TestErrorDict:
             "Unauthorized",
         )
         d = mcp_server._error_dict(e)
-        assert "supersecret" not in d["url"]
+        for field in ("url", "message"):
+            assert "supersecret" not in d[field], (
+                f"credential leaked through {field}: {d[field]!r}"
+            )
         assert "[redacted]" in d["url"]
+        assert "[redacted]" in d["message"]
+
+    def test_signed_url_indicators_case_insensitive(self) -> None:
+        """Round-3 finding: MinIO / R2 / Backblaze / mixed-case AWS
+        variants may use different capitalisations of the signature
+        param. Match case-insensitively."""
+        # Lowercase variant.
+        e1 = bb_api.BBApiError(
+            403,
+            "https://example.com/log?x-amz-signature=secret123",
+            "AccessDenied",
+        )
+        d1 = mcp_server._error_dict(e1)
+        assert "secret123" not in d1["url"]
+        assert "secret123" not in d1["message"]
+
+        # Plain `Signature=` (used by some non-AWS S3-compatible
+        # services).
+        e2 = bb_api.BBApiError(
+            403,
+            "https://r2.example.com/log?Signature=secret456",
+            "Forbidden",
+        )
+        d2 = mcp_server._error_dict(e2)
+        assert "secret456" not in d2["url"]
+        assert "secret456" not in d2["message"]
 
     def test_bbopnotfound_kind(self) -> None:
         e = bb_ops.BBOpNotFound("pipeline #42 not found")
@@ -405,6 +459,31 @@ class TestPipelineTools:
         # would raise on empty string.
         assert recorder.calls[0][1]["pattern"] is None
 
+    @pytest.mark.parametrize("bad_branch", ["", "   ", "\n\t"])
+    def test_pipeline_trigger_rejects_empty_or_whitespace_branch(
+        self, stub_client: bb_api.BBClient, bad_branch: str
+    ) -> None:
+        """Round-3 finding: pipeline_trigger forwarded branch verbatim,
+        unlike pipelines_list / commits_list which funnel through
+        _opt_str. Whitespace-only branch would silently POST
+        target.ref_name='   ' and 4xx with an opaque body."""
+        recorder = _recorder({})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(branch=bad_branch, repo="my-repo")
+        assert out["ok"] is False
+        assert out["kind"] == "ValueError"
+        assert recorder.calls == []  # bb_ops not reached
+
+    def test_pipeline_trigger_strips_branch_whitespace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Trailing/leading whitespace on a real branch name gets
+        stripped so the API call uses the clean value."""
+        recorder = _recorder({"build_number": 101})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            mcp_server.pipeline_trigger(branch="  main  ", repo="my-repo")
+        assert recorder.calls[0][1]["branch"] == "main"
+
     def test_pipeline_logs_returns_log_text(
         self, stub_client: bb_api.BBClient
     ) -> None:
@@ -495,7 +574,27 @@ class TestPullRequestTools:
             out = mcp_server.pr_create(title="Hi", repo="my-repo")
         assert out["ok"] is False
         assert out["kind"] == "ValueError"
-        assert "detached HEAD" in out["message"] or "HEAD" in out["message"]
+        assert "HEAD" in out["message"]
+        # Identifier threading: title surfaces on the error path so
+        # parallel pr_create fan-outs can correlate.
+        assert out["title"] == "Hi"
+        assert recorder.calls == []  # bb_ops.pr_create not reached
+
+    def test_pr_create_rejects_explicit_head_source_branch(
+        self,
+        stub_client: bb_api.BBClient,
+    ) -> None:
+        """Round-3 finding: round-2 fix rejected 'HEAD' from auto-detect
+        but the user-supplied path forwarded it verbatim. The check
+        must apply to BOTH entry points."""
+        recorder = _recorder({"id": 11})
+        with patch.object(bb_ops, "pr_create", recorder):
+            out = mcp_server.pr_create(
+                title="Hi", source_branch="HEAD", repo="my-repo"
+            )
+        assert out["ok"] is False
+        assert out["kind"] == "ValueError"
+        assert "HEAD" in out["message"]
         assert recorder.calls == []  # bb_ops.pr_create not reached
 
     def test_pr_unapprove_dispatches(
