@@ -184,6 +184,12 @@ class TestGitCurrentBranch:
             git_ops.git_current_branch(runner=runner)
         assert exc.value.returncode == GIT_PARSE_ERROR_RETURNCODE
         assert exc.value.returncode < 0  # any real git exit is >= 0
+        # err.command must include the `-c color.ui=never` prefix that
+        # _run_git actually passed to subprocess — otherwise a caller
+        # introspecting err.command (or reproducing the failing call
+        # from the message) sees a lie.
+        assert "-c" in exc.value.command
+        assert "color.ui=never" in exc.value.command
 
 
 # ===========================================================================
@@ -261,6 +267,10 @@ class TestGitRemoteRepo:
         assert "supersecret123" not in msg
         assert "x-token-auth" not in msg
         assert "[redacted]" in msg
+        # err.command also reflects the actual invocation including
+        # `-c color.ui=never`.
+        assert "-c" in exc.value.command
+        assert "color.ui=never" in exc.value.command
 
 
 # ===========================================================================
@@ -774,6 +784,93 @@ class TestGitUncommittedChanges:
         )
         small = git_ops.git_uncommitted_changes(runner=small_runner)
         assert small["staged_diff"] == "diff body\n"
+
+    def test_oversize_non_ascii_diff_byte_capped(self) -> None:
+        """Regression guard for round-4 finding: an earlier fast path
+        used `len(text) <= cap` which is wrong for non-ASCII content
+        (UTF-8 bytes >= chars). A 600K-emoji string was 600K chars
+        (under the 1 MiB char cap) but encoded to 2.4 MiB. The fixed
+        fast path is gated on `text.isascii()`."""
+        # 600_000 4-byte emoji ~= 2.4 MiB encoded, well over 1 MiB cap.
+        big_emoji_diff = "+" + ("\U0001F600" * 600_000)
+        # Sanity: this fixture must actually exceed the byte cap, otherwise
+        # the regression isn't being exercised.
+        assert (
+            len(big_emoji_diff.encode("utf-8")) > git_ops._MAX_DIFF_BYTES
+        )
+        runner = _RecordingRunner(
+            [
+                (0, big_emoji_diff, ""),
+                (0, "", ""),
+                (0, "", ""),
+            ]
+        )
+        result = git_ops.git_uncommitted_changes(runner=runner)
+        # Returned diff is byte-capped, not char-capped.
+        assert len(result["staged_diff"].encode("utf-8")) <= (
+            git_ops._MAX_DIFF_BYTES + len(git_ops._DIFF_TRUNCATION_MARKER.encode("utf-8"))
+        )
+        assert "truncated by bb MCP server" in result["staged_diff"]
+
+    def test_oversize_untracked_list_capped(self) -> None:
+        """A repo that forgot to gitignore node_modules / .venv could
+        return hundreds of thousands of untracked paths. Cap at
+        _MAX_PATH_LIST so the MCP server doesn't OOM on the JSON
+        serialisation."""
+        # Produce more paths than the cap allows.
+        many_paths = "\n".join(f"file{i:06}.tmp" for i in range(15_000))
+        runner = _RecordingRunner(
+            [
+                (0, "", ""),  # staged_diff
+                (0, "", ""),  # working_diff
+                (0, many_paths, ""),  # untracked
+            ]
+        )
+        result = git_ops.git_uncommitted_changes(runner=runner)
+        # Returned list is capped + 1 sentinel entry (the truncation marker).
+        assert len(result["untracked_files"]) == git_ops._MAX_PATH_LIST + 1
+        # Sentinel describes what got cut.
+        assert result["untracked_files"][-1].startswith("<...")
+        assert "5000 more" in result["untracked_files"][-1]
+        assert "cap" in result["untracked_files"][-1]
+
+
+class TestPathListCap:
+    """Direct unit tests for the _truncated_path_list helper, separate
+    from the full git_uncommitted_changes / git_status integration
+    paths so the cap behaviour is pinned at one place."""
+
+    def test_under_cap_returns_verbatim(self) -> None:
+        paths = [f"f{i}" for i in range(100)]
+        assert git_ops._truncated_path_list(paths) == paths
+
+    def test_at_cap_returns_verbatim(self) -> None:
+        paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST)]
+        assert git_ops._truncated_path_list(paths) == paths
+
+    def test_one_over_cap_appends_singular_sentinel(self) -> None:
+        paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST + 1)]
+        result = git_ops._truncated_path_list(paths)
+        assert len(result) == git_ops._MAX_PATH_LIST + 1
+        assert "1 more path " in result[-1]  # singular
+
+    def test_many_over_cap_appends_plural_sentinel(self) -> None:
+        paths = [f"f{i}" for i in range(git_ops._MAX_PATH_LIST + 5)]
+        result = git_ops._truncated_path_list(paths)
+        assert "5 more paths " in result[-1]  # plural
+
+    def test_git_status_caps_file_lists(self) -> None:
+        """Same cap applies inside _parse_status_porcelain_v2 — staged /
+        modified / untracked / unmerged lists are bounded too."""
+        # 12k untracked entries; status parser caps to _MAX_PATH_LIST + 1.
+        many_untracked = "\n".join(
+            f"? file{i:05}.tmp" for i in range(12_000)
+        )
+        header = "# branch.oid abc\n# branch.head main\n"
+        status_text = header + many_untracked
+        s = git_ops._parse_status_porcelain_v2(status_text)
+        assert len(s["untracked"]) == git_ops._MAX_PATH_LIST + 1
+        assert s["untracked"][-1].startswith("<...")
 
     def test_clean_tree_returns_empties(self) -> None:
         runner = _RecordingRunner(

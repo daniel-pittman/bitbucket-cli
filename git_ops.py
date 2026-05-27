@@ -194,8 +194,11 @@ def git_current_branch(
     )
     branch = out.strip()
     if not branch:
+        # Include the same `-c color.ui=never` prefix that _run_git
+        # actually executed, so err.command reflects the real
+        # invocation when a caller introspects the error.
         raise GitOpError(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", *_GIT_NO_COLOR, "rev-parse", "--abbrev-ref", "HEAD"],
             GIT_PARSE_ERROR_RETURNCODE,
             "git returned empty branch name",
         )
@@ -233,8 +236,10 @@ def git_remote_repo(
         # this string flows up through MCP into the agent's context
         # and downstream logs.
         safe_url = _redact_url_creds(url.strip())
+        # Include the same `-c color.ui=never` prefix that _run_git
+        # actually executed.
         raise GitOpError(
-            ["git", "remote", "get-url", "origin"],
+            ["git", *_GIT_NO_COLOR, "remote", "get-url", "origin"],
             GIT_PARSE_ERROR_RETURNCODE,
             f"could not parse workspace/repo from origin URL: {safe_url!r}",
         )
@@ -374,6 +379,11 @@ def _parse_status_porcelain_v2(text: str) -> dict[str, Any]:
         and not out["untracked"]
         and not out["unmerged"]
     )
+    # Cap each file-list field. A repo with millions of untracked
+    # files (forgot-to-gitignore-node_modules onboarding bug) would
+    # otherwise return all of them across MCP.
+    for key in ("staged", "modified", "untracked", "unmerged"):
+        out[key] = _truncated_path_list(out[key])
     return out
 
 
@@ -546,19 +556,47 @@ _DIFF_TRUNCATION_MARKER = (
     f"{_MAX_DIFF_BYTES} bytes. Use `git diff --stat` for a summary.]\n"
 )
 
+# Maximum number of path entries returned per file-list field
+# (staged / modified / untracked / unmerged + git_uncommitted_changes'
+# untracked_files). A repo that forgot to gitignore node_modules /
+# .venv / target/ commonly has hundreds of thousands of untracked
+# paths; capture_output materialises the full stdout in RAM and the
+# JSON serialisation across MCP would amplify the cost. Matches the
+# same defensive bound as _MAX_DIFF_BYTES / _MAX_LOG_COUNT.
+_MAX_PATH_LIST = 10_000
+
+
+def _truncated_path_list(paths: list[str]) -> list[str]:
+    """Cap a path list at `_MAX_PATH_LIST` entries, appending a
+    sentinel marker so the agent knows the list was truncated and
+    can fall back to a narrower query."""
+    if len(paths) <= _MAX_PATH_LIST:
+        return paths
+    omitted = len(paths) - _MAX_PATH_LIST
+    truncated = paths[:_MAX_PATH_LIST]
+    truncated.append(
+        f"<... {omitted} more path{'s' if omitted != 1 else ''} omitted "
+        f"(cap {_MAX_PATH_LIST} exceeded; use a narrower query)>"
+    )
+    return truncated
+
 
 def _cap_diff(text: str) -> str:
     """Truncate a diff string to `_MAX_DIFF_BYTES` if it exceeds the cap,
     appending an explicit marker so the caller knows what happened.
 
-    Fast path on `len(text)`: UTF-8 byte count is always >= char count,
-    so if char count fits the cap, the encoded form definitely does.
-    Avoids materialising a transient bytes copy of a multi-GB string
-    just to check its size — the cap exists specifically to defend
-    against multi-GB diffs OOMing the MCP server, and the check
-    itself shouldn't be the trigger.
+    Fast path on `text.isascii()`: ASCII-only strings have byte count
+    equal to char count, so a `len(text) <= cap` check is sound. For
+    non-ASCII content (CJK, emoji, accented Latin) the bytes-vs-chars
+    ratio can be 2-4x, so we have to encode-and-measure.
+
+    The prior round's fast path (`if len(text) <= cap: return text`)
+    was wrong by inversion: UTF-8 byte count is always >= char count,
+    so `chars <= cap` does NOT imply `bytes <= cap`. A 600K-emoji
+    string would pass the fast path but encode to 2.4 MiB.
     """
-    if len(text) <= _MAX_DIFF_BYTES:
+    # ASCII fast path: chars == bytes, so the cheap len check is sound.
+    if text.isascii() and len(text) <= _MAX_DIFF_BYTES:
         return text
     encoded = text.encode("utf-8")
     if len(encoded) <= _MAX_DIFF_BYTES:
@@ -608,5 +646,5 @@ def git_uncommitted_changes(
     return {
         "staged_diff": staged_diff,
         "working_diff": working_diff,
-        "untracked_files": untracked,
+        "untracked_files": _truncated_path_list(untracked),
     }
