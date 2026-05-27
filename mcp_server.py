@@ -18,19 +18,19 @@ Every Bitbucket tool accepts an optional `repo` argument:
   - "acme/repo" → use "acme" workspace + "repo" slug (overrides config)
 
 Run as a subprocess (stdio transport):
-    /usr/bin/python3 mcp_server.py
+    python3 mcp_server.py
 
 The script self-bootstraps a venv under `$XDG_DATA_HOME/bitbucket-cli/venv`
 (default `~/.local/share/bitbucket-cli/venv`) on first run, installs the
 `mcp` package into it, then re-execs under that venv. Any python3 on
-PATH that can run `python3 -m venv` works as the launcher. The venv
-location is durable (survives reboot), so subsequent launches re-exec
-into the existing venv without rebuilding.
+PATH that can run `python3 -m venv` works as the launcher (must be 3.10+;
+on macOS prefer Homebrew or pyenv over Apple's bundled 3.9 at
+/usr/bin/python3). The venv location is durable (survives reboot), so
+subsequent launches re-exec into the existing venv without rebuilding.
 
 Register user-scope so every Claude Code session sees it:
-    claude mcp add --scope user bb \\
-        /usr/bin/python3 \\
-        /path/to/bitbucket-cli/mcp_server.py
+    claude mcp add --scope user bitbucket \\
+        -- python3 /path/to/bitbucket-cli/mcp_server.py
 
 Environment overrides:
   BB_USER, BB_TOKEN, BB_WORKSPACE — auth + workspace (see bb_api docs)
