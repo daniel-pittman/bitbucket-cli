@@ -114,26 +114,35 @@ repo_path() {
     # silently construct a wrong URL (/repositories//foo or
     # /repositories/../foo). Mirrors the bb_api.repo_path Python
     # validation — both surfaces enforce the same contract.
-    if [[ -z "${BB_WORKSPACE// }" ]]; then
+    #
+    # Whitespace check uses regex against [[:space:]] (matches tabs,
+    # newlines, CR, etc.) not just the literal space — true parity
+    # with Python's `.strip()`. The previous `${var// }` form only
+    # stripped ASCII space and would happily pass `BB_WORKSPACE=$'\t'`.
+    if [[ -z "$BB_WORKSPACE" || "$BB_WORKSPACE" =~ ^[[:space:]]+$ ]]; then
         echo "Error: BB_WORKSPACE must be a non-empty, non-whitespace string." >&2
-        exit 1
+        kill -TERM $$
     fi
-    if [[ -z "${repo// }" ]]; then
+    if [[ -z "$repo" || "$repo" =~ ^[[:space:]]+$ ]]; then
         echo "Error: repo must be a non-empty, non-whitespace string." >&2
-        exit 1
+        kill -TERM $$
     fi
     if [[ "$BB_WORKSPACE" == *"/"* || "$repo" == *"/"* ]]; then
         echo "Error: workspace and repo must not contain '/'." >&2
-        exit 1
+        kill -TERM $$
     fi
     if [[ "$BB_WORKSPACE" == "." || "$BB_WORKSPACE" == ".." ]]; then
         echo "Error: workspace must not be '.' or '..'." >&2
-        exit 1
+        kill -TERM $$
     fi
     if [[ "$repo" == "." || "$repo" == ".." ]]; then
         echo "Error: repo must not be '.' or '..'." >&2
-        exit 1
+        kill -TERM $$
     fi
+    # `exit 1` inside a `$(repo_path ...)` command substitution only
+    # terminates the subshell — the caller would proceed with an
+    # empty path. `kill -TERM $$` terminates the parent script so
+    # the validation actually halts execution.
     echo "/repositories/${BB_WORKSPACE}/${repo}"
 }
 
@@ -286,8 +295,13 @@ cmd_watch() {
     echo ""
 
     while true; do
+        # Parity fix: bumped pagelen 50 → 100, symmetric with
+        # cmd_pipeline / cmd_pipeline_stop / cmd_logs. Without this
+        # bump, a pipeline at positions 51-100 in the recent list
+        # would never match here and the watch loop would spin
+        # forever printing blanks.
         local response
-        response=$(bb_get "$(repo_path "$repo")/pipelines/?sort=-created_on&pagelen=50")
+        response=$(bb_get "$(repo_path "$repo")/pipelines/?sort=-created_on&pagelen=100")
 
         local state result duration ref
         IFS=$'\t' read -r state result duration ref < <(echo "$response" | jq -r "
@@ -384,28 +398,51 @@ cmd_pipeline_trigger() {
     repo=$(detect_repo "${1:-}")
     local branch="${2:-}"
     local pattern="${3:-}"
-    shift 3 2>/dev/null || true
 
-    # Remaining args are VAR=VALUE pairs.
+    # `shift 3 || true` previously masked the under-3-args case:
+    # bash leaves $@ unchanged when the shift count exceeds $#, so
+    # `bb trigger myrepo` (1 arg) left "myrepo" in $@ and the
+    # var-loop below parsed it as a VAR=VALUE pair, sending
+    # {"key":"myrepo","value":"myrepo"} as a pipeline variable.
+    # Guard explicitly.
+    if [[ $# -ge 3 ]]; then
+        shift 3
+    else
+        # Consume what's there; remaining $@ is empty.
+        shift $#
+    fi
+
+    # Remaining args are VAR=VALUE pairs. Build the array via `jq`
+    # so values containing `"`, `\`, newlines, or tabs are correctly
+    # JSON-escaped. The previous string-concatenation approach
+    # produced invalid JSON on any of those characters, then the
+    # downstream `jq -n --argjson vars` would abort with a parse
+    # error after `Triggering pipeline...` had already been printed.
     local variables="[]"
     if [[ $# -gt 0 ]]; then
-        variables="["
-        local first=true
-        for var_pair in "$@"; do
-            local key="${var_pair%%=*}"
-            local value="${var_pair#*=}"
-            if [[ "$first" == "true" ]]; then
-                first=false
-            else
-                variables+=","
-            fi
-            variables+="{\"key\":\"${key}\",\"value\":\"${value}\"}"
-        done
-        variables+="]"
+        # Per-pair shape: split on the FIRST `=` only so values
+        # containing `=` survive intact. jq -Rs reads the whole
+        # input as one string, splits on newlines, then on `=`.
+        variables=$(printf '%s\n' "$@" | jq -Rs '
+            split("\n")
+            | map(select(length > 0))
+            | map(
+                split("=") | {
+                    key: .[0],
+                    value: (.[1:] | join("="))
+                }
+            )
+        ')
     fi
 
     if [[ -z "$branch" ]]; then
         branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+        # git rev-parse exits 0 with literal "HEAD" on detached HEAD —
+        # Bitbucket would 400 on ref_name=HEAD. Surface a clean error.
+        if [[ "$branch" == "HEAD" ]]; then
+            echo "Error: detached HEAD detected. Pass an explicit branch." >&2
+            exit 1
+        fi
     fi
 
     # Parity fix: previously the no-pattern branch built `{target: {...}}`
@@ -737,14 +774,34 @@ cmd_pr_merge() {
         exit 1
     fi
 
+    # Validate strategy against Bitbucket's accepted set so a typo
+    # (e.g. "squash_commit") fails locally with a clear message
+    # instead of getting an opaque 400 from the API.
+    case "$strategy" in
+        merge_commit|squash|fast_forward) ;;
+        *)
+            echo "Error: invalid strategy '${strategy}'." >&2
+            echo "  Valid: merge_commit, squash, fast_forward." >&2
+            exit 1
+            ;;
+    esac
+
     local payload
     payload=$(jq -n --arg strategy "$strategy" \
         '{type: "pullrequest", merge_strategy: $strategy, close_source_branch: true}')
 
-    local response
-    response=$(bb_put "$(repo_path "$repo")/pullrequests/${pr_id}/merge" "$payload")
-
-    echo "Merged PR #${pr_id} (${strategy})"
+    # Parity fix: capture exit code so a merge conflict / failing
+    # required check / wrong-strategy-for-repo error surfaces as a
+    # labelled error instead of silently aborting under set -e.
+    if bb_put "$(repo_path "$repo")/pullrequests/${pr_id}/merge" "$payload" > /dev/null; then
+        echo "Merged PR #${pr_id} (${strategy})"
+    else
+        local rc=$?
+        echo "Merge request failed for PR #${pr_id} (exit $rc)." >&2
+        echo "  Common causes: unresolved comments, failing required" >&2
+        echo "  builds, or wrong merge strategy for this repo." >&2
+        exit $rc
+    fi
 }
 
 cmd_pr_decline() {
@@ -1067,7 +1124,10 @@ cmd_vars() {
 
 cmd_whoami() {
     # Report the resolved config + git context. Useful as a connectivity
-    # smoke test before invasive operations. NEVER echoes BB_TOKEN.
+    # smoke test before invasive operations. NEVER echoes BB_TOKEN and
+    # NEVER echoes credentials embedded in the origin URL (a common
+    # pattern for token-based git auth — `whoami` output gets pasted
+    # into bug reports / screenshots, can't have secrets in it).
     echo "bb configuration:"
     echo "  User:      ${BB_USER}"
     echo "  Workspace: ${BB_WORKSPACE}"
@@ -1078,21 +1138,30 @@ cmd_whoami() {
     echo "Git context:"
     local cwd_branch cwd_remote
     cwd_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(not a git repo)")
-    cwd_remote=$(git remote get-url origin 2>/dev/null || echo "(no origin remote)")
+    # Strip `user:token@` from origin URL before echoing. Matches the
+    # `_redact_url` helper in mcp_server.py / git_ops.py: anything of
+    # the form `://user:token@host/path` becomes `://[redacted]@host/path`.
+    cwd_remote=$(
+        git remote get-url origin 2>/dev/null \
+            | sed -E 's#://[^/@]+@#://[redacted]@#' \
+            || echo "(no origin remote)"
+    )
     echo "  Cwd:       $(pwd)"
     echo "  Branch:    ${cwd_branch}"
     echo "  Origin:    ${cwd_remote}"
 
-    # Light reachability check — if we can list one repo without an
-    # HTTP error, auth is working. Don't fail loud on permission
-    # issues (some accounts have workspace-scoped tokens that
-    # can't list arbitrary workspaces).
+    # Light reachability check. Probe the configured workspace
+    # endpoint (not /user — workspace-scoped tokens, which Atlassian
+    # now recommends, reject /user with 401/403 while serving
+    # /repositories/{workspace} correctly). False-negative on /user
+    # would tell a user with a valid token to rotate it.
     echo ""
     echo "Auth check:"
-    if bb_get "/user" > /dev/null 2>&1; then
-        echo "  /user endpoint reachable — auth OK."
+    if bb_get "/repositories/${BB_WORKSPACE}?pagelen=1" > /dev/null 2>&1; then
+        echo "  Workspace reachable — auth OK."
     else
-        echo "  /user endpoint NOT reachable — token may be invalid or expired."
+        echo "  Workspace NOT reachable — token may be invalid, expired,"
+        echo "  or scoped to a different workspace."
         echo "  Rotate at https://id.atlassian.com/manage-profile/security/api-tokens"
     fi
 }
