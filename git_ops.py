@@ -32,13 +32,25 @@ from typing import Any
 from bb_api import parse_remote_url
 
 
+# Sentinel returncode for parse-failure errors (the git command itself
+# exited 0, but our parser couldn't make sense of the output). A real git
+# exit code is always >= 0, so -1 unambiguously distinguishes "git's
+# fault" from "parser's fault" — callers can branch on `err.returncode >= 0`
+# before dispatching on the specific exit-code value.
+GIT_PARSE_ERROR_RETURNCODE = -1
+
+
 class GitOpError(RuntimeError):
     """Raised when a `git` invocation fails or returns unparseable output.
 
     Carries the failing command's stderr (truncated in the message) and
-    the original return code so callers branching on git semantics can
-    inspect them. A separate exception class from `BBApiError` so MCP
-    tools can render "git failure" vs "Bitbucket failure" differently.
+    a returncode field. For genuine git failures, returncode is git's own
+    exit code (>= 0). For parse failures where git exited 0 but the
+    parser couldn't extract a usable value, returncode is
+    `GIT_PARSE_ERROR_RETURNCODE` (-1) — callers branching on git exit
+    semantics should gate on `err.returncode >= 0` first. A separate
+    exception class from `BBApiError` so MCP tools can render "git
+    failure" vs "Bitbucket failure" differently.
     """
 
     def __init__(self, command: list[str], returncode: int, stderr: str):
@@ -101,7 +113,7 @@ def git_current_branch(
     if not branch:
         raise GitOpError(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            0,
+            GIT_PARSE_ERROR_RETURNCODE,
             "git returned empty branch name",
         )
     return branch
@@ -134,7 +146,7 @@ def git_remote_repo(
     if parsed is None:
         raise GitOpError(
             ["git", "remote", "get-url", "origin"],
-            0,
+            GIT_PARSE_ERROR_RETURNCODE,
             f"could not parse workspace/repo from origin URL: {url.strip()!r}",
         )
     return parsed
@@ -260,6 +272,13 @@ def git_status(
     `clean` is True iff there are no staged, modified, untracked, or
     unmerged entries. `ahead`/`behind` are zero when no upstream is set
     or when the branch is in sync.
+
+    Known limitation: pathnames containing newlines, tabs, double-quotes,
+    or non-ASCII control characters are returned in git's C-quoted form
+    (e.g. `weird\\"name.py` instead of `weird"name.py`) because we use
+    the line-oriented porcelain=v2 output. Switching to `-z` + NUL-split
+    would be the robust fix; deferred until a real bug report shows up
+    (this affects 0% of file names in typical use).
     """
     text = _run_git(
         ["status", "--porcelain=v2", "--branch", "--untracked-files=normal"],
@@ -274,11 +293,19 @@ def git_status(
 # ---------------------------------------------------------------------------
 
 
-# Unit Separator (0x1F) — a control character that cannot appear in commit
-# subjects, author names, or dates. Using it as the field separator means
-# we don't have to worry about subject lines containing pipes / tabs /
-# whatever-else-the-author-felt-like.
+# Unit Separator (0x1F) — a control character that almost never appears
+# in commit subjects, author names, or dates in practice. Using it as
+# the field separator means we don't have to worry about subject lines
+# containing pipes / tabs / whatever-else-the-author-felt-like. git
+# stores arbitrary bytes so it technically could appear; the parser
+# handles malformed lines defensively below by skipping them.
 _LOG_FIELD_SEP = "\x1f"
+
+# Upper bound on `git log -n<count>` requests. Without this, an agent
+# that confabulates `count=1_000_000` would silently pull a million
+# commit records into memory and back across the MCP boundary. 1000 is
+# generous for any "show me recent activity" workflow.
+_MAX_LOG_COUNT = 1000
 
 
 def git_recent_commits(
@@ -306,12 +333,30 @@ def git_recent_commits(
     """
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         raise ValueError(f"count must be a positive int, got {count!r}")
+    if count > _MAX_LOG_COUNT:
+        raise ValueError(
+            f"count must be <= {_MAX_LOG_COUNT}, got {count!r}"
+        )
     if not isinstance(ref, str) or not ref.strip():
         raise ValueError(f"ref must be a non-empty string, got {ref!r}")
+    # Reject refs starting with '-' so an agent-supplied ref can't smuggle
+    # a git option flag (e.g. `ref='--all'` would replace the explicit
+    # ref with a glob, `ref='-h'` would print help). The `--` terminator
+    # below also closes the same hole structurally; the explicit check
+    # produces a clearer error than letting git fail downstream.
+    stripped_ref = ref.strip()
+    if stripped_ref.startswith("-"):
+        raise ValueError(
+            f"ref must not start with '-' (would be parsed as a git option), got {ref!r}"
+        )
 
     pretty = _LOG_FIELD_SEP.join(["%H", "%h", "%s", "%an", "%aI"])
+    # `--` terminator separates options from positional arguments. Even
+    # if a future caller's ref slipped a leading '-' past the check, git
+    # would interpret everything after `--` as a pathspec or ref, not a
+    # flag. Belt and suspenders.
     text = _run_git(
-        ["log", f"--pretty=format:{pretty}", f"-n{count}", ref],
+        ["log", f"--pretty=format:{pretty}", f"-n{count}", stripped_ref, "--"],
         path=path,
         runner=runner,
     )

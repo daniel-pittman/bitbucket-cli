@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 import git_ops
-from git_ops import GitOpError
+from git_ops import GIT_PARSE_ERROR_RETURNCODE, GitOpError
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +107,16 @@ class TestGitCurrentBranch:
         with pytest.raises(GitOpError, match="git executable not found"):
             git_ops.git_current_branch(runner=_MissingGitRunner)
 
-    def test_empty_stdout_raises(self) -> None:
+    def test_empty_stdout_raises_with_parse_returncode(self) -> None:
         # rev-parse should never return empty on a healthy repo; if it
         # does, fail loud rather than returning "" as a branch name.
+        # The sentinel returncode (-1) distinguishes parse failure from
+        # git's own exit codes for callers branching on returncode.
         runner = _RecordingRunner([(0, "\n", "")])
-        with pytest.raises(GitOpError, match="empty branch name"):
+        with pytest.raises(GitOpError, match="empty branch name") as exc:
             git_ops.git_current_branch(runner=runner)
+        assert exc.value.returncode == GIT_PARSE_ERROR_RETURNCODE
+        assert exc.value.returncode < 0  # any real git exit is >= 0
 
 
 # ===========================================================================
@@ -157,10 +161,14 @@ class TestGitRemoteRepo:
         with pytest.raises(GitOpError, match="No such remote"):
             git_ops.git_remote_repo(runner=runner)
 
-    def test_unparseable_url_raises(self) -> None:
+    def test_unparseable_url_raises_with_parse_returncode(self) -> None:
         runner = _RecordingRunner([(0, "not-a-url\n", "")])
-        with pytest.raises(GitOpError, match="could not parse"):
+        with pytest.raises(GitOpError, match="could not parse") as exc:
             git_ops.git_remote_repo(runner=runner)
+        # Parse failure: git exited 0 but we couldn't make sense of the
+        # output. Sentinel returncode distinguishes this from a real git
+        # failure (which carries git's own non-zero exit code).
+        assert exc.value.returncode == GIT_PARSE_ERROR_RETURNCODE
 
 
 # ===========================================================================
@@ -218,6 +226,16 @@ STATUS_UNMERGED = """\
 u UU N... 100644 100644 100644 100644 hash1 hash2 hash3 conflict.py
 """
 
+# Type-1 line with spaces in the filename. The path is the 9th token
+# (everything from index 8 onward) so split(" ", 8) preserves the spaces.
+STATUS_SPACE_IN_FILENAME = """\
+# branch.oid 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+# branch.head main
+# branch.upstream origin/main
+# branch.ab +0 -0
+1 .M N... 100644 100644 100644 hash1 hash1 docs/My Cool File.md
+"""
+
 
 class TestGitStatusParser:
     def test_clean_tree(self) -> None:
@@ -263,6 +281,14 @@ class TestGitStatusParser:
     def test_unmerged(self) -> None:
         s = git_ops._parse_status_porcelain_v2(STATUS_UNMERGED)
         assert s["unmerged"] == ["conflict.py"]
+        assert s["clean"] is False
+
+    def test_spaces_in_filename_preserved(self) -> None:
+        """Type-1 line uses `split(" ", 8)` so spaces in the filename
+        are preserved by collapsing everything from index 8 onward into
+        the path token. Regression guard for this parsing choice."""
+        s = git_ops._parse_status_porcelain_v2(STATUS_SPACE_IN_FILENAME)
+        assert s["modified"] == ["docs/My Cool File.md"]
         assert s["clean"] is False
 
 
@@ -358,6 +384,9 @@ class TestGitRecentCommits:
         # `-n<count>` shape, not separate args
         assert args[3] == "-n3"
         assert args[4] == "HEAD"
+        # `--` terminator separates options from positional refs (defense
+        # against an agent-supplied ref that starts with `-`).
+        assert args[5] == "--"
 
     def test_parses_log_output(self) -> None:
         runner = _RecordingRunner([(0, LOG_THREE_COMMITS, "")])
@@ -400,6 +429,33 @@ class TestGitRecentCommits:
         with pytest.raises(ValueError, match="ref"):
             git_ops.git_recent_commits(ref=bad, runner=runner)
         assert runner.calls == []
+
+    @pytest.mark.parametrize(
+        "bad_ref",
+        ["--all", "-h", "--format=junk", "  --pretty=blah"],
+    )
+    def test_rejects_ref_starting_with_dash(self, bad_ref: str) -> None:
+        """An agent-supplied ref like '--all' would otherwise be parsed
+        by git as an option flag, not a ref — silently changing the
+        meaning of the call. Reject at the boundary; the `--` terminator
+        below is the structural backstop."""
+        runner = _RecordingRunner([])
+        with pytest.raises(ValueError, match="must not start with '-'"):
+            git_ops.git_recent_commits(ref=bad_ref, runner=runner)
+        assert runner.calls == []  # no subprocess invocation
+
+    def test_rejects_count_above_cap(self) -> None:
+        runner = _RecordingRunner([])
+        with pytest.raises(ValueError, match="<="):
+            git_ops.git_recent_commits(count=10_001, runner=runner)
+        assert runner.calls == []
+
+    def test_count_at_cap_accepted(self) -> None:
+        # Verify the cap is exclusive (count == cap should pass), not
+        # off-by-one. The cap is _MAX_LOG_COUNT (1000).
+        runner = _RecordingRunner([(0, "", "")])
+        git_ops.git_recent_commits(count=git_ops._MAX_LOG_COUNT, runner=runner)
+        assert runner.calls[0]["args"][3] == f"-n{git_ops._MAX_LOG_COUNT}"
 
     def test_subject_containing_separator_drops_malformed_line(self) -> None:
         # The U+001F separator should not appear in commit subjects in
