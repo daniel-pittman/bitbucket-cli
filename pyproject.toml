@@ -48,7 +48,7 @@ Issues = "https://github.com/daniel-pittman/bitbucket-cli/issues"
 [tool.setuptools]
 # Flat module layout — same shape as zenhub-cli. The bash `bb` script lives
 # alongside; it is not a Python module.
-py-modules = ["bb_api", "bb_ops", "git_ops"]
+py-modules = ["bb_api", "bb_ops", "git_ops", "mcp_server"]
 
 [tool.setuptools.dynamic]
 version = { file = "VERSION" }
