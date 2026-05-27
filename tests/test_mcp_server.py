@@ -811,6 +811,23 @@ class TestGitTools:
 
 
 class TestWhoami:
+    """whoami has three phases — (1) config, (2) git context, (3) workspace
+    reachability via a single low-cost GET. Every test stubs phase (3)'s
+    HTTP layer so the suite stays hermetic — without the stub, an unpatched
+    BBClient.get would hit api.bitbucket.org for real."""
+
+    @staticmethod
+    def _stub_auth_ok(client: bb_api.BBClient) -> list[tuple[str, dict]]:
+        """Replace client.get with a recorder that returns success.
+        Returns the call-log so tests can assert the right endpoint
+        was hit with the right query."""
+        calls: list[tuple[str, dict]] = []
+        def fake_get(path: str, *, query=None, timeout=None):
+            calls.append((path, dict(query or {})))
+            return {"slug": "acme", "type": "workspace"}
+        client.get = fake_get  # type: ignore[method-assign]
+        return calls
+
     def test_reports_config_and_git_context(
         self,
         stub_client: bb_api.BBClient,
@@ -824,6 +841,7 @@ class TestWhoami:
             git_ops, "git_remote_repo",
             lambda path=None: ("acme", "widget-service"),
         )
+        calls = self._stub_auth_ok(stub_client)
         out = mcp_server.whoami()
         assert out["ok"] is True
         assert out["user"] == "alice@example.com"
@@ -831,6 +849,9 @@ class TestWhoami:
         assert out["git_branch"] == "feat/test"
         assert out["git_workspace"] == "acme"
         assert out["git_repo"] == "widget-service"
+        assert out["auth"] == {"ok": True}
+        # Reachability probe hit the right endpoint with the cheap pagelen.
+        assert calls == [("/repositories/acme", {"pagelen": "1"})]
         # Token must NEVER be echoed.
         assert "tok-xyz" not in str(out)
         assert "token" not in {k.lower() for k in out.keys()}
@@ -847,16 +868,19 @@ class TestWhoami:
 
         monkeypatch.setattr(git_ops, "git_current_branch", raise_git)
         monkeypatch.setattr(git_ops, "git_remote_repo", raise_git)
+        self._stub_auth_ok(stub_client)
         out = mcp_server.whoami()
         assert out["ok"] is True  # config still loaded
-        assert "git_branch_error" in out
-        assert "git_remote_error" in out
+        # When _default_repo_path raises, both git_branch/git_remote
+        # probes are skipped — only cwd_error is recorded.
+        assert "git_branch_error" in out or "cwd_error" in out
 
     def test_config_error_flips_ok_false(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """If config is missing, ok=False AND we still surface git context
-        (best-effort) so the user can debug."""
+        (best-effort) so the user can debug. The auth probe is skipped
+        (no client to probe with) so out['auth'] is absent."""
         mcp_server._reset_client_cache()
         def raise_config(*_args: Any, **_kwargs: Any) -> Any:
             raise bb_api.BBConfigError("Missing BB_USER")
@@ -873,6 +897,69 @@ class TestWhoami:
         assert "BB_USER" in out["message"]
         # Still reports git context.
         assert out["git_branch"] == "main"
+        # Auth probe MUST be skipped when there's no client — never let
+        # a None-deref slip in by refactor.
+        assert "auth" not in out
+
+    def test_auth_probe_failure_does_not_flip_ok(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 401 from the workspace endpoint means the token is invalid
+        for THIS workspace. Surface it as out['auth']['ok']=False but
+        keep the outer ok=True — config + git context are still useful
+        for debugging the credential."""
+        monkeypatch.setattr(git_ops, "git_current_branch", lambda path=None: "main")
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo",
+            lambda path=None: ("acme", "widget-service"),
+        )
+
+        def fake_get(path: str, *, query=None, timeout=None):
+            raise bb_api.BBApiError(
+                status=401,
+                url="https://api.bitbucket.org/2.0/repositories/acme?pagelen=1",
+                body="",
+            )
+
+        stub_client.get = fake_get  # type: ignore[method-assign]
+        out = mcp_server.whoami()
+        assert out["ok"] is True  # outer call still ok
+        assert out["auth"]["ok"] is False
+        assert out["auth"]["kind"] == "BBApiError"
+        assert out["auth"]["status"] == 401
+        # Token must NEVER be echoed, even on the auth-failure path.
+        assert "tok-xyz" not in str(out)
+
+    def test_auth_probe_url_encodes_workspace(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the workspace slug has a character that needs URL
+        encoding (rare, but `/` would break path parsing), the probe
+        must encode it — bash uses raw curl, Python uses urllib.quote
+        with safe=''. Test the encoding rather than the raw substitution."""
+        # BBConfig is frozen; swap the whole client in.
+        weird_cfg = bb_api.BBConfig(
+            user="alice@example.com",
+            token="tok-xyz",
+            workspace="ws/with-slash",
+            api_base=bb_api.DEFAULT_API_BASE,
+        )
+        stub_client = bb_api.BBClient(weird_cfg)
+        monkeypatch.setattr(mcp_server, "_client_cache", stub_client)
+        monkeypatch.setattr(git_ops, "git_current_branch", lambda path=None: "main")
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo",
+            lambda path=None: ("acme", "widget-service"),
+        )
+        calls = self._stub_auth_ok(stub_client)
+        out = mcp_server.whoami()
+        assert out["ok"] is True
+        # `/` must be encoded as %2F so it doesn't fragment the path.
+        assert calls == [("/repositories/ws%2Fwith-slash", {"pagelen": "1"})]
 
 
 # ---------------------------------------------------------------------------

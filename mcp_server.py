@@ -48,6 +48,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -1186,22 +1187,33 @@ def git_uncommitted_changes(path: str = "") -> dict[str, Any]:
 
 @mcp.tool()
 def whoami() -> dict[str, Any]:
-    """Report the resolved Bitbucket user, workspace, API base, and the
-    auto-detected git context for the current working directory.
+    """Report the resolved Bitbucket user, workspace, API base, the
+    auto-detected git context for the current working directory, and a
+    workspace-reachability probe that confirms the credential actually
+    works against the configured workspace.
 
-    Useful as a connectivity / config smoke test before more invasive
-    operations. Does NOT echo the token.
+    Does NOT echo the token.
 
-    Two-phase: (1) config (fatal — flips ok=False on failure);
+    Three-phase: (1) config (fatal — flips ok=False on failure);
     (2) git context (best-effort — failures stored as structured
     sub-errors but don't flip ok=False, since the server is useful
-    even outside a git repo).
+    even outside a git repo); (3) workspace reachability via a single
+    low-cost `GET /repositories/{workspace}?pagelen=1` (best-effort —
+    failures recorded as `auth` payload but don't flip ok=False, since
+    config + git context are still useful with a stale token).
+
+    The reachability probe targets the workspace endpoint (not /user)
+    because Atlassian's workspace-scoped tokens — the now-recommended
+    shape — reject /user with 401/403 while serving the workspace
+    endpoint correctly, so a /user probe would false-negative valid
+    tokens.
     """
     out: dict[str, Any] = {"ok": True}
 
     # Phase 1: config. Wrap the full breadth of expected exceptions
     # (including OSError for os.getcwd-on-deleted-cwd inside the
     # whoami body itself).
+    client: bb_api.BBClient | None = None
     try:
         client = _get_client()
         out["user"] = client.config.user
@@ -1221,19 +1233,34 @@ def whoami() -> dict[str, Any]:
         cwd = _default_repo_path()
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         out["cwd_error"] = _error_dict(e)
-        return out
-    out["cwd"] = cwd
+        cwd = None
+    else:
+        out["cwd"] = cwd
 
-    try:
-        out["git_branch"] = git_ops.git_current_branch(path=cwd)
-    except _TOOL_EXPECTED_EXCEPTIONS as e:
-        out["git_branch_error"] = _error_dict(e)
-    try:
-        ws, slug = git_ops.git_remote_repo(path=cwd)
-        out["git_workspace"] = ws
-        out["git_repo"] = slug
-    except _TOOL_EXPECTED_EXCEPTIONS as e:
-        out["git_remote_error"] = _error_dict(e)
+    if cwd is not None:
+        try:
+            out["git_branch"] = git_ops.git_current_branch(path=cwd)
+        except _TOOL_EXPECTED_EXCEPTIONS as e:
+            out["git_branch_error"] = _error_dict(e)
+        try:
+            ws, slug = git_ops.git_remote_repo(path=cwd)
+            out["git_workspace"] = ws
+            out["git_repo"] = slug
+        except _TOOL_EXPECTED_EXCEPTIONS as e:
+            out["git_remote_error"] = _error_dict(e)
+
+    # Phase 3: workspace reachability. Skip if Phase 1 failed (no
+    # client to probe with). Single cheap GET; success means the
+    # credential is valid for the configured workspace right now.
+    if client is not None:
+        try:
+            client.get(
+                f"/repositories/{urllib.parse.quote(client.config.workspace, safe='')}",
+                query={"pagelen": "1"},
+            )
+            out["auth"] = {"ok": True}
+        except _TOOL_EXPECTED_EXCEPTIONS as e:
+            out["auth"] = {"ok": False, **_error_dict(e)}
 
     return out
 
