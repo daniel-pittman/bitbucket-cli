@@ -16,7 +16,7 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 
 ## What this agent does
 
-1. **Pipeline operations** — list / show / trigger / stop / watch pipelines; pull step-level logs; resolve build numbers across the most-recent 100-page (or 2000-pipeline scan when called via MCP) so older runs are still findable.
+1. **Pipeline operations** — list / show / trigger / stop / watch pipelines; pull step-level logs; resolve build numbers across the most-recent 100 pipelines (single page) for bash, or a 2000-pipeline scan (up to 20 pages) via MCP so older runs are still findable.
 2. **Pull-request lifecycle** — list / show / create / approve / unapprove / merge / decline; view diffs; list and add comments. PR creation auto-detects the source branch from the current git checkout when not specified.
 3. **Repo introspection** — list workspace repos with optional BBQL filtering; show single-repo metadata (language, size, clone URLs, default branch); list / show branches with URL-encoding for slash-containing names; list recent commits across all branches or per-branch.
 4. **Pipeline configuration** — view repo variables (with `secured` flag awareness so callers don't misread a `null` value as "unset" when it's actually "masked").

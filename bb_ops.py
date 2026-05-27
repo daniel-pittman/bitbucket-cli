@@ -50,9 +50,9 @@ def _is_positive_int(value: Any) -> bool:
 # When resolving a build_number -> uuid, we walk the pipelines list sorted
 # by most-recent-first. This cap bounds how far back we look before giving
 # up. 2000 = 20 pages of 100 = "any pipeline triggered in the last few
-# months" for an active repo. The bash script's inline lookup is limited
-# to a single 50-pipeline page, so this is a substantive parity improvement
-# (parity follow-up for 4.7: fix bash to paginate the same way).
+# months" for an active repo. The bash script's inline lookup is a single
+# 100-pipeline page; this MCP-side scan trades a few extra API calls for
+# the ability to address older builds by number.
 _PIPELINE_SCAN_LIMIT = 2000
 
 
