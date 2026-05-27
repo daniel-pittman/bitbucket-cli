@@ -894,3 +894,41 @@ class TestBootstrapStub:
         import os as _os
         assert _os.environ.get("BB_MCP_SKIP_BOOTSTRAP") == "1"
         assert mcp_server._MCP_SKIP_BOOTSTRAP is True
+
+
+class TestVenvLocation:
+    """Pin the durable XDG-spec venv location so a regression to the
+    old /tmp/bbenv path (which gets wiped at every boot, forcing a
+    rebuild) doesn't slip through. Mirrors the zenhub-cli pattern."""
+
+    def test_venv_dir_is_under_xdg_data_home(self) -> None:
+        """The venv path must end in `bitbucket-cli/venv` so it lives
+        alongside other XDG-spec app state."""
+        from pathlib import Path
+        assert mcp_server._VENV_DIR.parts[-2:] == ("bitbucket-cli", "venv")
+        # NOT /tmp (which would re-bootstrap every reboot).
+        assert not str(mcp_server._VENV_DIR).startswith("/tmp")
+
+    def test_xdg_data_home_env_var_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`XDG_DATA_HOME=/custom/path` must place the venv at
+        `/custom/path/bitbucket-cli/venv` — per the XDG Base Dir spec.
+        Calls the helper directly so the test doesn't need to reload
+        the module."""
+        from pathlib import Path
+        monkeypatch.setenv("XDG_DATA_HOME", "/custom/xdg")
+        assert mcp_server._xdg_data_home() == Path("/custom/xdg")
+
+    def test_xdg_data_home_default_under_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When XDG_DATA_HOME is unset, fall back to ~/.local/share."""
+        from pathlib import Path
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        assert mcp_server._xdg_data_home() == Path.home() / ".local" / "share"
+
+    def test_venv_ready_sentinel_inside_venv_dir(self) -> None:
+        """The ready-sentinel must live INSIDE the venv dir so removing
+        the whole venv (`rm -rf $venv_dir`) also removes the sentinel
+        — otherwise a stale sentinel could survive and claim a missing
+        venv is ready."""
+        assert mcp_server._VENV_READY.parent == mcp_server._VENV_DIR

@@ -20,9 +20,12 @@ Every Bitbucket tool accepts an optional `repo` argument:
 Run as a subprocess (stdio transport):
     /usr/bin/python3 mcp_server.py
 
-The script self-bootstraps /tmp/bbenv (mcp package) on first run and on
-reboot when /tmp is wiped, then re-execs under that venv. Any python3 on
-PATH that can run `python3 -m venv` works as the launcher.
+The script self-bootstraps a venv under `$XDG_DATA_HOME/bitbucket-cli/venv`
+(default `~/.local/share/bitbucket-cli/venv`) on first run, installs the
+`mcp` package into it, then re-execs under that venv. Any python3 on
+PATH that can run `python3 -m venv` works as the launcher. The venv
+location is durable (survives reboot), so subsequent launches re-exec
+into the existing venv without rebuilding.
 
 Register user-scope so every Claude Code session sees it:
     claude mcp add --scope user bb \\
@@ -34,6 +37,9 @@ Environment overrides:
   BB_API_BASE                     — Bitbucket REST base (default api.bitbucket.org/2.0)
   BB_DEFAULT_REPO_PATH            — git checkout dir for auto-detect (default: cwd)
   BB_MCP_SKIP_BOOTSTRAP=1         — test escape hatch (skips venv + stubs FastMCP)
+  XDG_DATA_HOME                   — overrides the venv parent dir (default
+                                    ~/.local/share); the venv lives at
+                                    `$XDG_DATA_HOME/bitbucket-cli/venv`
 """
 
 from __future__ import annotations
@@ -46,12 +52,29 @@ from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Self-bootstrap: /tmp gets wiped on reboot. If our venv is missing, build it
-# with stdlib-only code and re-exec under it. Must run before any third-party
-# import (mcp).
+# Self-bootstrap: ensure the venv exists and re-exec into it. Built under
+# `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/
+# venv`) so it survives reboots — the previous `/tmp/bbenv` location would
+# get wiped at every boot, forcing a fresh ~30s rebuild. The new location
+# follows the XDG Base Directory spec and matches the pattern used by
+# zenhub-cli (`~/.local/share/zenhub-cli/venv`).
+#
+# Must run before any third-party import (mcp).
 # ---------------------------------------------------------------------------
 
-_VENV_DIR = Path("/tmp/bbenv")
+
+def _xdg_data_home() -> Path:
+    """Return the resolved XDG data dir for app state. Honors
+    XDG_DATA_HOME when set (per the spec); falls back to
+    `~/.local/share`. Returned at module-import time so the path is
+    pinned for the rest of the bootstrap."""
+    explicit = os.environ.get("XDG_DATA_HOME")
+    if explicit:
+        return Path(explicit)
+    return Path.home() / ".local" / "share"
+
+
+_VENV_DIR = _xdg_data_home() / "bitbucket-cli" / "venv"
 _VENV_PY = _VENV_DIR / "bin" / "python3"
 # Sentinel file written ONLY after the full bootstrap (venv create + pip
 # install) succeeds. If pip is Ctrl-C'd / OOM-killed / disk-full mid-run,
@@ -60,8 +83,9 @@ _VENV_PY = _VENV_DIR / "bin" / "python3"
 # broken venv, and die on `from mcp.server.fastmcp import FastMCP`.
 _VENV_READY = _VENV_DIR / ".bbenv-ready"
 # Pin to mcp>=1.0,<2 so a breaking mcp 2.x release doesn't silently
-# install on the next /tmp wipe and break every fresh launch. Matches
-# the pyproject.toml [mcp] extra.
+# install on a fresh-machine bootstrap (or a manual `rm` of the venv)
+# and break every subsequent launch. Matches the pyproject.toml [mcp]
+# extra.
 _VENV_DEPS = ("mcp>=1.0,<2",)  # No heavy deps (no torch / sentence-transformers).
 _VENV_MIN_PY = (3, 10)  # bb_api uses PEP 604 unions; mcp also needs >=3.10
 
@@ -127,13 +151,16 @@ def _pip_install_or_diagnose(args: list[str]) -> None:
 
 
 def _bootstrap_venv() -> None:
-    """Create /tmp/bbenv on first run, install deps, re-exec under it.
+    """Create the venv on first run, install deps, re-exec under it.
 
     Idempotent: a fully-bootstrapped venv (sentinel file present)
     re-execs immediately. A partially-bootstrapped venv (venv exists
     but sentinel doesn't — e.g. previous pip install was Ctrl-C'd or
     OOM-killed) gets the pip install retried with no manual cleanup
     needed.
+
+    Creates parent directories if needed (e.g. on a fresh machine the
+    XDG data dir may not exist yet).
     """
     if not _VENV_READY.exists():
         builder = _find_builder_python()
@@ -142,6 +169,11 @@ def _bootstrap_venv() -> None:
             f"[bb-mcp] bootstrapping {_VENV_DIR} with {builder}",
             file=sys.stderr,
         )
+        # Make sure the parent directory exists. On a fresh machine
+        # `~/.local/share` may exist but `~/.local/share/bitbucket-cli`
+        # won't yet — `python -m venv` doesn't create intermediate
+        # directories above the target.
+        _VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
         # Only create the venv if it doesn't already exist (a previous
         # half-finished bootstrap left _VENV_PY in place).
         if not _VENV_PY.exists():
@@ -159,12 +191,13 @@ def _bootstrap_venv() -> None:
         _VENV_READY.touch()
 
     # Detect "are we already running under the bootstrap venv?" via
-    # resolved sys.prefix. Both `python -m venv` on Linux/macOS (which
-    # symlinks the interpreter) and macOS's `/tmp -> /private/tmp`
-    # mean we must resolve BOTH sides through realpath, not just rely
-    # on string equality. Without the resolve, /tmp/bbenv vs
-    # /private/tmp/bbenv would compare unequal forever and trigger an
-    # infinite execv loop.
+    # resolved sys.prefix. `python -m venv` on Linux/macOS symlinks
+    # the interpreter into the venv's bin/, and various platform path
+    # quirks (e.g. macOS's `/tmp -> /private/tmp`, `~/` resolution
+    # differences) mean we must resolve BOTH sides through realpath,
+    # not just rely on string equality. Without the resolve, the
+    # comparison can disagree on the same logical path and trigger
+    # an infinite execv loop.
     if Path(sys.prefix).resolve() != _VENV_DIR.resolve():
         # Resolve __file__ so a relative-launch (`python3 mcp_server.py`
         # from inside the repo) followed by any future chdir between
@@ -190,10 +223,10 @@ if not _MCP_SKIP_BOOTSTRAP:
         from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
     except ImportError as e:
         # Sentinel-present launch found `mcp` missing — manual `pip
-        # uninstall`, partial /tmp cleanup that wiped the package dir
-        # but spared the touch file, or an image-layer accident. Tell
-        # the user the recovery path explicitly rather than letting
-        # them chase a bare ModuleNotFoundError.
+        # uninstall`, partial filesystem cleanup that wiped the package
+        # dir but spared the touch file, or an image-layer accident.
+        # Tell the user the recovery path explicitly rather than
+        # letting them chase a bare ModuleNotFoundError.
         raise ImportError(
             f"[bb-mcp] FastMCP import failed even though {_VENV_READY} "
             f"says the venv is ready ({e}). The mcp package was probably "
