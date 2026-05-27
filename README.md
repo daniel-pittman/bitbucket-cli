@@ -209,7 +209,7 @@ The MCP server is a **parallel implementation** of the same Bitbucket REST contr
 
 ### Install
 
-The MCP server self-bootstraps a virtual environment on first run, so installation is just two steps: clone the repo (see [Installation](#installation) step 1), then point your MCP client at `mcp_server.py`. The first invocation creates `~/.local/share/bitbucket-cli/venv` (override with `XDG_DATA_HOME`) and installs the `mcp` package. Subsequent invocations reuse the venv — startup is fast.
+The MCP server self-bootstraps a virtual environment on first run, so installation is just two steps: clone the repo (see [Installation](#installation) step 1), then point your MCP client at `mcp_server.py`. The first invocation creates `~/.local/share/bitbucket-cli/venv` (relocate by setting `XDG_DATA_HOME`; the venv then lives at `$XDG_DATA_HOME/bitbucket-cli/venv`) and installs the `mcp` package. Subsequent invocations reuse the venv — startup is fast.
 
 ### Claude Code (`.mcp.json` or `claude mcp add`)
 
