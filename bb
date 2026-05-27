@@ -613,7 +613,11 @@ cmd_pr_list() {
         # finds it before Homebrew bash on the default PATH, so the
         # lowercase-substitution syntax would fail this branch only
         # (when count==0) — and only on macOS where it bites hardest.
-        echo "  No $(echo "$state" | tr '[:upper:]' '[:lower:]') pull requests."
+        # Use printf '%s' rather than echo to neutralize leading-dash
+        # values (echo would interpret `-n` / `-e` / `-E` as flags); not
+        # a real risk for Bitbucket states (OPEN/MERGED/DECLINED/...)
+        # but bulletproof and only marginally longer.
+        echo "  No $(printf '%s' "$state" | tr '[:upper:]' '[:lower:]') pull requests."
         return
     fi
 
