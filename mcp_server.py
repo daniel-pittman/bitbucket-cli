@@ -321,6 +321,14 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
             raise ValueError(
                 f"repo must be 'workspace/repo' or 'repo'; got {repo!r}"
             )
+        # Symmetric with the bare-slug branch below — validate `.` / `..`
+        # in either segment BEFORE _get_client() so a malformed slug on
+        # a config-less machine surfaces as ValueError rather than the
+        # misleading BBConfigError.
+        if parts[0] in (".", "..") or parts[1] in (".", ".."):
+            raise ValueError(
+                f"workspace and repo must not be '.' or '..'; got {repo!r}"
+            )
         client = _get_client()
         return client, parts[0], parts[1]
 
@@ -344,18 +352,31 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
 # Keeping a consistent shape means the MCP agent can branch on `ok` once and
 # render the result vs. error path uniformly.
 
-# Match a URL with embedded credentials OR an AWS-style signed URL with
-# a `Signature` / `X-Amz-Signature` / `X-Amz-Credential` query parameter.
-# Either shape would leak a high-value secret if echoed into an error
-# message that flows up through MCP into agent context / downstream logs.
+# Match a URL with embedded credentials. `[^/]+@` is greedy up to the
+# last `@` before the path so passwords containing literal `@` don't
+# slip through the redactor.
 _URL_CRED_PATTERN = re.compile(r"://[^/]+@")
-# Lowercase signed-URL indicators; comparison lowercases the query part
-# first so MinIO / R2 / Backblaze / mixed-case AWS variants don't slip
-# past the redaction.
+
+# SCP-style remote URLs (`user:token@host:path`) have no scheme prefix,
+# so the regex above doesn't catch them. Match a `<user[:tok]>@<host>:`
+# at the start of a line or after whitespace.
+_SCP_CRED_PATTERN = re.compile(r"(^|\s)[^/:\s@]+(?::[^/@\s]*)?@(?=[^/\s]+:)")
+
+# Lowercase signed-URL indicators (compared against the lowercased
+# query part). Covers:
+#   AWS:    X-Amz-Signature / X-Amz-Credential
+#   GCP:    X-Goog-Signature / X-Goog-Credential
+#   Azure:  sig=, sv=, se=  (SAS query parameters)
+#   Plain:  Signature= (some non-AWS S3-compatible services)
+#   Bearer: access_token=, api_key=  (URLs that embed bearer tokens)
+# Tuples of trailing `=` so `sig=` doesn't match the trailing of
+# `signature=` (which would over-match harmlessly anyway, but the
+# specific patterns are clearer).
 _SIGNED_URL_INDICATORS_LOWER = (
-    "x-amz-signature=",
-    "x-amz-credential=",
-    "signature=",
+    "x-amz-signature=", "x-amz-credential=",
+    "x-goog-signature=", "x-goog-credential=",
+    "sig=", "signature=",
+    "access_token=", "api_key=",
 )
 
 
@@ -369,8 +390,9 @@ def _redact_url(url: str) -> str:
     S3 URL>). The signed URL embeds AWS credentials in the query and
     must not flow into agent context or downstream logs.
 
-    Case-insensitive match on query params so MinIO / R2 / Backblaze /
-    mixed-case AWS variants don't slip past.
+    Case-insensitive query-param match so MinIO / R2 / Backblaze /
+    mixed-case AWS variants don't slip past. Covers AWS / GCP / Azure
+    SAS / generic Signature= / bearer-token-in-URL shapes.
     """
     if not url:
         return url
@@ -388,28 +410,40 @@ def _redact_url(url: str) -> str:
     return redacted
 
 
-def _redact_message(message: str) -> str:
-    """Redact any URLs embedded in a free-form error message text.
+# Match ANY URL scheme (http, https, ssh, git+ssh, etc.) so SCP-style
+# variants and ssh:// URLs with embedded passphrases don't slip past
+# free-form-text redaction. Stops at whitespace / quote / angle-bracket /
+# closing-paren — covers URLs embedded in typical log / error shapes.
+_ANY_URL_PATTERN = re.compile(r"(?:[a-zA-Z][a-zA-Z0-9+.-]*)://[^\s'\"<>)]+")
 
-    Necessary because `BBApiError.__str__` constructs its message from
-    the raw URL: `f"HTTP {status} from {url}: {body[:500]}"`. The
-    round-2 security fix only redacted the `url` FIELD on the error
-    dict but left the `message` field carrying the same URL verbatim.
-    Now both fields route through redaction.
 
-    Cheap shape: scan for `http(s)://...` substrings and pass each
-    through `_redact_url`. Conservative — anything that looks like a
-    URL gets redacted, even ones without credentials (those are
-    no-ops through _redact_url).
+def _safe_text(text: str) -> str:
+    """Redact every URL-shaped substring AND SCP-style `user:tok@host:`
+    forms from a free-form text field. Applied uniformly to every
+    string field going into the error dict (message / body / stderr)
+    so a credential leak through ANY one of those fields requires a
+    new threat vector, not just a new field name.
+
+    The previous rounds whack-a-moled fields one at a time:
+      - Round 2: redacted `url` (left `message` leaking)
+      - Round 3: redacted `message` (left `body` leaking)
+      - Round 4: this routes all three through one helper so the
+        leak class is structurally closed.
     """
-    if not message:
-        return message
-    # Match http:// or https:// up to the next whitespace / quote /
-    # angle-bracket / closing-paren — covers URLs embedded in typical
-    # log / error message shapes.
-    def _sub(m: re.Match[str]) -> str:
+    if not text:
+        return text
+    def _sub_url(m: re.Match[str]) -> str:
         return _redact_url(m.group(0))
-    return re.sub(r"https?://[^\s'\"<>)]+", _sub, message)
+    # Pass 1: redact URL-scheme forms (http://, https://, ssh://, git+ssh://, ...).
+    redacted = _ANY_URL_PATTERN.sub(_sub_url, text)
+    # Pass 2: SCP-style (user:tok@host:path) with no scheme prefix.
+    redacted = _SCP_CRED_PATTERN.sub(lambda m: f"{m.group(1)}[redacted]@", redacted)
+    return redacted
+
+
+# Legacy alias retained for the existing test_bbapierror_redacts_signed_s3_url
+# / test_bbapierror_redacts_embedded_creds tests. Renamed forwarder.
+_redact_message = _safe_text
 
 
 def _error_dict(e: Exception) -> dict[str, Any]:
@@ -417,23 +451,29 @@ def _error_dict(e: Exception) -> dict[str, Any]:
 
     The agent sees `kind`, `message`, and (for BBApiError) the HTTP
     status + redacted URL so it can branch on `kind == "BBApiError"
-    and status == 404` without parsing the message string. URLs are
-    routed through `_redact_url` (for the `url` field) AND the
-    `message` field is routed through `_redact_message`, so embedded
-    credentials AND AWS signed-URL parameters never leak through
-    EITHER channel into the agent context.
+    and status == 404` without parsing the message string.
+
+    EVERY string field that could contain a URL or credential is
+    routed through `_safe_text`:
+      - message     (str(e) embeds URL for BBApiError)
+      - url         (BBApiError, dedicated url-only redactor)
+      - body        (API response can echo the redirect target URL)
+      - stderr      (GitOpError; git stderr commonly contains remote URLs
+                     once Phase 4.7 wraps remote-touching commands)
     """
     kind = type(e).__name__
-    # str(e) may contain the raw URL (BBApiError.__str__ embeds it
-    # verbatim); route through the message-level redactor.
-    out: dict[str, Any] = {"ok": False, "kind": kind, "message": _redact_message(str(e))}
+    out: dict[str, Any] = {
+        "ok": False,
+        "kind": kind,
+        "message": _safe_text(str(e)),
+    }
     if isinstance(e, bb_api.BBApiError):
         out["status"] = e.status
         out["url"] = _redact_url(e.url)
-        out["body"] = e.body
+        out["body"] = _safe_text(e.body)
     elif isinstance(e, git_ops.GitOpError):
         out["returncode"] = e.returncode
-        out["stderr"] = e.stderr
+        out["stderr"] = _safe_text(e.stderr)
     return out
 
 
@@ -718,10 +758,24 @@ def pr_create(
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
-        # Default source_branch to the current git branch when
-        # empty/whitespace — matches the bash `bb pr-create` behaviour.
-        # `.strip()` so " " (sloppy whitespace) doesn't bypass auto-detect.
-        if not source_branch.strip():
+        # Normalise every string arg at the boundary. `(x or "").strip()`
+        # handles None (JSON null), whitespace-only, and trailing/leading
+        # whitespace uniformly. Symmetric with pipeline_trigger's branch
+        # handling (round 3 fix #2) and _resolve_repo's repo handling
+        # (round 2). Without this, "feat/widget " posts a 404, "Hi "
+        # ships a title with literal trailing whitespace, etc.
+        source_branch = (source_branch or "").strip()
+        destination_branch = (destination_branch or "main").strip() or "main"
+        normalised_title = (title or "").strip()
+        normalised_description = (description or "").strip()
+        if not normalised_title:
+            raise ValueError(
+                f"title is required and must be non-empty/non-whitespace; got {title!r}"
+            )
+
+        # Default source_branch to the current git branch when empty —
+        # matches the bash `bb pr-create` behaviour.
+        if not source_branch:
             source_branch = git_ops.git_current_branch(path=_default_repo_path())
         # Reject "HEAD" regardless of whether it came from auto-detect
         # or was supplied explicitly. Bitbucket would silently create a
@@ -733,17 +787,18 @@ def pr_create(
             )
         pr = bb_ops.pr_create(
             client, workspace, repo_slug,
-            title=title,
+            title=normalised_title,
             source_branch=source_branch,
             destination_branch=destination_branch,
-            description=description,
+            description=normalised_description,
             close_source_branch=close_source_branch,
             reviewers=reviewers,
         )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "pr": pr}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         # Thread title for parallel-call correlation (e.g. agent fanning
-        # out one pr_create per stacked branch in a PR train).
+        # out one pr_create per stacked branch in a PR train). Use the
+        # raw title so the agent can match against what it sent.
         return _error_dict_with(e, title=title)
 
 
@@ -1066,9 +1121,12 @@ def git_recent_commits(path: str = "", count: int = 10, ref: str = "HEAD") -> di
     """List the most recent `count` commits reachable from `ref`."""
     try:
         cwd = path or _default_repo_path()
-        # Echo the stripped ref so the response matches what git
-        # actually ran (git_ops.git_recent_commits strips internally).
-        stripped_ref = ref.strip() if ref else "HEAD"
+        # `(ref or "").strip() or "HEAD"`: None, "", and "   " all
+        # funnel to the HEAD default. Previously whitespace-only collapsed
+        # to "" then errored, inconsistent with the empty-string success
+        # path. Same shape as `_opt_str` but with a fallback rather than
+        # None (ref is required by git_ops).
+        stripped_ref = (ref or "").strip() or "HEAD"
         commits = git_ops.git_recent_commits(path=cwd, count=count, ref=stripped_ref)
         return {"ok": True, "path": cwd, "ref": stripped_ref, "commits": commits}
     except _TOOL_EXPECTED_EXCEPTIONS as e:

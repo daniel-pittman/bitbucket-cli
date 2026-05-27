@@ -38,10 +38,20 @@ import mcp_server
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset the module-level client cache + default cwd between tests so
-    one test's state doesn't leak into another's."""
+    one test's state doesn't leak into another's.
+
+    Also scrubs the BB_* auth env vars so a developer running pytest
+    locally with `BB_USER=...` exported in their shell doesn't accidentally
+    let `bb_api.load_config()` pick up their real config in any test that
+    reaches `_get_client()` without the `stub_client` fixture. Without
+    this scrub, a future test could pass locally and fail in CI (or
+    vice versa) based on developer env, not code state."""
     mcp_server._reset_client_cache()
     # Default BB_DEFAULT_REPO_PATH to a stable value so tests can assert on it.
     monkeypatch.setenv("BB_DEFAULT_REPO_PATH", "/test/cwd")
+    # Scrub ambient BB config so the suite is hermetic against dev env.
+    for k in ("BB_USER", "BB_TOKEN", "BB_WORKSPACE", "BB_API_BASE"):
+        monkeypatch.delenv(k, raising=False)
 
 
 @pytest.fixture
@@ -268,26 +278,32 @@ class TestErrorDict:
         assert "nope" in d["body"]
 
     def test_bbapierror_redacts_signed_s3_url(self) -> None:
-        """Round-2 SECURITY finding: pipeline_logs / pr_diff follow
+        """Round-2/3/4 SECURITY findings: pipeline_logs / pr_diff follow
         Bitbucket's 307 to a signed S3 URL. If S3 then returns non-3xx
-        (clock skew, expired, network hiccup), BBApiError.url carries
-        the signed URL with AWS credentials in the query string. The
-        agent error dict must NOT propagate it through ANY field —
-        round-3 found the round-2 fix only covered `url`, leaving
-        `message` (built from str(e)) still leaking."""
+        (clock skew, expired, network hiccup), BBApiError carries the
+        signed URL with AWS credentials in the query string. The agent
+        error dict must NOT propagate it through ANY field.
+
+        Round 2 fixed `url`; round 3 found `message` still leaked;
+        round 4 found `body` still leaked. Pin EVERY string field that
+        could carry the URL so a future regression can't add a new
+        unredacted field without the test catching it."""
         signed = (
             "https://bbuseruploads.s3.amazonaws.com/path/to/log?"
             "X-Amz-Signature=abcd1234supersecret&X-Amz-Credential=AKIAEXAMPLE"
             "&Expires=12345"
         )
-        e = bb_api.BBApiError(403, signed, "AccessDenied")
+        # Realistic API body that echoes the upstream URL — typical for
+        # nginx / proxy-layered error pages.
+        body_with_url = (
+            f"<html>Bad gateway: upstream {signed} failed: connection reset</html>"
+        )
+        e = bb_api.BBApiError(403, signed, body_with_url)
         d = mcp_server._error_dict(e)
-        # Both `url` AND `message` must be free of the secret. The
-        # round-2 fix only checked `url`, hiding the regression where
-        # `message` still carried the raw URL.
-        for field in ("url", "message"):
+        # EVERY string field free of every secret bit.
+        for field in ("url", "message", "body"):
             assert "abcd1234supersecret" not in d[field], (
-                f"secret leaked through {field}: {d[field]!r}"
+                f"signature leaked through {field}: {d[field]!r}"
             )
             assert "AKIAEXAMPLE" not in d[field], (
                 f"AWS access key leaked through {field}: {d[field]!r}"
@@ -297,18 +313,42 @@ class TestErrorDict:
         assert "redacted-signed-url-params" in d["url"]
 
     def test_bbapierror_redacts_embedded_creds(self) -> None:
+        # Body field can also carry the credentialed URL (e.g.
+        # `curl` showing the failing URL back in its error output).
         e = bb_api.BBApiError(
             401,
             "https://user:supersecret@api.bitbucket.org/2.0/foo",
-            "Unauthorized",
+            "Auth failed for https://user:supersecret@api.bitbucket.org/2.0/foo",
         )
         d = mcp_server._error_dict(e)
-        for field in ("url", "message"):
+        for field in ("url", "message", "body"):
             assert "supersecret" not in d[field], (
                 f"credential leaked through {field}: {d[field]!r}"
             )
         assert "[redacted]" in d["url"]
         assert "[redacted]" in d["message"]
+        assert "[redacted]" in d["body"]
+
+    def test_giterror_stderr_redacted(self) -> None:
+        """Phase 4.7+ will add git wrappers that touch remote repos
+        (fetch / push / ls-remote). Their stderr commonly contains
+        `fatal: unable to access 'https://x-token-auth:TOKEN@bb.org/...'`.
+        _error_dict must redact stderr the same way it redacts message
+        and body."""
+        e = git_ops.GitOpError(
+            ["git", "fetch"],
+            128,
+            "fatal: unable to access 'https://x-token-auth:SECRETTOKEN@bitbucket.org/foo/bar.git/': The requested URL returned error: 401",
+        )
+        d = mcp_server._error_dict(e)
+        for field in ("message", "stderr"):
+            assert "SECRETTOKEN" not in d[field], (
+                f"git token leaked through {field}: {d[field]!r}"
+            )
+            assert "x-token-auth" not in d[field], (
+                f"git username leaked through {field}: {d[field]!r}"
+            )
+        assert "[redacted]" in d["stderr"]
 
     def test_signed_url_indicators_case_insensitive(self) -> None:
         """Round-3 finding: MinIO / R2 / Backblaze / mixed-case AWS
@@ -334,6 +374,39 @@ class TestErrorDict:
         d2 = mcp_server._error_dict(e2)
         assert "secret456" not in d2["url"]
         assert "secret456" not in d2["message"]
+
+    def test_redacts_azure_sas_url(self) -> None:
+        """Round-4 finding: Azure Blob SAS URLs use ?sv=...&sig=...&se=...
+        (no `signature=` suffix). The substring check must catch the
+        `sig=` short form."""
+        sas = "https://acct.blob.core.windows.net/c/blob?sv=2020&sig=ABCSECRET&se=2026"
+        e = bb_api.BBApiError(403, sas, "AuthorizationFailed")
+        d = mcp_server._error_dict(e)
+        for field in ("url", "message"):
+            assert "ABCSECRET" not in d[field]
+
+    def test_redacts_bearer_token_in_url(self) -> None:
+        """Bearer tokens in query string (`?access_token=...` /
+        `?api_key=...`) also redacted."""
+        for param in ("access_token", "api_key"):
+            e = bb_api.BBApiError(
+                401,
+                f"https://api.example.com/endpoint?{param}=SECRET_BEARER",
+                "Unauthorized",
+            )
+            d = mcp_server._error_dict(e)
+            assert "SECRET_BEARER" not in d["url"]
+            assert "SECRET_BEARER" not in d["message"]
+
+    def test_safe_text_redacts_ssh_url_in_free_text(self) -> None:
+        """Round-4 finding: _redact_message only matched http(s)://.
+        ssh:// URLs with embedded passphrases (and other schemes) must
+        also be caught. Validates the broadened _safe_text helper."""
+        # Construct an error message that embeds an ssh:// URL with auth.
+        text = "Could not read from remote repository ssh://x-token:SSHPASS@bb.org/foo.git: connection refused"
+        redacted = mcp_server._safe_text(text)
+        assert "SSHPASS" not in redacted
+        assert "x-token" not in redacted
 
     def test_bbopnotfound_kind(self) -> None:
         e = bb_ops.BBOpNotFound("pipeline #42 not found")
