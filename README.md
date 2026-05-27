@@ -1,26 +1,33 @@
 # bb - Bitbucket CLI
 
+<p align="center">
+  <img src="docs/img/social-preview.png" alt="bb — Bitbucket Cloud CLI" width="720" />
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/daniel-pittman/bitbucket-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/daniel-pittman/bitbucket-cli/actions/workflows/ci.yml)
 [![Bash](https://img.shields.io/badge/bash-4.0%2B-1f425f.svg)](https://www.gnu.org/software/bash/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![GitHub release](https://img.shields.io/github/v/release/daniel-pittman/bitbucket-cli)](https://github.com/daniel-pittman/bitbucket-cli/releases)
 
-A lightweight command-line interface for Bitbucket Cloud. Wraps the Bitbucket REST API for common operations like managing pipelines, pull requests, and repositories.
+A lightweight command-line interface for Bitbucket Cloud. Wraps the Bitbucket REST API for common operations like managing pipelines, pull requests, and repositories. Ships with a Python [MCP server](#mcp-server-for-claude-code--ai-agents) so any [Claude Code](https://docs.claude.com/en/docs/claude-code) session (or any other MCP-aware client) can drive Bitbucket Cloud as native tools.
 
-No dependencies beyond `curl` and `jq`. Works on macOS, Linux, and WSL.
+The bash CLI has no dependencies beyond `curl` and `jq`. The MCP server adds Python 3.10+. Works on macOS, Linux, and WSL.
 
 ## Features
 
 - **Pipelines**: List, view, watch, trigger, and stop pipeline builds
-- **Pull Requests**: Create, view, approve, merge, and manage PRs
-- **Repositories**: List repos, view details, browse branches
+- **Pull Requests**: Create, view, approve, unapprove, merge, decline, diff, comment
+- **Repositories**: List repos, view details, list/show branches, list recent commits
 - **Browser Integration**: Quick-open any resource in your browser
+- **MCP server**: 30 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
 
 ## Requirements
 
 - `bash` (4.0+)
 - `curl` - usually pre-installed on macOS/Linux
 - `jq` - JSON processor ([install instructions](https://jqlang.github.io/jq/download/))
+- Python 3.10+ (only required for the MCP server)
 
 ### Installing jq
 
@@ -188,6 +195,80 @@ bb logs my-repo 42 1
 # Open repo settings in browser
 bb open my-repo settings
 ```
+
+## MCP server (for Claude Code / AI agents)
+
+`bb` ships with a [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes 30 tools — pipelines, pull requests, repos, branches, commits, repo variables, and git-context helpers — so [Claude Code](https://docs.claude.com/en/docs/claude-code) (or any other MCP-aware client) can drive Bitbucket Cloud as native tools.
+
+The MCP server is a **parallel implementation** of the same Bitbucket REST contract as the bash CLI — it does not shell out to `bb`. It speaks HTTP directly via Python stdlib (no `requests` etc.).
+
+### Requirements
+
+- Python 3.10+ (only required for the MCP server; the bash CLI does not need Python)
+- The same `BB_USER` / `BB_TOKEN` / `BB_WORKSPACE` credentials as the CLI
+
+### Install
+
+The MCP server self-bootstraps a virtual environment on first run, so installation is just two steps: clone (or update) the repo, then point your MCP client at `mcp_server.py`. The first invocation creates `~/.local/share/bitbucket-cli/venv` (override with `XDG_DATA_HOME`) and installs the `mcp` package. Subsequent invocations reuse the venv — startup is fast.
+
+### Claude Code (`.mcp.json` or `claude mcp add`)
+
+Add the server to your Claude Code MCP config. The simplest form:
+
+```json
+{
+  "mcpServers": {
+    "bitbucket": {
+      "command": "python3",
+      "args": ["/absolute/path/to/bitbucket-cli/mcp_server.py"],
+      "env": {
+        "BB_USER": "your-email@example.com",
+        "BB_TOKEN": "your-api-token",
+        "BB_WORKSPACE": "your-workspace"
+      }
+    }
+  }
+}
+```
+
+Or via the CLI:
+
+```bash
+claude mcp add bitbucket \
+  --env BB_USER=your-email@example.com \
+  --env BB_TOKEN=your-api-token \
+  --env BB_WORKSPACE=your-workspace \
+  -- python3 /absolute/path/to/bitbucket-cli/mcp_server.py
+```
+
+### Other MCP clients
+
+`mcp_server.py` is a stdio MCP server, so any client that speaks MCP-over-stdio can use it. The `command` is `python3 /absolute/path/to/bitbucket-cli/mcp_server.py`; environment variables are the same three credentials above.
+
+### Tool surface (30 tools)
+
+| Area | Tools |
+|---|---|
+| Pipelines (read) | `pipelines_list`, `pipeline_show`, `pipeline_steps`, `pipeline_logs` |
+| Pipelines (write) | `pipeline_trigger`, `pipeline_stop` |
+| Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
+| Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
+| Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
+| Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
+| Meta | `whoami` (resolves config + connectivity smoke test; never echoes `BB_TOKEN`) |
+
+Every tool that takes a repo argument supports auto-detection (omit `repo` to resolve from the current git checkout's `origin` remote) and workspace override (`workspace/repo` shape).
+
+### Agent definition
+
+A generic agent definition that documents the tool surface, operating principles (resolve-git-context-first, show-diffs-before-destructive-ops, parity discipline), and worked examples lives at [`agents/bitbucket.md`](agents/bitbucket.md). Copy it into your Claude Code agent directory if you want a dedicated subagent for Bitbucket work.
+
+### Security
+
+- `BB_TOKEN` is never echoed (`whoami`, error envelopes, log lines).
+- URL credentials (`https://user:token@host/...`) and signed-URL query parameters (AWS / Azure / GCP / bearer / access_token / api_key) are stripped from every error message.
+- Cross-host `Authorization` headers are stripped on redirect so the Bitbucket Basic header never reaches S3 when fetching pipeline logs.
+- Pipeline variable values are masked as `KEY=***` when echoed back.
 
 ## License
 
