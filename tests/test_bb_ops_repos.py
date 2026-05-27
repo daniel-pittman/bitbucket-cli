@@ -149,6 +149,25 @@ class TestReposList:
             bb_ops.repos_list(_client(opener), workspace=bad_workspace)
         assert opener.calls == []
 
+    @pytest.mark.parametrize("bad_workspace", ["acme/widget", "a/b/c"])
+    def test_rejects_workspace_with_slash(self, bad_workspace: str) -> None:
+        """Without this, `workspace="acme/widget"` would silently build
+        a single-repo endpoint URL and paginate against a response that
+        lacks `values` — confusing failure. Symmetric with bb_api.repo_path."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="workspace.*'/'"):
+            bb_ops.repos_list(_client(opener), workspace=bad_workspace)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_workspace", [".", ".."])
+    def test_rejects_workspace_dot_segments(self, bad_workspace: str) -> None:
+        """Path-traversal defense — `/repositories/../widget` after URL
+        normalisation could resolve to the wrong workspace."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match=r"'\.'|'\.\.'"):
+            bb_ops.repos_list(_client(opener), workspace=bad_workspace)
+        assert opener.calls == []
+
     @pytest.mark.parametrize("bad_query", ["", "   "])
     def test_rejects_empty_query(self, bad_query: str) -> None:
         opener = _CaptureOpener([])
@@ -209,7 +228,10 @@ class TestBranchesList:
         bb_ops.branches_list(
             _client(opener), "acme", "widget-service", query='name ~ "feat"'
         )
-        assert "q=" in opener.calls[0]["url"]
+        # Exact-form assertion (symmetric with TestReposList.test_query_filter):
+        # a regression that silently mangled or dropped the BBQL string
+        # would otherwise pass a `"q=" in url` weak check.
+        assert "q=name+~+%22feat%22" in opener.calls[0]["url"]
 
     @pytest.mark.parametrize("bad", [0, -1, True, False])
     def test_rejects_non_positive_count(self, bad: Any) -> None:
@@ -217,6 +239,15 @@ class TestBranchesList:
         with pytest.raises(ValueError, match="count"):
             bb_ops.branches_list(
                 _client(opener), "acme", "widget-service", count=bad
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_query", ["", "   "])
+    def test_rejects_empty_query(self, bad_query: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="query"):
+            bb_ops.branches_list(
+                _client(opener), "acme", "widget-service", query=bad_query
             )
         assert opener.calls == []
 
@@ -392,3 +423,22 @@ class TestCommitsList:
                 _client(opener), "acme", "widget-service", count=bad
             )
         assert opener.calls == []
+
+    def test_count_walks_pages(self) -> None:
+        """commits_list has the most complex path shape (branch vs
+        no-branch); pin its pagination behaviour symmetrically with
+        the other list ops."""
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [{"hash": f"c{i:03}"} for i in range(100)],
+                    "next": _repo_url() + "/commits?page=2",
+                },
+                {"values": [{"hash": f"c{i:03}"} for i in range(100, 175)]},
+            ]
+        )
+        result = bb_ops.commits_list(
+            _client(opener), "acme", "widget-service", count=175
+        )
+        assert len(result) == 175
+        assert "pagelen=100" in opener.calls[0]["url"]

@@ -10,8 +10,10 @@ formatting, no colour codes, no parsing of bash output.
 Bitbucket REST contract. See CONTRIBUTING.md for the parity rule: when a
 defect surfaces in either side, the fix lands in both code paths.
 
-This PR (Phase 4.2) adds pipeline operations. Subsequent PRs add PRs,
-repos, branches, and git context.
+Current scope: pipelines, pull requests, repos/branches/vars/downloads/
+commits. The companion git_ops module provides the git-context wrappers
+the MCP server uses to resolve "current branch" / "remote workspace"
+before invoking these ops.
 """
 
 from __future__ import annotations
@@ -704,8 +706,20 @@ def repos_list(
     gap for the agent's filtered-list workflows.
     """
     ws = workspace if workspace is not None else client.config.workspace
+    # Symmetric with bb_api.repo_path: reject empty/whitespace AND
+    # embedded `/`, `.`, `..`. Without this, `workspace="acme/widget"`
+    # would silently build `/repositories/acme/widget` (a single-repo
+    # endpoint), then paginate against a response that lacks `values`
+    # — a confusing failure mode the boundary validator exists to
+    # prevent everywhere else in this file. repos_list is the only op
+    # that doesn't route through repo_path, so the check is duplicated
+    # here rather than central.
     if not isinstance(ws, str) or not ws.strip():
         raise ValueError(f"workspace must be a non-empty string, got {ws!r}")
+    if "/" in ws:
+        raise ValueError(f"workspace must not contain '/', got {ws!r}")
+    if ws in (".", ".."):
+        raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
 
@@ -786,11 +800,10 @@ def branch_show(
         raise ValueError(
             f"name must be a non-empty, non-whitespace string, got {name!r}"
         )
-    # `quote` with no `safe=` URL-encodes `/` to `%2F`. Branch names like
-    # `feat/widget` would otherwise be interpreted as a sub-resource path
-    # by Bitbucket and 404.
-    from urllib.parse import quote as _quote
-    encoded = _quote(name.strip(), safe="")
+    # `quote(s, safe="")` URL-encodes `/` to `%2F`. Branch names like
+    # `feat/widget` would otherwise be interpreted as a sub-resource
+    # path by Bitbucket and 404.
+    encoded = quote(name.strip(), safe="")
     return client.get(f"{repo_path(workspace, repo)}/refs/branches/{encoded}")
 
 
@@ -889,8 +902,7 @@ def commits_list(
     if branch is None:
         path = f"{repo_path(workspace, repo)}/commits"
     else:
-        from urllib.parse import quote as _quote
-        encoded = _quote(branch.strip(), safe="")
+        encoded = quote(branch.strip(), safe="")
         path = f"{repo_path(workspace, repo)}/commits/{encoded}"
 
     out: list[dict[str, Any]] = []
