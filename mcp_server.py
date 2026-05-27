@@ -1189,8 +1189,8 @@ def git_uncommitted_changes(path: str = "") -> dict[str, Any]:
 def whoami() -> dict[str, Any]:
     """Report the resolved Bitbucket user, workspace, API base, the
     auto-detected git context for the current working directory, and a
-    workspace-reachability probe that confirms the credential actually
-    works against the configured workspace.
+    workspace-reachability probe that confirms the credential reaches
+    the configured workspace.
 
     Does NOT echo the token.
 
@@ -1198,15 +1198,22 @@ def whoami() -> dict[str, Any]:
     (2) git context (best-effort — failures stored as structured
     sub-errors but don't flip ok=False, since the server is useful
     even outside a git repo); (3) workspace reachability via a single
-    low-cost `GET /repositories/{workspace}?pagelen=1` (best-effort —
-    failures recorded as `auth` payload but don't flip ok=False, since
-    config + git context are still useful with a stale token).
+    low-cost `GET /repositories/{workspace}?pagelen=1` with a 10 s
+    timeout (best-effort — failures recorded as `auth` payload but
+    don't flip ok=False, since config + git context are still useful
+    with a stale token).
 
     The reachability probe targets the workspace endpoint (not /user)
     because Atlassian's workspace-scoped tokens — the now-recommended
     shape — reject /user with 401/403 while serving the workspace
     endpoint correctly, so a /user probe would false-negative valid
-    tokens.
+    tokens. Note the converse trade-off: this endpoint requires
+    `repository:read` scope, so a workspace-scoped token granting only
+    `pipelines:read` or `pullrequest:read` will surface as
+    `auth.ok=False` even though pipeline / PR ops still work. No
+    single endpoint covers every scope; treat `auth.ok=False` as a
+    "this scope probably can't do repo listing" signal rather than as
+    a global credential verdict.
     """
     out: dict[str, Any] = {"ok": True}
 
@@ -1257,6 +1264,7 @@ def whoami() -> dict[str, Any]:
             client.get(
                 f"/repositories/{urllib.parse.quote(client.config.workspace, safe='')}",
                 query={"pagelen": "1"},
+                timeout=10.0,
             )
             out["auth"] = {"ok": True}
         except _TOOL_EXPECTED_EXCEPTIONS as e:

@@ -255,7 +255,7 @@ claude mcp add bitbucket \
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
 | Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
-| Meta | `whoami` (resolves config + connectivity smoke test; never echoes `BB_TOKEN`) |
+| Meta | `whoami` (resolves config + workspace-reachability probe with 10s timeout; never echoes `BB_TOKEN`. Probe requires `repository:read` scope — narrower workspace-scoped tokens may report `auth.ok=False` even though pipeline/PR tools still work) |
 
 Every tool that takes a repo argument supports auto-detection (omit `repo` to resolve from the current git checkout's `origin` remote) and workspace override (`workspace/repo` shape).
 
