@@ -115,15 +115,19 @@ repo_path() {
     # /repositories/../foo). Mirrors the bb_api.repo_path Python
     # validation — both surfaces enforce the same contract.
     #
-    # Whitespace check uses regex against [[:space:]] (matches tabs,
-    # newlines, CR, etc.) not just the literal space — true parity
-    # with Python's `.strip()`. The previous `${var// }` form only
-    # stripped ASCII space and would happily pass `BB_WORKSPACE=$'\t'`.
-    if [[ -z "$BB_WORKSPACE" || "$BB_WORKSPACE" =~ ^[[:space:]]+$ ]]; then
+    # Whitespace check: reject if the value EQUALS its whitespace-
+    # stripped form's emptiness. Catches all-whitespace AND mixed-
+    # whitespace (e.g. ` acme ` which the previous `^[[:space:]]+$`
+    # regex let through). `tr -d '[:space:]'` is true parity with
+    # Python's `.strip()`.
+    local _ws_stripped _repo_stripped
+    _ws_stripped="$(printf '%s' "$BB_WORKSPACE" | tr -d '[:space:]')"
+    _repo_stripped="$(printf '%s' "$repo" | tr -d '[:space:]')"
+    if [[ -z "$_ws_stripped" || "$_ws_stripped" != "$BB_WORKSPACE" ]]; then
         echo "Error: BB_WORKSPACE must be a non-empty, non-whitespace string." >&2
         kill -TERM $$
     fi
-    if [[ -z "$repo" || "$repo" =~ ^[[:space:]]+$ ]]; then
+    if [[ -z "$_repo_stripped" || "$_repo_stripped" != "$repo" ]]; then
         echo "Error: repo must be a non-empty, non-whitespace string." >&2
         kill -TERM $$
     fi
@@ -144,6 +148,20 @@ repo_path() {
     # empty path. `kill -TERM $$` terminates the parent script so
     # the validation actually halts execution.
     echo "/repositories/${BB_WORKSPACE}/${repo}"
+}
+
+# Validate a build_number argument is a positive integer before
+# splicing into a jq filter or URL. jq treats unquoted non-numeric
+# identifiers as undefined-function references (e.g. `select(.x == abc)`
+# becomes `abc/0 is not defined`), aborting under `set -e` with no
+# curated error. A crafted value like `1) | $ENV.BB_TOKEN, .uuid` can
+# also exfil environment via the jq filter's $ENV — validate the shape
+# at the boundary so neither failure mode can fire.
+_require_build_number() {
+    if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+        echo "Error: build_number must be a positive integer (got ${1!r:-empty})." >&2
+        exit 1
+    fi
 }
 
 # --- Formatting helpers ---
@@ -235,6 +253,7 @@ cmd_pipeline() {
         echo "Usage: bb pipeline [repo] <build-number>" >&2
         exit 1
     fi
+    _require_build_number "$build_number"
 
     # Parity fix: bumped pagelen 50→100 (Bitbucket's max). Older
     # pipelines still unfindable beyond 100; full pagination is
@@ -290,6 +309,7 @@ cmd_watch() {
         build_number=$(echo "$latest" | jq -r '.values[0].build_number')
         echo "Watching most recent pipeline: #${build_number}"
     fi
+    _require_build_number "$build_number"
 
     echo "Watching pipeline #${build_number} on ${BB_WORKSPACE}/${repo} (every ${poll_interval}s)..."
     echo ""
@@ -345,6 +365,7 @@ cmd_logs() {
         echo "Usage: bb logs [repo] <build-number> [step-index]" >&2
         exit 1
     fi
+    _require_build_number "$build_number"
 
     # Parity fix: bumped pagelen 50→100 (Bitbucket's max). Symmetric
     # with cmd_pipeline_stop / cmd_pipeline.
@@ -414,17 +435,17 @@ cmd_pipeline_trigger() {
 
     # Remaining args are VAR=VALUE pairs. Build the array via `jq`
     # so values containing `"`, `\`, newlines, or tabs are correctly
-    # JSON-escaped. The previous string-concatenation approach
-    # produced invalid JSON on any of those characters, then the
-    # downstream `jq -n --argjson vars` would abort with a parse
-    # error after `Triggering pipeline...` had already been printed.
+    # JSON-escaped. NUL delimiter (not newline) so values containing
+    # newlines aren't fragmented into ghost vars — the previous
+    # newline-split approach would turn VAR=$'line1\nline2' into a
+    # real {VAR:line1} entry plus a ghost {line2:""} entry. jq's
+    # split(" ") on a NUL-delimited stream sidesteps that.
     local variables="[]"
     if [[ $# -gt 0 ]]; then
         # Per-pair shape: split on the FIRST `=` only so values
-        # containing `=` survive intact. jq -Rs reads the whole
-        # input as one string, splits on newlines, then on `=`.
-        variables=$(printf '%s\n' "$@" | jq -Rs '
-            split("\n")
+        # containing `=` survive intact.
+        variables=$(printf '%s\0' "$@" | jq -Rs '
+            split(" ")
             | map(select(length > 0))
             | map(
                 split("=") | {
@@ -481,11 +502,27 @@ cmd_pipeline_trigger() {
         echo "  Custom pipeline: ${pattern}"
     fi
     if [[ "$variables" != "[]" ]]; then
-        echo "  Variables: $*"
+        # Echo variable KEYS only — values may be secrets (API tokens,
+        # deploy creds) that the user passed as VAR=value. The previous
+        # `Variables: $*` form leaked the full value into stdout /
+        # terminal scrollback / CI logs / shell history.
+        local masked
+        masked=$(printf '%s\n' "$@" | sed -E 's/=.*$/=***/' | tr '\n' ' ')
+        echo "  Variables: ${masked%% }"
     fi
 
+    # rc-capture pattern: capture the exit code so a 4xx (protected
+    # branch, custom pipeline name not found, invalid variable shape)
+    # surfaces as a labelled error instead of `set -e` silently
+    # aborting after the "Triggering pipeline..." banner.
     local response
-    response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload")
+    if ! response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload"); then
+        local rc=$?
+        echo "Trigger request failed for ${BB_WORKSPACE}/${repo} branch ${branch} (exit $rc)." >&2
+        echo "  Common causes: protected branch, custom pipeline name not" >&2
+        echo "  found, or invalid variable shape." >&2
+        exit $rc
+    fi
 
     local build_num
     build_num=$(echo "$response" | jq -r '.build_number')
@@ -503,6 +540,7 @@ cmd_pipeline_stop() {
         echo "Usage: bb pipeline-stop [repo] <build-number>" >&2
         exit 1
     fi
+    _require_build_number "$build_number"
 
     # Parity fix: previously scanned only 50 most-recent pipelines, so
     # older builds were unfindable. Bumped to 100 (Bitbucket's max
@@ -708,8 +746,20 @@ cmd_pr_create() {
     fi
 
     echo "Creating PR: ${source_branch} -> ${dest}"
+
+    # rc-capture pattern: a 400 (typo in dest branch, duplicate PR
+    # already open, source branch not pushed, etc.) makes bb_post
+    # exit non-zero and `set -e` would silently abort after the
+    # "Creating PR:" banner. Without a labelled error, a user
+    # retrying assuming a network blip might create a duplicate.
     local response
-    response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload")
+    if ! response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload"); then
+        local rc=$?
+        echo "PR-create request failed (exit $rc)." >&2
+        echo "  Common causes: dest branch typo, a PR with this source" >&2
+        echo "  branch is already open, source branch not pushed." >&2
+        exit $rc
+    fi
 
     local pr_id pr_url
     pr_id=$(echo "$response" | jq -r '.id')
@@ -1141,11 +1191,18 @@ cmd_whoami() {
     # Strip `user:token@` from origin URL before echoing. Matches the
     # `_redact_url` helper in mcp_server.py / git_ops.py: anything of
     # the form `://user:token@host/path` becomes `://[redacted]@host/path`.
-    cwd_remote=$(
-        git remote get-url origin 2>/dev/null \
-            | sed -E 's#://[^/@]+@#://[redacted]@#' \
-            || echo "(no origin remote)"
-    )
+    #
+    # Use an `if` block (not `git ... | sed ... || echo`) because in a
+    # pipeline the `||` attaches to sed, which always exits 0 on
+    # empty input — so the fallback would never fire when git itself
+    # failed (no origin remote / not in a git repo). The if-form
+    # branches on git's exit status, not sed's.
+    local _git_remote_raw
+    if _git_remote_raw=$(git remote get-url origin 2>/dev/null); then
+        cwd_remote=$(printf '%s' "$_git_remote_raw" | sed -E 's#://[^/@]+@#://[redacted]@#')
+    else
+        cwd_remote="(no origin remote)"
+    fi
     echo "  Cwd:       $(pwd)"
     echo "  Branch:    ${cwd_branch}"
     echo "  Origin:    ${cwd_remote}"
