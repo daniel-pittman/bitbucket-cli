@@ -1212,13 +1212,20 @@ cmd_whoami() {
     # now recommends, reject /user with 401/403 while serving
     # /repositories/{workspace} correctly). False-negative on /user
     # would tell a user with a valid token to rotate it.
+    #
+    # Converse caveat: /repositories/{workspace} requires
+    # `repository:read` scope. A workspace-scoped token granting only
+    # `pipelines:read` or `pullrequest:read` will fail this probe even
+    # though `bb pipelines` / `bb prs` still work. Treat this as a
+    # scope hint, not a global credential verdict.
     echo ""
     echo "Auth check:"
     if bb_get "/repositories/${BB_WORKSPACE}?pagelen=1" > /dev/null 2>&1; then
         echo "  Workspace reachable — auth OK."
     else
         echo "  Workspace NOT reachable — token may be invalid, expired,"
-        echo "  or scoped to a different workspace."
+        echo "  scoped to a different workspace, or missing repository:read"
+        echo "  (pipeline/PR-only scoped tokens still work for those commands)."
         echo "  Rotate at https://id.atlassian.com/manage-profile/security/api-tokens"
     fi
 }
