@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/daniel-pittman/bitbucket-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/daniel-pittman/bitbucket-cli/actions/workflows/ci.yml)
-[![Bash](https://img.shields.io/badge/bash-4.0%2B-1f425f.svg)](https://www.gnu.org/software/bash/)
+[![Bash](https://img.shields.io/badge/bash-3.2%2B-1f425f.svg)](https://www.gnu.org/software/bash/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![GitHub release](https://img.shields.io/github/v/release/daniel-pittman/bitbucket-cli)](https://github.com/daniel-pittman/bitbucket-cli/releases)
 
@@ -24,7 +24,7 @@ The bash CLI has no dependencies beyond `curl` and `jq`. The MCP server adds Pyt
 
 ## Requirements
 
-- `bash` (4.0+)
+- `bash` (3.2+) — works with macOS system bash; bash 4+ also fine
 - `curl` - usually pre-installed on macOS/Linux
 - `jq` - JSON processor ([install instructions](https://jqlang.github.io/jq/download/))
 - Python 3.10+ (only required for the MCP server)
@@ -64,9 +64,13 @@ choco install jq
    chmod +x bb
    ```
 
-3. Symlink to your PATH:
+3. Symlink to your PATH. Pick the directory that's on your PATH and that you own:
    ```bash
-   ln -s "$(pwd)/bb" /usr/local/bin/bb
+   # macOS with Homebrew (no sudo needed):
+   ln -s "$(pwd)/bb" /opt/homebrew/bin/bb
+
+   # macOS without Homebrew, or Linux (needs sudo on most setups):
+   sudo ln -s "$(pwd)/bb" /usr/local/bin/bb
    ```
 
    Or add the directory to your PATH:

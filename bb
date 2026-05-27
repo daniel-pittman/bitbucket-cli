@@ -608,7 +608,12 @@ cmd_pr_list() {
     count=$(echo "$response" | jq '.size')
 
     if [[ "$count" == "0" ]]; then
-        echo "  No ${state,,} pull requests."
+        # Use `tr` instead of `${state,,}` for bash 3.x compatibility.
+        # macOS ships bash 3.2 at /bin/bash and `#!/usr/bin/env bash`
+        # finds it before Homebrew bash on the default PATH, so the
+        # lowercase-substitution syntax would fail this branch only
+        # (when count==0) — and only on macOS where it bites hardest.
+        echo "  No $(echo "$state" | tr '[:upper:]' '[:lower:]') pull requests."
         return
     fi
 
