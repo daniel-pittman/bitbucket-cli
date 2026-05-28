@@ -370,6 +370,38 @@ def _validate_pr_id(pr_id: int) -> None:
         raise ValueError(f"pr_id must be a positive int, got {pr_id!r}")
 
 
+# Fields stripped from each PR object in the LIST view (prs_list) by
+# default. Bitbucket PR objects carry the full rendered description +
+# summary (raw / html / markup variants) and the participants array,
+# which together push even a 3-PR list past the MCP 25k-token response
+# cap on repos with rich PR bodies (observed: johnny-server, 3 open PRs
+# = ~70 KB). The list/triage workflow (prs_list -> pick one -> pr_show)
+# only needs identity + state + branches + author + links; the full
+# body is one pr_show away. pr_show is intentionally NOT slimmed — it's
+# the drill-down where you WANT the whole object.
+_PR_LIST_BULKY_FIELDS = ("description", "summary", "rendered", "participants")
+
+
+def _slim_pr_list_item(pr: dict[str, Any]) -> dict[str, Any]:
+    """Drop the bulky fields from one PR list object. Shallow copy so
+    the caller's source dict is untouched. `reviewers`, when present,
+    is projected down to uuid + display_name per reviewer (the full
+    account blobs are the other big contributor) while preserving the
+    count and identities a triage view needs."""
+    slim = {k: v for k, v in pr.items() if k not in _PR_LIST_BULKY_FIELDS}
+    reviewers = pr.get("reviewers")
+    if isinstance(reviewers, list):
+        slim["reviewers"] = [
+            {
+                "uuid": r.get("uuid"),
+                "display_name": r.get("display_name"),
+            }
+            for r in reviewers
+            if isinstance(r, dict)
+        ]
+    return slim
+
+
 def prs_list(
     client: BBClient,
     workspace: str,
@@ -377,9 +409,16 @@ def prs_list(
     *,
     state: str = "OPEN",
     count: int = 25,
+    verbose: bool = False,
 ) -> list[dict[str, Any]]:
     """List pull requests filtered by state. Defaults match bash:
-    state=OPEN, count=25. Walks pages as needed to honour `count`."""
+    state=OPEN, count=25. Walks pages as needed to honour `count`.
+
+    By default each PR is slimmed (see _slim_pr_list_item) so the list
+    fits the MCP response cap on rich-PR repos. Pass verbose=True to get
+    the full Bitbucket PR objects (description, summary, rendered,
+    participants intact) — useful when a caller genuinely needs the
+    bodies and isn't going through the MCP transport."""
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
     if not isinstance(state, str) or not state:
@@ -399,7 +438,7 @@ def prs_list(
 
     out: list[dict[str, Any]] = []
     for pr in client.paginate(_prs_root(workspace, repo), query=query):
-        out.append(pr)
+        out.append(pr if verbose else _slim_pr_list_item(pr))
         if len(out) >= count:
             break
     return out

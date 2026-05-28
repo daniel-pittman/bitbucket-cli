@@ -178,6 +178,116 @@ class TestPrsList:
         assert opener.calls == []
 
 
+def _make_rich_pr(id_: int) -> dict[str, Any]:
+    """A PR object carrying the bulky fields Bitbucket actually returns
+    (rendered HTML description + summary variants + participant array +
+    full reviewer account blobs) — the payload shape that pushes the
+    MCP response past the 25k-token cap on real repos."""
+    pr = _make_pr(id_)
+    pr["description"] = "x" * 5000  # raw markdown body
+    pr["summary"] = {
+        "raw": "y" * 3000,
+        "markup": "markdown",
+        "html": "<p>" + ("z" * 3000) + "</p>",
+    }
+    pr["rendered"] = {"title": {"html": "..."}, "description": {"html": "w" * 4000}}
+    pr["participants"] = [
+        {"user": {"display_name": f"User {n}", "uuid": f"{{u{n}}}"}, "role": "PARTICIPANT"}
+        for n in range(20)
+    ]
+    pr["reviewers"] = [
+        {
+            "display_name": f"Reviewer {n}",
+            "uuid": f"{{r{n}}}",
+            "account_id": f"acct-{n}",
+            "nickname": f"rev{n}",
+            "type": "user",
+            "links": {"avatar": {"href": "https://example.com/a.png"}},
+        }
+        for n in range(3)
+    ]
+    return pr
+
+
+class TestPrsListSlimProjection:
+    """#27 — prs_list slims each PR by default so the list view fits the
+    MCP 25k-token response cap on rich-PR repos. pr_show stays full."""
+
+    def test_default_strips_bulky_fields(self) -> None:
+        opener = _CaptureOpener([{"values": [_make_rich_pr(1)]}])
+        result = bb_ops.prs_list(_client(opener), "acme", "widget-service")
+        pr = result[0]
+        # Bulky fields gone by default.
+        for field in ("description", "summary", "rendered", "participants"):
+            assert field not in pr, f"{field} should be stripped in slim mode"
+        # Identity / triage fields preserved.
+        assert pr["id"] == 1
+        assert pr["title"] == "PR 1"
+        assert pr["state"] == "OPEN"
+        assert pr["source"]["branch"]["name"] == "feat/widget"
+        assert pr["links"]["html"]["href"].endswith("/pull-requests/1")
+
+    def test_reviewers_projected_to_uuid_and_name(self) -> None:
+        opener = _CaptureOpener([{"values": [_make_rich_pr(1)]}])
+        result = bb_ops.prs_list(_client(opener), "acme", "widget-service")
+        reviewers = result[0]["reviewers"]
+        assert len(reviewers) == 3
+        # Only uuid + display_name survive — the account_id / nickname /
+        # links blobs (the bulk) are dropped.
+        for r in reviewers:
+            assert set(r.keys()) == {"uuid", "display_name"}
+        assert reviewers[0]["display_name"] == "Reviewer 0"
+        assert reviewers[0]["uuid"] == "{r0}"
+
+    def test_verbose_preserves_full_objects(self) -> None:
+        opener = _CaptureOpener([{"values": [_make_rich_pr(1)]}])
+        result = bb_ops.prs_list(
+            _client(opener), "acme", "widget-service", verbose=True
+        )
+        pr = result[0]
+        # Everything intact in verbose mode.
+        assert len(pr["description"]) == 5000
+        assert "html" in pr["summary"]
+        assert "rendered" in pr
+        assert len(pr["participants"]) == 20
+        # Reviewers keep their full account blobs (not projected).
+        assert "account_id" in pr["reviewers"][0]
+
+    def test_slim_meaningfully_smaller(self) -> None:
+        """Concrete size guard: the slim projection must cut the
+        serialized payload by an order of magnitude on a rich PR, or the
+        25k-cap fix isn't actually buying anything."""
+        import json
+        opener = _CaptureOpener(
+            [{"values": [_make_rich_pr(i) for i in range(1, 4)]}]
+        )
+        slim = bb_ops.prs_list(_client(opener), "acme", "widget-service")
+        opener2 = _CaptureOpener(
+            [{"values": [_make_rich_pr(i) for i in range(1, 4)]}]
+        )
+        full = bb_ops.prs_list(
+            _client(opener2), "acme", "widget-service", verbose=True
+        )
+        slim_bytes = len(json.dumps(slim))
+        full_bytes = len(json.dumps(full))
+        # 3 rich PRs full = tens of KB; slim should be a small fraction.
+        assert slim_bytes * 5 < full_bytes, (
+            f"slim ({slim_bytes}B) not meaningfully smaller than full "
+            f"({full_bytes}B)"
+        )
+
+    def test_source_dict_not_mutated(self) -> None:
+        """Slimming must not mutate the original API response dict —
+        a verbose caller iterating the same objects later must still
+        see the full fields."""
+        original = _make_rich_pr(1)
+        opener = _CaptureOpener([{"values": [original]}])
+        bb_ops.prs_list(_client(opener), "acme", "widget-service")
+        # The fixture dict the opener returned still has its bulky fields.
+        assert "description" in original
+        assert "participants" in original
+
+
 # ===========================================================================
 # pr_show + pr_activity
 # ===========================================================================
