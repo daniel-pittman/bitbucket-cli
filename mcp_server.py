@@ -1263,6 +1263,15 @@ def whoami() -> dict[str, Any]:
     don't flip ok=False, since config + git context are still useful
     with a stale token).
 
+    The probed workspace is the configured BB_WORKSPACE, or — since
+    BB_WORKSPACE is optional as of v1.2.0 — the git-detected workspace
+    from Phase 2 as a fallback. If neither resolves, the probe is
+    SKIPPED (`auth.ok = None`, with a `skipped` reason) rather than
+    probing an empty workspace, which would hit the global
+    `/repositories/` endpoint and falsely report `auth.ok = True`.
+    `auth` carries the `workspace` it actually probed. This mirrors the
+    bash cmd_whoami behavior exactly.
+
     The reachability probe targets the workspace endpoint (not /user)
     because Atlassian's workspace-scoped tokens — the now-recommended
     shape — reject /user with 401/403 while serving the workspace
@@ -1316,19 +1325,36 @@ def whoami() -> dict[str, Any]:
         except _TOOL_EXPECTED_EXCEPTIONS as e:
             out["git_remote_error"] = _error_dict(e)
 
-    # Phase 3: workspace reachability. Skip if Phase 1 failed (no
-    # client to probe with). Single cheap GET; success means the
-    # credential is valid for the configured workspace right now.
+    # Phase 3: workspace reachability. Skip if Phase 1 failed (no client
+    # to probe with). Single cheap GET; success means the credential is
+    # valid for the probed workspace right now.
+    #
+    # BB_WORKSPACE is optional as of v1.2.0, so config.workspace can be
+    # "". Probing an empty workspace would build `GET /repositories/`,
+    # which hits the GLOBAL public-repositories endpoint and returns 200
+    # — a false-positive "auth OK" that verified nothing. Mirror the bash
+    # cmd_whoami: pick the configured workspace, else the git-detected one
+    # (already resolved in Phase 2 as out["git_workspace"]), and skip the
+    # probe with an explicit ok=None when neither resolves rather than
+    # probing a bad URL.
     if client is not None:
-        try:
-            client.get(
-                f"/repositories/{urllib.parse.quote(client.config.workspace, safe='')}",
-                query={"pagelen": "1"},
-                timeout=10.0,
-            )
-            out["auth"] = {"ok": True}
-        except _TOOL_EXPECTED_EXCEPTIONS as e:
-            out["auth"] = {"ok": False, **_error_dict(e)}
+        probe_ws = client.config.workspace or out.get("git_workspace", "")
+        if not probe_ws:
+            out["auth"] = {
+                "ok": None,
+                "skipped": "no workspace to probe — set BB_WORKSPACE or run "
+                "inside a Bitbucket git checkout. Config + token loaded OK.",
+            }
+        else:
+            try:
+                client.get(
+                    f"/repositories/{urllib.parse.quote(probe_ws, safe='')}",
+                    query={"pagelen": "1"},
+                    timeout=10.0,
+                )
+                out["auth"] = {"ok": True, "workspace": probe_ws}
+            except _TOOL_EXPECTED_EXCEPTIONS as e:
+                out["auth"] = {"ok": False, "workspace": probe_ws, **_error_dict(e)}
 
     return out
 
