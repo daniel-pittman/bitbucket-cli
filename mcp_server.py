@@ -375,6 +375,16 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
             f"repo must not be '.' or '..'; got {repo!r}"
         )
     client = _get_client()
+    # BB_WORKSPACE is optional (v1.2.0). A bare slug has no workspace of
+    # its own, so it can only resolve against the configured default. If
+    # that's absent, fail with an actionable error rather than building a
+    # "/repositories//slug" URL — name the two ways to supply one.
+    if not client.config.workspace:
+        raise ValueError(
+            f"no workspace for bare slug {repo!r}: set BB_WORKSPACE, or pass "
+            f"'workspace/{repo}'. (Inside a git checkout, omit the repo arg "
+            "entirely to auto-detect both from the origin remote.)"
+        )
     return client, client.config.workspace, repo
 
 
