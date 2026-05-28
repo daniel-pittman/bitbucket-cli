@@ -720,20 +720,32 @@ def pipeline_logs(
 
 
 @mcp.tool()
-def prs_list(repo: str = "", state: str = "OPEN", count: int = 25) -> dict[str, Any]:
+def prs_list(
+    repo: str = "", state: str = "OPEN", count: int = 25, verbose: bool = False
+) -> dict[str, Any]:
     """List pull requests filtered by state.
+
+    By default each PR is slimmed (drops the bulky description / summary
+    / rendered / participants fields) so the response fits the MCP
+    25k-token cap even on repos with rich PR bodies — the list/triage
+    workflow only needs identity + state + branches + author + links,
+    and the full body is one `pr_show` call away. Set verbose=True only
+    if you specifically need the full PR objects in the list (rarely).
 
     Args:
         repo: Repo slug, "workspace/slug", or "" to auto-detect.
         state: OPEN, MERGED, DECLINED, or SUPERSEDED.
         count: Maximum number of PRs to return.
+        verbose: If True, return full (unslimmed) PR objects.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
-        prs = bb_ops.prs_list(client, workspace, repo_slug, state=state, count=count)
+        prs = bb_ops.prs_list(
+            client, workspace, repo_slug, state=state, count=count, verbose=verbose
+        )
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "prs": prs}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict(e)
+        return _error_dict_with(e, state=state)
 
 
 @mcp.tool()
