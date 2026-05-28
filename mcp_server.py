@@ -979,9 +979,11 @@ def workspaces_list(count: int = 100) -> dict[str, Any]:
 
     Requires the `read:workspace:bitbucket` scope on the API token. A
     token granted only repository/pullrequest/pipeline scopes returns
-    `auth.ok=False` with `status=403` and Bitbucket's "credentials
-    lack one or more required privilege scopes" message surfaced
-    verbatim — exactly which scope to add is in the error body.
+    the standard error envelope `{"ok": False, "kind": "BBApiError",
+    "status": 403, "body": ...}` (flat `ok`, NOT the `auth.ok` shape
+    that's specific to the `whoami` tool). Bitbucket's "credentials
+    lack one or more required privilege scopes" message is in `body` —
+    exactly which scope to add is recoverable from there.
 
     Each workspace entry is a `workspace_access` envelope:
     `{administrator: bool, workspace: {slug, uuid, links, ...}}`.
