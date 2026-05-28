@@ -515,13 +515,17 @@ cmd_pipeline_trigger() {
     # branch, custom pipeline name not found, invalid variable shape)
     # surfaces as a labelled error instead of `set -e` silently
     # aborting after the "Triggering pipeline..." banner.
-    local response
-    if ! response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload"); then
-        local rc=$?
+    # Capture rc via `|| rc=$?`, not `if ! cmd; then rc=$?` — the
+    # latter sets $? to the negation (always 0), so the real exit code
+    # was being lost and `exit $rc` exited 0 on failure. Verified on
+    # bash 3.2 and 5.x.
+    local response rc=0
+    response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
         echo "Trigger request failed for ${BB_WORKSPACE}/${repo} branch ${branch} (exit $rc)." >&2
         echo "  Common causes: protected branch, custom pipeline name not" >&2
         echo "  found, or invalid variable shape." >&2
-        exit $rc
+        exit "$rc"
     fi
 
     local build_num
@@ -761,13 +765,17 @@ cmd_pr_create() {
     # exit non-zero and `set -e` would silently abort after the
     # "Creating PR:" banner. Without a labelled error, a user
     # retrying assuming a network blip might create a duplicate.
-    local response
-    if ! response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload"); then
-        local rc=$?
+    # Capture rc via `|| rc=$?`, not `if ! cmd; then rc=$?` — the
+    # latter sets $? to the negation (always 0), so the real exit code
+    # was being lost and `exit $rc` exited 0 on failure. Verified on
+    # bash 3.2 and 5.x.
+    local response rc=0
+    response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
         echo "PR-create request failed (exit $rc)." >&2
         echo "  Common causes: dest branch typo, a PR with this source" >&2
         echo "  branch is already open, source branch not pushed." >&2
-        exit $rc
+        exit "$rc"
     fi
 
     local pr_id pr_url
@@ -1088,14 +1096,16 @@ cmd_workspaces() {
     echo "Workspaces accessible to ${BB_USER}:"
     echo ""
 
-    local response
-    if ! response=$(bb_get "/user/workspaces?pagelen=100"); then
-        local rc=$?
+    # Capture rc via `|| rc=$?` rather than `if ! cmd; then rc=$?`.
+    # The `!`-negation form sets $? to the LOGICAL NEGATION of the
+    # command's status (always 0 for a failing command), so the real
+    # curl exit code is unrecoverable inside an `if !` block — verified
+    # on bash 3.2 and 5.x. curl -f exits 22 on an HTTP >=400 response;
+    # other codes are transport-level (DNS, connection, TLS).
+    local response rc=0
+    response=$(bb_get "/user/workspaces?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
         echo "Workspace listing failed (exit $rc)." >&2
-        # curl -f exits 22 specifically on an HTTP >=400 response; other
-        # exit codes mean transport-level failures (DNS, connection, TLS)
-        # where the scope hint would be misleading. Only name the scope
-        # when the failure is actually an HTTP error.
         if [[ "$rc" -eq 22 ]]; then
             echo "If this is a 403, the token lacks the read:workspace:bitbucket" >&2
             echo "scope. Rotate it at" >&2
@@ -1105,7 +1115,7 @@ cmd_workspaces() {
             echo "This looks like a connectivity error (not an HTTP response)." >&2
             echo "Check your network and that api.bitbucket.org is reachable." >&2
         fi
-        exit $rc
+        exit "$rc"
     fi
 
     printf "  %-30s %s\n" "SLUG" "ROLE"
