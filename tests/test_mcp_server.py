@@ -98,6 +98,8 @@ EXPECTED_TOOLS = {
     "pr_diff",
     "pr_comments_list",
     "pr_comment_add",
+    # Workspaces
+    "workspaces_list",
     # Repos / branches / metadata
     "repos_list",
     "repo_show",
@@ -130,9 +132,9 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 30 = 6 pipelines
-    + 11 PRs + 7 repos/metadata + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 30
+    regression that drops a registration is visible. 31 = 6 pipelines
+    + 11 PRs + 1 workspaces + 7 repos/metadata + 5 git context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 31
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +173,28 @@ class TestResolveRepo:
         client, ws, slug = mcp_server._resolve_repo("other/cool-repo")
         assert ws == "other"
         assert slug == "cool-repo"
+
+    def test_bare_slug_with_empty_workspace_errors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v1.2.0: BB_WORKSPACE is optional, so a bare slug can have no
+        configured workspace to resolve against. That must raise a clear
+        ValueError naming the fixes (set BB_WORKSPACE / use ws/slug /
+        omit for auto-detect) rather than building a '/repositories//slug'
+        URL. The 'ws/slug' and auto-detect paths still work without a
+        configured workspace — only the bare-slug path needs one."""
+        mcp_server._reset_client_cache()
+        cfg = bb_api.BBConfig(
+            user="alice@example.com", token="tok-xyz",
+            workspace="",  # optional + absent
+            api_base=bb_api.DEFAULT_API_BASE,
+        )
+        monkeypatch.setattr(mcp_server, "_client_cache", bb_api.BBClient(cfg))
+        with pytest.raises(ValueError, match="no workspace for bare slug"):
+            mcp_server._resolve_repo("my-repo")
+        # But ws/slug still resolves fine with an empty config workspace.
+        _client, ws, slug = mcp_server._resolve_repo("acme/my-repo")
+        assert (ws, slug) == ("acme", "my-repo")
 
     @pytest.mark.parametrize(
         "bad",
@@ -849,7 +873,7 @@ class TestWhoami:
         assert out["git_branch"] == "feat/test"
         assert out["git_workspace"] == "acme"
         assert out["git_repo"] == "widget-service"
-        assert out["auth"] == {"ok": True}
+        assert out["auth"] == {"ok": True, "workspace": "acme"}
         # Reachability probe hit the right endpoint with the cheap pagelen.
         assert calls == [("/repositories/acme", {"pagelen": "1"})]
         # Token must NEVER be echoed.
@@ -903,8 +927,72 @@ class TestWhoami:
         assert "git_branch_error" not in out
         assert "git_remote_error" not in out
         assert "cwd" not in out
-        # Phase 3 still runs — auth is independent of cwd.
-        assert out["auth"] == {"ok": True}
+        # Phase 3 still runs — auth is independent of cwd. probe_ws comes
+        # from the configured workspace ("acme") since git_workspace was
+        # never set (cwd_error skipped Phase 2's git probes).
+        assert out["auth"] == {"ok": True, "workspace": "acme"}
+
+    def test_auth_probe_skipped_when_no_workspace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """v1.2.0: BB_WORKSPACE is optional, so config.workspace can be ""
+        AND git auto-detect can fail to yield one. The probe must be
+        SKIPPED (auth.ok=None) — not run against an empty workspace,
+        which would build `GET /repositories/` (the global public-repos
+        endpoint) and return a false-positive auth.ok=True. Mirrors the
+        bash cmd_whoami skip behavior."""
+        mcp_server._reset_client_cache()
+        cfg = bb_api.BBConfig(
+            user="alice@example.com", token="tok-xyz",
+            workspace="",  # optional + absent
+            api_base=bb_api.DEFAULT_API_BASE,
+        )
+        client = bb_api.BBClient(cfg)
+        monkeypatch.setattr(mcp_server, "_client_cache", client)
+        # No git context either (so git_workspace stays unset).
+        def raise_git(*_a: Any, **_k: Any) -> Any:
+            raise git_ops.GitOpError(["git"], 128, "not a git repo")
+        monkeypatch.setattr(git_ops, "git_current_branch", raise_git)
+        monkeypatch.setattr(git_ops, "git_remote_repo", raise_git)
+        # Tripwire: the HTTP probe must NOT fire when there's no workspace.
+        def boom_get(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("auth probe ran against an empty workspace")
+        client.get = boom_get  # type: ignore[method-assign]
+        out = mcp_server.whoami()
+        assert out["ok"] is True
+        assert out["auth"]["ok"] is None
+        assert "skipped" in out["auth"]
+        assert "tok-xyz" not in str(out)
+
+    def test_auth_probe_falls_back_to_git_workspace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When BB_WORKSPACE is empty but we're in a git checkout, the
+        probe targets the git-detected workspace (not skipped). Mirrors
+        bash cmd_whoami's probe_ws fallback."""
+        mcp_server._reset_client_cache()
+        cfg = bb_api.BBConfig(
+            user="alice@example.com", token="tok-xyz",
+            workspace="", api_base=bb_api.DEFAULT_API_BASE,
+        )
+        client = bb_api.BBClient(cfg)
+        monkeypatch.setattr(mcp_server, "_client_cache", client)
+        monkeypatch.setattr(git_ops, "git_current_branch", lambda path=None: "main")
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo",
+            lambda path=None: ("git-detected-ws", "widget-service"),
+        )
+        calls: list[tuple[str, dict]] = []
+        def fake_get(path: str, *, query=None, timeout=None):
+            calls.append((path, dict(query or {})))
+            return {"slug": "widget-service"}
+        client.get = fake_get  # type: ignore[method-assign]
+        out = mcp_server.whoami()
+        assert out["auth"] == {"ok": True, "workspace": "git-detected-ws"}
+        # Probe used the git workspace, not an empty string.
+        assert calls == [("/repositories/git-detected-ws", {"pagelen": "1"})]
 
     def test_config_error_flips_ok_false(
         self, monkeypatch: pytest.MonkeyPatch

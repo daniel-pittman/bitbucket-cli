@@ -11,7 +11,9 @@ All fixture data is fictional (acme / widget-service / alice / bob).
 
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -86,6 +88,135 @@ def _client(opener: _CaptureOpener) -> BBClient:
 
 def _repo_url() -> str:
     return DEFAULT_API_BASE + "/repositories/acme/widget-service"
+
+
+# ===========================================================================
+# workspaces_list
+# ===========================================================================
+
+
+def _workspace_value(slug: str, *, admin: bool = False) -> dict[str, Any]:
+    """Mirror the shape Bitbucket's /user/workspaces actually returns.
+
+    The new endpoint (CHANGE-3022) uses a sparse `workspace_access`
+    envelope — no `name` / no `permission` string, just slug + uuid +
+    links under `.workspace`, plus a top-level `administrator` bool.
+    Tests pin the shape so a refactor that flattens or renames keys
+    breaks loudly instead of silently changing the agent surface.
+    """
+    return {
+        "type": "workspace_access",
+        "administrator": admin,
+        "workspace": {
+            "type": "workspace_base",
+            "uuid": "{" + slug + "-uuid}",
+            "slug": slug,
+            "links": {
+                "self": {
+                    "href": f"https://api.bitbucket.org/2.0/workspaces/{slug}"
+                }
+            },
+        },
+    }
+
+
+class TestWorkspacesList:
+    def test_hits_user_workspaces_endpoint(self) -> None:
+        # The whole point: this op does NOT use BB_WORKSPACE — it's a
+        # user-scoped listing. The URL must be /user/workspaces, not
+        # /workspaces (deprecated CHANGE-2770) and not anything
+        # workspace-scoped.
+        opener = _CaptureOpener(
+            [{"values": [_workspace_value("acme"), _workspace_value("widget-co", admin=True)]}]
+        )
+        result = bb_ops.workspaces_list(_client(opener))
+        assert len(result) == 2
+        assert result[0]["workspace"]["slug"] == "acme"
+        assert result[1]["administrator"] is True
+        url = opener.calls[0]["url"]
+        assert url.startswith(DEFAULT_API_BASE + "/user/workspaces?")
+        assert "pagelen=100" in url
+        assert opener.calls[0]["method"] == "GET"
+        # No body on GETs.
+        assert opener.calls[0]["body"] is None
+
+    def test_returns_raw_envelope_not_just_slug(self) -> None:
+        """Callers (agent, bash) decide how to render — we surface the
+        full Bitbucket envelope including the administrator bool and
+        the workspace.uuid that downstream tools may want for explicit
+        targeting. Don't pre-flatten."""
+        opener = _CaptureOpener(
+            [{"values": [_workspace_value("daniel-pittman", admin=True)]}]
+        )
+        result = bb_ops.workspaces_list(_client(opener))
+        assert result[0]["workspace"]["uuid"] == "{daniel-pittman-uuid}"
+        assert result[0]["administrator"] is True
+        # The legacy fields callers might expect MUST stay absent — the
+        # new schema doesn't carry them. Pin this so a future "helpful"
+        # mutation that injects defaults doesn't mask the change.
+        assert "name" not in result[0]["workspace"]
+        assert "permission" not in result[0]
+
+    def test_count_walks_pages(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [_workspace_value(f"ws-{i}") for i in range(100)],
+                    "next": DEFAULT_API_BASE + "/user/workspaces?page=2",
+                },
+                {"values": [_workspace_value(f"ws-{i}") for i in range(100, 150)]},
+            ]
+        )
+        result = bb_ops.workspaces_list(_client(opener), count=150)
+        assert len(result) == 150
+        assert "pagelen=100" in opener.calls[0]["url"]
+        # Pagination must follow the `next` link.
+        assert len(opener.calls) == 2
+        assert "page=2" in opener.calls[1]["url"]
+
+    def test_count_caps_response(self) -> None:
+        # Even if Bitbucket returns more than `count`, the caller
+        # gets exactly `count` items (matches repos_list semantics).
+        opener = _CaptureOpener(
+            [{"values": [_workspace_value(f"ws-{i}") for i in range(10)]}]
+        )
+        result = bb_ops.workspaces_list(_client(opener), count=3)
+        assert len(result) == 3
+
+    def test_403_no_scope_translates_from_httperror(self) -> None:
+        """A token without `read:workspace:bitbucket` returns 403 with
+        Bitbucket's "credentials lack one or more required privilege
+        scopes" body. This test raises the *real* urllib HTTPError from
+        the opener (not a pre-built BBApiError) so it exercises the
+        bb_api._request HTTPError→BBApiError translation layer — a
+        regression there would surface here, not only in test_bb_api.
+        The scope name must survive into BBApiError.body so the MCP
+        wrapper / bash command can tell the user which scope to add."""
+        from bb_api import BBApiError
+        body = (
+            '{"error": {"message": "Your credentials lack one or more required '
+            'privilege scopes.", "detail": {"required": ["read:workspace:bitbucket"]}}}'
+        )
+        http_err = urllib.error.HTTPError(
+            url=DEFAULT_API_BASE + "/user/workspaces?pagelen=100",
+            code=403,
+            msg="Forbidden",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(body.encode("utf-8")),
+        )
+        opener = _CaptureOpener([http_err])
+        with pytest.raises(BBApiError) as exc:
+            bb_ops.workspaces_list(_client(opener))
+        assert exc.value.status == 403
+        # Body must survive the translation so the scope name is recoverable.
+        assert "read:workspace:bitbucket" in exc.value.body
+
+    @pytest.mark.parametrize("bad", [0, -1, True, False, "ten", None, 1.5])
+    def test_rejects_non_positive_count(self, bad: Any) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="count"):
+            bb_ops.workspaces_list(_client(opener), count=bad)
+        assert opener.calls == []
 
 
 # ===========================================================================

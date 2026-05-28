@@ -198,9 +198,27 @@ def test_load_config_missing_keys_lists_all(tmp_path: Path) -> None:
     with pytest.raises(BBConfigError) as exc:
         load_config(env={}, config_path=tmp_path / "no-such-file")
     msg = str(exc.value)
+    # BB_USER + BB_TOKEN are the only required keys (auth).
     assert "BB_USER" in msg
     assert "BB_TOKEN" in msg
-    assert "BB_WORKSPACE" in msg
+    # BB_WORKSPACE is OPTIONAL as of v1.2.0 (parity with the bash CLI:
+    # auto-detected from git origin, or supplied via the workspace/slug
+    # tool-arg form). It must NOT appear in the required-missing list.
+    assert "BB_WORKSPACE" not in msg
+
+
+def test_load_config_workspace_optional(tmp_path: Path) -> None:
+    """v1.2.0: load_config succeeds with only BB_USER + BB_TOKEN; the
+    absent workspace normalises to "" (not None, not an error). The
+    MCP server then auto-detects per-repo or errors at the bare-slug
+    boundary."""
+    cfg = load_config(
+        env={"BB_USER": "alice@example.com", "BB_TOKEN": "tok"},
+        config_path=tmp_path / "nope",
+    )
+    assert cfg.user == "alice@example.com"
+    assert cfg.token == "tok"
+    assert cfg.workspace == ""
 
 
 def test_load_config_custom_api_base(tmp_path: Path) -> None:

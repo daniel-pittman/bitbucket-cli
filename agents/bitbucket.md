@@ -63,6 +63,10 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 - `pr_decline(pr_id, repo?)` — close without merging.
 - `pr_comment_add(pr_id, body, repo?)` — post a top-level comment.
 
+### Workspaces
+
+- `workspaces_list(count?)` — workspaces the authenticated user belongs to. Uses `GET /2.0/user/workspaces` (CHANGE-3022 replacement for the cross-workspace listing endpoints removed under CHANGE-2770 on 2026-04-14). Requires the `read:workspace:bitbucket` scope on the API token — a token without that scope returns the standard flat error envelope `{ok: False, kind: "BBApiError", status: 403, body: ...}` (NOT the `auth.ok` shape — that's `whoami`-specific) with Bitbucket's "credentials lack one or more required privilege scopes" message in `body` (the scope name is recoverable from there). Returns workspace_access envelopes: `{administrator: bool, workspace: {slug, uuid, links}}`; the new schema has no `name` or `permission` string fields — branch on `administrator` (bool) for role-style decisions.
+
 ### Repos / branches / metadata
 
 - `repos_list(workspace?, count?, sort?, query?)` — workspace repos. `query` is a Bitbucket BBQL filter (e.g. `'name ~ "widget"'`).

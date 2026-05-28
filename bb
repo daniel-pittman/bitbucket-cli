@@ -26,6 +26,16 @@ BB_API="https://api.bitbucket.org/2.0"
 # --- Config loading ---
 
 load_config() {
+    # Snapshot env-provided values BEFORE sourcing the config files.
+    # `source ~/.config/bb/config` runs `BB_USER=...` etc., which would
+    # otherwise clobber values the user exported in their shell —
+    # inverting the documented precedence (env vars are meant to be
+    # highest priority) and diverging from the Python bb_api.load_config,
+    # which resolves env first. We re-apply these snapshots after
+    # sourcing so the env still wins.
+    local _env_user="${BB_USER:-}" _env_token="${BB_TOKEN:-}"
+    local _env_ws="${BB_WORKSPACE:-}" _env_api="${BB_API_BASE:-}"
+
     if [[ -f "$HOME/.config/bb/config" ]]; then
         # shellcheck source=/dev/null
         source "$HOME/.config/bb/config"
@@ -35,15 +45,39 @@ load_config() {
         source "$SCRIPT_DIR/.env"
     fi
 
-    if [[ -z "${BB_USER:-}" || -z "${BB_TOKEN:-}" || -z "${BB_WORKSPACE:-}" ]]; then
-        echo "Error: BB_USER, BB_TOKEN, and BB_WORKSPACE must be set." >&2
+    # Re-apply env snapshots (highest priority), matching the documented
+    # order and the Python resolve() behaviour.
+    [[ -n "$_env_user" ]] && BB_USER="$_env_user"
+    [[ -n "$_env_token" ]] && BB_TOKEN="$_env_token"
+    [[ -n "$_env_ws" ]] && BB_WORKSPACE="$_env_ws"
+    [[ -n "$_env_api" ]] && BB_API_BASE="$_env_api"
+
+    # Wire BB_API_BASE into the base URL every curl call uses. Without
+    # this the variable was snapshotted + re-applied but never consulted,
+    # so `BB_API_BASE=https://staging... bb prs` silently hit production
+    # — and bb_api.py honours it, so the CLI was the odd one out. Strip a
+    # trailing slash to match Python's api_base.rstrip("/") normalisation
+    # (avoids "//path").
+    if [[ -n "${BB_API_BASE:-}" ]]; then
+        BB_API="${BB_API_BASE%/}"
+    fi
+
+    # BB_WORKSPACE is now OPTIONAL: when running inside a Bitbucket git
+    # checkout, resolve_repo auto-detects the workspace from the origin
+    # remote, and the -w/--workspace flag or a "workspace/slug" argument
+    # can supply it per-command. Only BB_USER + BB_TOKEN are mandatory
+    # (auth). A command that needs a workspace but can't resolve one
+    # from any source fails at that point (resolve_repo / repo_path)
+    # with a clear, actionable message.
+    if [[ -z "${BB_USER:-}" || -z "${BB_TOKEN:-}" ]]; then
+        echo "Error: BB_USER and BB_TOKEN must be set." >&2
         echo "" >&2
         echo "Quick setup:" >&2
         echo "  mkdir -p ~/.config/bb" >&2
         echo "  cat > ~/.config/bb/config <<EOF" >&2
         echo "BB_USER=your-email@example.com" >&2
         echo "BB_TOKEN=your-api-token" >&2
-        echo "BB_WORKSPACE=your-workspace" >&2
+        echo "BB_WORKSPACE=your-workspace   # optional — auto-detected in a git checkout" >&2
         echo "EOF" >&2
         echo "" >&2
         echo "Create an API token at:" >&2
@@ -93,19 +127,110 @@ bb_delete() {
     curl -sf -u "${BB_USER}:${BB_TOKEN}" -X DELETE "${BB_API}${path}"
 }
 
-# Detect repo from current git remote if not provided
-detect_repo() {
-    if [[ -n "${1:-}" ]]; then
-        echo "$1"
-        return
+# Resolve the (workspace, repo-slug) pair for a command from its
+# optional repo argument, and publish the result by SETTING two
+# variables in the CALLER's scope:
+#   repo          — the repo slug
+#   BB_WORKSPACE  — the workspace to operate in
+#
+# This is called WITHOUT command substitution (i.e. `resolve_repo "$1"`,
+# not `repo=$(resolve_repo "$1")`) precisely so it runs in the caller's
+# shell and its assignments to `repo` (a caller `local`, reached via
+# bash dynamic scope) and `BB_WORKSPACE` (global) actually propagate.
+# A subshell — which is what the old `detect_repo` ran in — cannot set
+# the parent's workspace, which is why workspace auto-detect needs this
+# shape.
+#
+# Resolution precedence (highest first) — mirrors the Python
+# _resolve_repo contract in mcp_server.py:
+#   1. -w/--workspace flag        (BB_WORKSPACE_OVERRIDE, set pre-dispatch)
+#   2. explicit "workspace/slug"  (overrides workspace for this call)
+#   3. git origin auto-detect     (workspace + slug from the remote URL)
+#   4. BB_WORKSPACE default       (bare "slug" arg, or env/config default)
+#   5. error                      (nothing resolved a workspace)
+resolve_repo() {
+    local arg="${1:-}"
+    # A -w/--workspace flag locks the workspace: it beats both the git
+    # origin and any "ws/slug" arg. Detected by BB_WORKSPACE_OVERRIDE
+    # being set (the dispatcher records it before load_config).
+    local ws_locked=""
+    [[ -n "${BB_WORKSPACE_OVERRIDE:-}" ]] && ws_locked=1
+
+    if [[ -z "$arg" ]]; then
+        # (3) Auto-detect from the git origin remote.
+        local remote_url
+        remote_url=$(git remote get-url origin 2>/dev/null || true)
+        if [[ -z "$remote_url" ]]; then
+            echo "Error: no repo specified and not in a git repository." >&2
+            echo "  Pass a repo (bb <cmd> myrepo) or workspace/repo" >&2
+            echo "  (bb <cmd> acme/myrepo), or run inside a git checkout." >&2
+            exit 1
+        fi
+        # Strip one trailing slash so `.../repo/` parses, then match the
+        # tail. Greedy [^/]+ is fine here because we strip `.git`
+        # afterward (bash ERE has no non-greedy quantifier, unlike the
+        # Python _REMOTE_TAIL regex — same end result via the %.git
+        # parameter expansion below).
+        remote_url="${remote_url%/}"
+        if [[ "$remote_url" =~ [:/]([^/:]+)/([^/]+)$ ]]; then
+            local detected_ws="${BASH_REMATCH[1]}"
+            local detected_repo="${BASH_REMATCH[2]%.git}"
+            repo="$detected_repo"
+            # Flag wins over git-detected workspace; else use git's.
+            [[ -z "$ws_locked" ]] && BB_WORKSPACE="$detected_ws"
+        else
+            echo "Error: could not parse workspace/repo from origin URL." >&2
+            exit 1
+        fi
+    elif [[ "$arg" == */* ]]; then
+        # (2) Explicit "workspace/slug" override.
+        local arg_ws="${arg%%/*}"
+        local arg_repo="${arg#*/}"
+        if [[ "$arg_repo" == */* ]]; then
+            echo "Error: repo must be 'slug' or 'workspace/slug' (one '/'), got '$arg'." >&2
+            exit 1
+        fi
+        repo="$arg_repo"
+        # The -w flag still wins over an inline ws/slug (flag is the
+        # most explicit, per-invocation signal).
+        [[ -z "$ws_locked" ]] && BB_WORKSPACE="$arg_ws"
+    else
+        # (4) Bare slug → use whatever BB_WORKSPACE already resolved to
+        # (flag override, else env/config default). repo_path enforces
+        # that BB_WORKSPACE is actually set and well-formed.
+        repo="$arg"
     fi
+}
+
+# Resolve JUST the workspace for workspace-level commands that take no
+# repo argument (e.g. `bb repos`). Sets BB_WORKSPACE in the caller's
+# scope. Same precedence as resolve_repo, minus the slug:
+#   1. -w/--workspace flag      (BB_WORKSPACE_OVERRIDE locks it)
+#   2. git origin auto-detect   (workspace from the remote URL)
+#   3. BB_WORKSPACE default     (env / config)
+#   4. error
+resolve_workspace() {
+    # -w flag locks the workspace (most explicit signal).
+    [[ -n "${BB_WORKSPACE_OVERRIDE:-}" ]] && return
+
+    # git origin wins over the config default — "operate on where I am".
     local remote_url
     remote_url=$(git remote get-url origin 2>/dev/null || true)
-    if [[ -z "$remote_url" ]]; then
-        echo "Error: No repo specified and not in a git repository." >&2
+    if [[ -n "$remote_url" ]]; then
+        remote_url="${remote_url%/}"
+        if [[ "$remote_url" =~ [:/]([^/:]+)/([^/]+)$ ]]; then
+            BB_WORKSPACE="${BASH_REMATCH[1]}"
+            return
+        fi
+    fi
+
+    # Fall back to env/config BB_WORKSPACE; error if nothing resolved one.
+    if [[ -z "${BB_WORKSPACE:-}" ]]; then
+        echo "Error: no workspace resolved." >&2
+        echo "  Set BB_WORKSPACE (env or ~/.config/bb/config), pass" >&2
+        echo "  -w <workspace>, or run inside a Bitbucket git checkout." >&2
         exit 1
     fi
-    echo "$remote_url" | sed -E 's#.*[:/]([^/]+)/([^/.]+)(\.git)?$#\2#'
 }
 
 repo_path() {
@@ -164,6 +289,21 @@ _require_build_number() {
     fi
 }
 
+# Allowlist the PR state before it's interpolated into the request URL.
+# Mirrors the Python _KNOWN_PR_STATES boundary check (bb_ops.py) — both
+# surfaces reject anything outside the four valid states. Also closes a
+# query-param injection surface: without this, `bb prs my-repo
+# 'OPEN&pagelen=1000'` would smuggle extra query params into the URL.
+_require_pr_state() {
+    case "$1" in
+        OPEN|MERGED|DECLINED|SUPERSEDED) ;;
+        *)
+            echo "Error: state must be one of OPEN, MERGED, DECLINED, SUPERSEDED (got '$1')." >&2
+            exit 1
+            ;;
+    esac
+}
+
 # --- Formatting helpers ---
 
 format_state() {
@@ -203,7 +343,7 @@ format_duration() {
 
 cmd_pipelines() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local count="${2:-10}"
 
     echo "Pipelines for ${BB_WORKSPACE}/${repo}:"
@@ -246,7 +386,7 @@ cmd_pipelines() {
 
 cmd_pipeline() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local build_number="${2:-}"
 
     if [[ -z "$build_number" ]]; then
@@ -299,7 +439,7 @@ cmd_pipeline() {
 
 cmd_watch() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local build_number="${2:-}"
     local poll_interval="${3:-15}"
 
@@ -357,7 +497,7 @@ cmd_watch() {
 
 cmd_logs() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local build_number="${2:-}"
     local step_index="${3:-}"
 
@@ -416,7 +556,7 @@ cmd_logs() {
 
 cmd_pipeline_trigger() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local branch="${2:-}"
     local pattern="${3:-}"
 
@@ -515,13 +655,17 @@ cmd_pipeline_trigger() {
     # branch, custom pipeline name not found, invalid variable shape)
     # surfaces as a labelled error instead of `set -e` silently
     # aborting after the "Triggering pipeline..." banner.
-    local response
-    if ! response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload"); then
-        local rc=$?
+    # Capture rc via `|| rc=$?`, not `if ! cmd; then rc=$?` — the
+    # latter sets $? to the negation (always 0), so the real exit code
+    # was being lost and `exit $rc` exited 0 on failure. Verified on
+    # bash 3.2 and 5.x.
+    local response rc=0
+    response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
         echo "Trigger request failed for ${BB_WORKSPACE}/${repo} branch ${branch} (exit $rc)." >&2
         echo "  Common causes: protected branch, custom pipeline name not" >&2
         echo "  found, or invalid variable shape." >&2
-        exit $rc
+        exit "$rc"
     fi
 
     local build_num
@@ -533,7 +677,7 @@ cmd_pipeline_trigger() {
 
 cmd_pipeline_stop() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local build_number="${2:-}"
 
     if [[ -z "$build_number" ]]; then
@@ -572,7 +716,7 @@ cmd_pipeline_stop() {
 
 cmd_pipeline_approve() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local build_number="${2:-}"
 
     if [[ -z "$build_number" ]]; then
@@ -594,9 +738,33 @@ cmd_pipeline_approve() {
 # =========================================================================
 
 cmd_pr_list() {
-    local repo
-    repo=$(detect_repo "${1:-}")
-    local state="${2:-OPEN}"
+    local repo state
+    # State-recognition: `bb prs MERGED` from inside a checkout means
+    # "MERGED PRs in this repo", not "a repo named MERGED". If the first
+    # arg is a bare state name (matched case-INSENSITIVELY, so `merged`
+    # works too), treat it as the state and auto-detect the repo.
+    # Otherwise the first arg is the repo ([repo] [state] positional
+    # form, unchanged).
+    #
+    # Tradeoff: because the match is case-insensitive, a repo literally
+    # named "open"/"merged"/"declined"/"superseded" (any case) would be
+    # read as a state and shadowed — you'd reach it via the explicit
+    # `bb prs <workspace>/open` form. Accepted: such a repo name is
+    # vanishingly unlikely, and the explicit form is always available
+    # as an escape hatch.
+    local _arg1_upper
+    _arg1_upper="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
+    case "$_arg1_upper" in
+        OPEN|MERGED|DECLINED|SUPERSEDED)
+            resolve_repo ""
+            state="$_arg1_upper"
+            ;;
+        *)
+            resolve_repo "${1:-}"
+            state="$(printf '%s' "${2:-OPEN}" | tr '[:lower:]' '[:upper:]')"
+            ;;
+    esac
+    _require_pr_state "$state"
 
     echo "Pull requests for ${BB_WORKSPACE}/${repo} [${state}]:"
     echo ""
@@ -642,7 +810,7 @@ cmd_pr_list() {
 
 cmd_pr_view() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
 
     if [[ -z "$pr_id" ]]; then
@@ -698,7 +866,7 @@ cmd_pr_view() {
 
 cmd_pr_create() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local title="${2:-}"
     local dest="${3:-main}"
 
@@ -761,13 +929,17 @@ cmd_pr_create() {
     # exit non-zero and `set -e` would silently abort after the
     # "Creating PR:" banner. Without a labelled error, a user
     # retrying assuming a network blip might create a duplicate.
-    local response
-    if ! response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload"); then
-        local rc=$?
+    # Capture rc via `|| rc=$?`, not `if ! cmd; then rc=$?` — the
+    # latter sets $? to the negation (always 0), so the real exit code
+    # was being lost and `exit $rc` exited 0 on failure. Verified on
+    # bash 3.2 and 5.x.
+    local response rc=0
+    response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
         echo "PR-create request failed (exit $rc)." >&2
         echo "  Common causes: dest branch typo, a PR with this source" >&2
         echo "  branch is already open, source branch not pushed." >&2
-        exit $rc
+        exit "$rc"
     fi
 
     local pr_id pr_url
@@ -780,7 +952,7 @@ cmd_pr_create() {
 
 cmd_pr_approve() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
 
     if [[ -z "$pr_id" ]]; then
@@ -802,7 +974,7 @@ cmd_pr_approve() {
 
 cmd_pr_unapprove() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
 
     if [[ -z "$pr_id" ]]; then
@@ -823,7 +995,7 @@ cmd_pr_unapprove() {
 
 cmd_pr_merge() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
     local strategy="${3:-merge_commit}"
 
@@ -865,7 +1037,7 @@ cmd_pr_merge() {
 
 cmd_pr_decline() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
 
     if [[ -z "$pr_id" ]]; then
@@ -885,7 +1057,7 @@ cmd_pr_decline() {
 
 cmd_pr_diff() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
 
     if [[ -z "$pr_id" ]]; then
@@ -904,7 +1076,7 @@ cmd_pr_diff() {
 
 cmd_pr_comments() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
 
     if [[ -z "$pr_id" ]]; then
@@ -928,7 +1100,7 @@ cmd_pr_comments() {
 
 cmd_pr_comment_add() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local pr_id="${2:-}"
     local body="${3:-}"
 
@@ -972,7 +1144,7 @@ _url_encode_segment() {
 
 cmd_branches() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
 
     echo "Branches for ${BB_WORKSPACE}/${repo}:"
     echo ""
@@ -998,7 +1170,7 @@ cmd_branches() {
 
 cmd_branch_show() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local name="${2:-}"
 
     if [[ -z "$name" ]]; then
@@ -1030,7 +1202,7 @@ cmd_branch_show() {
 
 cmd_commits() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local branch="${2:-}"
     local count="${3:-10}"
 
@@ -1068,7 +1240,77 @@ cmd_commits() {
 #  REPOSITORY COMMANDS
 # =========================================================================
 
+cmd_workspaces() {
+    # GET /2.0/user/workspaces — the CHANGE-3022 replacement for the
+    # cross-workspace listing endpoints removed under CHANGE-2770
+    # (effective 2026-04-14). Workspace-scoped (no BB_WORKSPACE
+    # involvement), so no -w override applies here.
+    #
+    # Requires `read:workspace:bitbucket` scope on the API token.
+    # A token granted only repository/pullrequest/pipeline scopes
+    # returns 403 — bb_get (`curl -sf`) exits non-zero WITHOUT printing
+    # the body, so we can't echo Bitbucket's exact message; instead we
+    # name the scope unconditionally on the error path so the user
+    # knows the fix regardless.
+    if [[ $# -gt 0 ]]; then
+        echo "Usage: bb workspaces   (takes no arguments)" >&2
+        exit 1
+    fi
+
+    echo "Workspaces accessible to ${BB_USER}:"
+    echo ""
+
+    # Capture rc via `|| rc=$?` rather than `if ! cmd; then rc=$?`.
+    # The `!`-negation form sets $? to the LOGICAL NEGATION of the
+    # command's status (always 0 for a failing command), so the real
+    # curl exit code is unrecoverable inside an `if !` block — verified
+    # on bash 3.2 and 5.x. curl -f exits 22 on an HTTP >=400 response;
+    # other codes are transport-level (DNS, connection, TLS).
+    local response rc=0
+    response=$(bb_get "/user/workspaces?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Workspace listing failed (exit $rc)." >&2
+        if [[ "$rc" -eq 22 ]]; then
+            echo "If this is a 403, the token lacks the read:workspace:bitbucket" >&2
+            echo "scope. Rotate it at" >&2
+            echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+            echo "with that scope checked (existing scopes stay as they are)." >&2
+        else
+            echo "This looks like a connectivity error (not an HTTP response)." >&2
+            echo "Check your network and that api.bitbucket.org is reachable." >&2
+        fi
+        exit "$rc"
+    fi
+
+    printf "  %-30s %s\n" "SLUG" "ROLE"
+    printf "  %-30s %s\n" "----" "----"
+
+    echo "$response" | jq -r '
+        .values[] |
+        [
+            .workspace.slug,
+            (if .administrator then "admin" else "member" end)
+        ] | @tsv
+    ' | while IFS=$'\t' read -r slug role; do
+        printf "  %-30s %s\n" "$slug" "$role"
+    done
+
+    # Parity guard with bb_ops.workspaces_list, which paginates: bash
+    # fetches a single 100-item page (matching cmd_repos convention).
+    # >100 workspace memberships is vanishingly rare, but if the API
+    # signals more pages, say so rather than silently truncating —
+    # direct the user to the paginating MCP tool.
+    if [[ "$(echo "$response" | jq -r '.next // empty')" != "" ]]; then
+        # All three lines to stderr so the separator stays attached to
+        # the hint even when stdout is piped elsewhere.
+        echo "" >&2
+        echo "  (showing first 100 — you belong to more; use the MCP" >&2
+        echo "   workspaces_list tool, which paginates, for the full set)" >&2
+    fi
+}
+
 cmd_repos() {
+    resolve_workspace
     echo "Repositories in ${BB_WORKSPACE}:"
     echo ""
 
@@ -1092,7 +1334,7 @@ cmd_repos() {
 
 cmd_repo() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
 
     local response
     response=$(bb_get "$(repo_path "$repo")")
@@ -1117,7 +1359,7 @@ cmd_repo() {
 
 cmd_downloads() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
 
     echo "Downloads for ${BB_WORKSPACE}/${repo}:"
     echo ""
@@ -1154,7 +1396,7 @@ cmd_downloads() {
 
 cmd_vars() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
 
     echo "Repository variables for ${BB_WORKSPACE}/${repo}:"
     echo ""
@@ -1189,7 +1431,11 @@ cmd_whoami() {
     # into bug reports / screenshots, can't have secrets in it).
     echo "bb configuration:"
     echo "  User:      ${BB_USER}"
-    echo "  Workspace: ${BB_WORKSPACE}"
+    if [[ -n "${BB_WORKSPACE:-}" ]]; then
+        echo "  Workspace: ${BB_WORKSPACE} (default)"
+    else
+        echo "  Workspace: (not set — auto-detected per-repo from git origin)"
+    fi
     echo "  API:       ${BB_API}"
     echo "  Token:     [set, redacted]"
 
@@ -1229,19 +1475,33 @@ cmd_whoami() {
     # scope hint, not a global credential verdict.
     echo ""
     echo "Auth check:"
-    if bb_get "/repositories/${BB_WORKSPACE}?pagelen=1" > /dev/null 2>&1; then
-        echo "  Workspace reachable — auth OK."
+    # BB_WORKSPACE is optional now, so pick a workspace to probe: the
+    # configured/flag default if set, else the git origin's workspace.
+    # If neither resolves, skip the probe rather than build a bad URL.
+    local probe_ws="${BB_WORKSPACE:-}"
+    if [[ -z "$probe_ws" && -n "${_git_remote_raw:-}" ]]; then
+        local _pr="${_git_remote_raw%/}"
+        if [[ "$_pr" =~ [:/]([^/:]+)/([^/]+)$ ]]; then
+            probe_ws="${BASH_REMATCH[1]}"
+        fi
+    fi
+    if [[ -z "$probe_ws" ]]; then
+        echo "  Skipped — no workspace to probe (set BB_WORKSPACE or run"
+        echo "  inside a Bitbucket git checkout). Config + token look set."
+    elif bb_get "/repositories/${probe_ws}?pagelen=1" > /dev/null 2>&1; then
+        echo "  Workspace '${probe_ws}' reachable — auth OK."
     else
-        echo "  Workspace NOT reachable — token may be invalid, expired,"
-        echo "  scoped to a different workspace, or missing repository:read"
-        echo "  (pipeline/PR-only scoped tokens still work for those commands)."
+        echo "  Workspace '${probe_ws}' NOT reachable — token may be invalid,"
+        echo "  expired, scoped to a different workspace, or missing"
+        echo "  repository:read (pipeline/PR-only scoped tokens still work"
+        echo "  for those commands)."
         echo "  Rotate at https://id.atlassian.com/manage-profile/security/api-tokens"
     fi
 }
 
 cmd_open() {
     local repo
-    repo=$(detect_repo "${1:-}")
+    resolve_repo "${1:-}"
     local section="${2:-}"
 
     local url="https://bitbucket.org/${BB_WORKSPACE}/${repo}"
@@ -1294,6 +1554,7 @@ BRANCHES
   bb commits [repo] [branch] [count]    List recent commits (default count: 10)
 
 REPOSITORY
+  bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
   bb downloads [repo]                   List repo downloads
@@ -1388,6 +1649,7 @@ case "$command" in
     branch)               cmd_branch_show "$@" ;;
     commits)              cmd_commits "$@" ;;
     # Repos
+    workspaces|ws)        cmd_workspaces "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;
