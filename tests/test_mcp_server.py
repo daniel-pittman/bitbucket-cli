@@ -174,6 +174,28 @@ class TestResolveRepo:
         assert ws == "other"
         assert slug == "cool-repo"
 
+    def test_bare_slug_with_empty_workspace_errors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v1.2.0: BB_WORKSPACE is optional, so a bare slug can have no
+        configured workspace to resolve against. That must raise a clear
+        ValueError naming the fixes (set BB_WORKSPACE / use ws/slug /
+        omit for auto-detect) rather than building a '/repositories//slug'
+        URL. The 'ws/slug' and auto-detect paths still work without a
+        configured workspace — only the bare-slug path needs one."""
+        mcp_server._reset_client_cache()
+        cfg = bb_api.BBConfig(
+            user="alice@example.com", token="tok-xyz",
+            workspace="",  # optional + absent
+            api_base=bb_api.DEFAULT_API_BASE,
+        )
+        monkeypatch.setattr(mcp_server, "_client_cache", bb_api.BBClient(cfg))
+        with pytest.raises(ValueError, match="no workspace for bare slug"):
+            mcp_server._resolve_repo("my-repo")
+        # But ws/slug still resolves fine with an empty config workspace.
+        _client, ws, slug = mcp_server._resolve_repo("acme/my-repo")
+        assert (ws, slug) == ("acme", "my-repo")
+
     @pytest.mark.parametrize(
         "bad",
         ["a/b/c", "/repo", "ws/", "/", "//"],

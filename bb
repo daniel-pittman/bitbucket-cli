@@ -52,6 +52,16 @@ load_config() {
     [[ -n "$_env_ws" ]] && BB_WORKSPACE="$_env_ws"
     [[ -n "$_env_api" ]] && BB_API_BASE="$_env_api"
 
+    # Wire BB_API_BASE into the base URL every curl call uses. Without
+    # this the variable was snapshotted + re-applied but never consulted,
+    # so `BB_API_BASE=https://staging... bb prs` silently hit production
+    # — and bb_api.py honours it, so the CLI was the odd one out. Strip a
+    # trailing slash to match Python's api_base.rstrip("/") normalisation
+    # (avoids "//path").
+    if [[ -n "${BB_API_BASE:-}" ]]; then
+        BB_API="${BB_API_BASE%/}"
+    fi
+
     # BB_WORKSPACE is now OPTIONAL: when running inside a Bitbucket git
     # checkout, resolve_repo auto-detects the workspace from the origin
     # remote, and the -w/--workspace flag or a "workspace/slug" argument
@@ -154,7 +164,7 @@ resolve_repo() {
             echo "Error: no repo specified and not in a git repository." >&2
             echo "  Pass a repo (bb <cmd> myrepo) or workspace/repo" >&2
             echo "  (bb <cmd> acme/myrepo), or run inside a git checkout." >&2
-            kill -TERM $$
+            exit 1
         fi
         # Strip one trailing slash so `.../repo/` parses, then match the
         # tail. Greedy [^/]+ is fine here because we strip `.git`
@@ -170,7 +180,7 @@ resolve_repo() {
             [[ -z "$ws_locked" ]] && BB_WORKSPACE="$detected_ws"
         else
             echo "Error: could not parse workspace/repo from origin URL." >&2
-            kill -TERM $$
+            exit 1
         fi
     elif [[ "$arg" == */* ]]; then
         # (2) Explicit "workspace/slug" override.
@@ -178,7 +188,7 @@ resolve_repo() {
         local arg_repo="${arg#*/}"
         if [[ "$arg_repo" == */* ]]; then
             echo "Error: repo must be 'slug' or 'workspace/slug' (one '/'), got '$arg'." >&2
-            kill -TERM $$
+            exit 1
         fi
         repo="$arg_repo"
         # The -w flag still wins over an inline ws/slug (flag is the
@@ -219,7 +229,7 @@ resolve_workspace() {
         echo "Error: no workspace resolved." >&2
         echo "  Set BB_WORKSPACE (env or ~/.config/bb/config), pass" >&2
         echo "  -w <workspace>, or run inside a Bitbucket git checkout." >&2
-        kill -TERM $$
+        exit 1
     fi
 }
 
@@ -731,13 +741,17 @@ cmd_pr_list() {
     local repo state
     # State-recognition: `bb prs MERGED` from inside a checkout means
     # "MERGED PRs in this repo", not "a repo named MERGED". If the first
-    # arg is a bare state name (case-insensitively), treat it as the
-    # state and auto-detect the repo. Otherwise the first arg is the
-    # repo ([repo] [state] positional form, unchanged). Uppercase the
-    # state so `bb prs merged` works too. The four states are uppercase
-    # and Bitbucket slugs are lowercase-hyphen by convention, so a real
-    # repo named "open"/"merged" colliding here is effectively
-    # impossible.
+    # arg is a bare state name (matched case-INSENSITIVELY, so `merged`
+    # works too), treat it as the state and auto-detect the repo.
+    # Otherwise the first arg is the repo ([repo] [state] positional
+    # form, unchanged).
+    #
+    # Tradeoff: because the match is case-insensitive, a repo literally
+    # named "open"/"merged"/"declined"/"superseded" (any case) would be
+    # read as a state and shadowed — you'd reach it via the explicit
+    # `bb prs <workspace>/open` form. Accepted: such a repo name is
+    # vanishingly unlikely, and the explicit form is always available
+    # as an escape hatch.
     local _arg1_upper
     _arg1_upper="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
     case "$_arg1_upper" in
