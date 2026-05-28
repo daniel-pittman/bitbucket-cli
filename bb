@@ -279,6 +279,21 @@ _require_build_number() {
     fi
 }
 
+# Allowlist the PR state before it's interpolated into the request URL.
+# Mirrors the Python _KNOWN_PR_STATES boundary check (bb_ops.py) — both
+# surfaces reject anything outside the four valid states. Also closes a
+# query-param injection surface: without this, `bb prs my-repo
+# 'OPEN&pagelen=1000'` would smuggle extra query params into the URL.
+_require_pr_state() {
+    case "$1" in
+        OPEN|MERGED|DECLINED|SUPERSEDED) ;;
+        *)
+            echo "Error: state must be one of OPEN, MERGED, DECLINED, SUPERSEDED (got '$1')." >&2
+            exit 1
+            ;;
+    esac
+}
+
 # --- Formatting helpers ---
 
 format_state() {
@@ -713,9 +728,29 @@ cmd_pipeline_approve() {
 # =========================================================================
 
 cmd_pr_list() {
-    local repo
-    resolve_repo "${1:-}"
-    local state="${2:-OPEN}"
+    local repo state
+    # State-recognition: `bb prs MERGED` from inside a checkout means
+    # "MERGED PRs in this repo", not "a repo named MERGED". If the first
+    # arg is a bare state name (case-insensitively), treat it as the
+    # state and auto-detect the repo. Otherwise the first arg is the
+    # repo ([repo] [state] positional form, unchanged). Uppercase the
+    # state so `bb prs merged` works too. The four states are uppercase
+    # and Bitbucket slugs are lowercase-hyphen by convention, so a real
+    # repo named "open"/"merged" colliding here is effectively
+    # impossible.
+    local _arg1_upper
+    _arg1_upper="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
+    case "$_arg1_upper" in
+        OPEN|MERGED|DECLINED|SUPERSEDED)
+            resolve_repo ""
+            state="$_arg1_upper"
+            ;;
+        *)
+            resolve_repo "${1:-}"
+            state="$(printf '%s' "${2:-OPEN}" | tr '[:lower:]' '[:upper:]')"
+            ;;
+    esac
+    _require_pr_state "$state"
 
     echo "Pull requests for ${BB_WORKSPACE}/${repo} [${state}]:"
     echo ""
