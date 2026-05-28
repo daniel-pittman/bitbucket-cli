@@ -52,10 +52,12 @@ Loaded in this order (later overrides earlier):
 ### Bash (`bb`)
 - User-facing commands: `cmd_<name>` functions.
 - HTTP helpers: `bb_get` / `bb_post` / `bb_put` / `bb_delete`.
-- `detect_repo` / `repo_path` resolve the repo from git remote when not supplied.
-- Boundary validation via helpers like `_require_build_number` (rejects non-numeric).
+- `resolve_repo` sets `repo` + `BB_WORKSPACE` in the CALLER's scope (called as `resolve_repo "$1"`, NOT `repo=$(...)`, so it escapes the subshell and can set the workspace). Precedence: `-w` flag > `workspace/slug` arg > git origin auto-detect > `BB_WORKSPACE` default > error. `resolve_workspace` is the repo-less companion for workspace-level commands. Both mirror the Python `_resolve_repo` contract.
+- `BB_WORKSPACE` is OPTIONAL — only `BB_USER` + `BB_TOKEN` are required at load; a missing workspace fails at the point of use, not at startup.
+- Boundary validation via helpers like `_require_build_number` (rejects non-numeric) and `_require_pr_state` (allowlists OPEN/MERGED/DECLINED/SUPERSEDED — also closes a query-param injection surface).
 - Variables are passed to `jq -Rs` with NUL delimiters to prevent injection.
-- Error rc capture: `if cmd; then ...; else local rc=$?; ...; exit $rc; fi` (never lose the exit code).
+- Error rc capture: `local rc=0; out=$(cmd) || rc=$?` — NOT `if ! cmd; then rc=$?` (the `!` negation makes `$?` always 0; verified on bash 3.2 + 5.x).
+- bash 3.2+ floor (macOS system bash supported) — no `${var,,}` / `${var^^}` / `mapfile` / `declare -A`; a `bash:3.2` CI job (`bash32-floor`) parses `bb` to catch regressions.
 
 ### Python (`bb_api.py`, `bb_ops.py`, `git_ops.py`, `mcp_server.py`)
 - `BBClient` injected as first arg into every `bb_ops` function.

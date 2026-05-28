@@ -15,6 +15,31 @@ permissions:
   contents: read
 
 jobs:
+  # Guard the bash 3.2 floor (README + CLAUDE.md advertise "bash 3.2+ —
+  # macOS system bash is supported"). `bash -n` on the ubuntu runner uses
+  # bash 5.x, which PARSES bash-4-only idioms (${var,,}, mapfile,
+  # declare -A, ...) without complaint — they only blow up at runtime
+  # under macOS's /bin/bash 3.2. A real such bug (the `${state,,}` in
+  # `bb prs`) already shipped once. This job parses bb under an actual
+  # bash:3.2 image so the regression class fails CI instead of a user's
+  # macOS terminal. Pinned by digest, not tag, per the supply-chain
+  # posture (a floating `bash:3.2` tag could be repointed upstream).
+  bash32-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Parse bb under bash 3.2
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            bash:3.2@sha256:a11f59667c0a9d51724e88ebebac74b208f4177e36a33ad80dd23436e70f6115 \
+            bash -n bb || {
+              echo "bb failed to parse under bash 3.2 — a bash-4+ idiom slipped in." >&2
+              echo "Check for \${var,,} / \${var^^} / mapfile / declare -A / etc." >&2
+              exit 1
+            }
+
   syntax:
     runs-on: ubuntu-latest
     strategy:

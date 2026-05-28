@@ -92,9 +92,33 @@ mkdir -p ~/.config/bb
 cat > ~/.config/bb/config <<EOF
 BB_USER=your-email@example.com
 BB_TOKEN=your-api-token
-BB_WORKSPACE=your-workspace
+BB_WORKSPACE=your-workspace   # optional — see "How the workspace is resolved"
 EOF
 ```
+
+`BB_USER` and `BB_TOKEN` are required. `BB_WORKSPACE` is **optional**: when
+you run `bb` inside a Bitbucket git checkout, the workspace is auto-detected
+from the `origin` remote, so you only need `BB_WORKSPACE` as a fallback for
+commands run outside a repo (e.g. `bb repos` from an arbitrary directory).
+
+### How the workspace is resolved
+
+For any command that needs a workspace, `bb` resolves it in this order
+(highest priority first):
+
+1. **`-w/--workspace <name>` flag** — explicit, per-invocation override.
+2. **`workspace/slug` argument** — e.g. `bb pipelines acme/widget` targets the
+   `acme` workspace regardless of git context or config.
+3. **git `origin` auto-detect** — when you're inside a Bitbucket checkout, the
+   workspace comes from the remote URL. This is why `cd`-ing into any repo and
+   running `bb prs` / `bb pipelines` Just Works across multiple workspaces.
+4. **`BB_WORKSPACE`** — your configured default, used when none of the above
+   apply (notably for repo-less commands like `bb repos` run outside a checkout).
+5. If none resolve a workspace, the command fails with a message naming all
+   three ways to supply one.
+
+This mirrors the MCP server's `_resolve_repo` behavior, so the bash CLI and the
+Python tools agree on which workspace a given invocation targets.
 
 ### Getting an API Token
 
@@ -182,7 +206,7 @@ bb help                               # Show help
 
 ### Auto-Detection
 
-When inside a git repository with a Bitbucket remote, the `[repo]` argument is optional - it will be auto-detected from the git remote URL.
+When inside a git repository with a Bitbucket remote, the `[repo]` argument is optional — **both the repo slug AND the workspace** are auto-detected from the `origin` remote URL. This is what lets you `cd` between repos in different workspaces and have commands target the right one without a `-w` flag. To override, pass `-w <workspace>`, a `workspace/slug` argument, or set `BB_WORKSPACE` as a default (see [How the workspace is resolved](#how-the-workspace-is-resolved)).
 
 ## Examples
 
@@ -229,7 +253,7 @@ Note on `whoami`: resolves config + git context + a workspace-reachability probe
 
 Every tool that takes a repo argument supports auto-detection (omit `repo` to resolve from the current git checkout's `origin` remote — or from `BB_DEFAULT_REPO_PATH` if set; see [Environment overrides](#environment-overrides) below) and workspace override (`workspace/repo` shape).
 
-### Requirements
+### MCP server requirements
 
 - Python 3.10+ available on PATH (the bash CLI doesn't need Python — only the MCP server does).
 - The same `~/.config/bb/config` (or `BB_USER` / `BB_TOKEN` / `BB_WORKSPACE` env vars) as the CLI — see [Configuration](#configuration) above.
@@ -278,7 +302,7 @@ claude mcp add --scope user bitbucket-work \
     --env BB_USER=you@work.com \
     --env BB_TOKEN=... \
     --env BB_WORKSPACE=acme \
-    -- python3 /absolute/path/to/bitbucket-cli/mcp_server.py
+    -- python3 /absolute/path/to/bitbucket-cli/mcp_server.py  # ← replace with your clone path
 ```
 
 ### Other MCP clients
@@ -289,6 +313,7 @@ claude mcp add --scope user bitbucket-work \
 
 | Variable | Purpose |
 |---|---|
+| `BB_API_BASE` | Override the Bitbucket REST base URL (default `https://api.bitbucket.org/2.0`). Useful for a test / proxied / staging mirror. |
 | `BB_DEFAULT_REPO_PATH` | Default working directory for repo auto-detection (when a Bitbucket tool is called with `repo=""`) AND for the `git_*` tools' default `path=""` resolution. Defaults to the MCP server's launch cwd. |
 | `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/venv`). |
 
