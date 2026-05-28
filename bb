@@ -1092,10 +1092,19 @@ cmd_workspaces() {
     if ! response=$(bb_get "/user/workspaces?pagelen=100"); then
         local rc=$?
         echo "Workspace listing failed (exit $rc)." >&2
-        echo "A 403 here means the token lacks the read:workspace:bitbucket" >&2
-        echo "scope. Rotate it at" >&2
-        echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
-        echo "with that scope checked (existing scopes stay as they are)." >&2
+        # curl -f exits 22 specifically on an HTTP >=400 response; other
+        # exit codes mean transport-level failures (DNS, connection, TLS)
+        # where the scope hint would be misleading. Only name the scope
+        # when the failure is actually an HTTP error.
+        if [[ "$rc" -eq 22 ]]; then
+            echo "If this is a 403, the token lacks the read:workspace:bitbucket" >&2
+            echo "scope. Rotate it at" >&2
+            echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+            echo "with that scope checked (existing scopes stay as they are)." >&2
+        else
+            echo "This looks like a connectivity error (not an HTTP response)." >&2
+            echo "Check your network and that api.bitbucket.org is reachable." >&2
+        fi
         exit $rc
     fi
 
@@ -1118,7 +1127,9 @@ cmd_workspaces() {
     # signals more pages, say so rather than silently truncating —
     # direct the user to the paginating MCP tool.
     if [[ "$(echo "$response" | jq -r '.next // empty')" != "" ]]; then
-        echo ""
+        # All three lines to stderr so the separator stays attached to
+        # the hint even when stdout is piped elsewhere.
+        echo "" >&2
         echo "  (showing first 100 — you belong to more; use the MCP" >&2
         echo "   workspaces_list tool, which paginates, for the full set)" >&2
     fi
