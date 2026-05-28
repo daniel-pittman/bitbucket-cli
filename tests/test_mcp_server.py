@@ -98,6 +98,8 @@ EXPECTED_TOOLS = {
     "pr_diff",
     "pr_comments_list",
     "pr_comment_add",
+    # Workspaces
+    "workspaces_list",
     # Repos / branches / metadata
     "repos_list",
     "repo_show",
@@ -130,9 +132,9 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 30 = 6 pipelines
-    + 11 PRs + 7 repos/metadata + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 30
+    regression that drops a registration is visible. 31 = 6 pipelines
+    + 11 PRs + 1 workspaces + 7 repos/metadata + 5 git context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 31
 
 
 # ---------------------------------------------------------------------------

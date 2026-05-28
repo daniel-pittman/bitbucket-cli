@@ -20,7 +20,7 @@ The bash CLI has no dependencies beyond `curl` and `jq`. The MCP server adds Pyt
 - **Pull Requests**: Create, view, approve, unapprove, merge, decline, diff, comment
 - **Repositories**: List repos, view details, list/show branches, list recent commits
 - **Browser Integration**: Quick-open any resource in your browser
-- **MCP server**: 30 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
+- **MCP server**: 31 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
 
 ## Requirements
 
@@ -109,11 +109,12 @@ Your Bitbucket account needs these workspace permissions:
 
 | Feature | Required Permission |
 |---------|---------------------|
-| View pipelines, PRs, repos | **Read** access to repositories |
-| Trigger/stop pipelines | **Read + Write** access to Pipelines |
-| Create/approve/merge PRs | **Read + Write** access to Pull Requests |
+| View pipelines, PRs, repos | **Read** access to repositories (`read:repository:bitbucket`) |
+| Trigger/stop pipelines | **Read + Write** access to Pipelines (`read:pipeline:bitbucket`, `write:pipeline:bitbucket`) |
+| Create/approve/merge PRs | **Read + Write** access to Pull Requests (`read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`) |
+| List workspaces (`bb workspaces`) | `read:workspace:bitbucket` (new in v1.2.0 — Atlassian API token scope, opt-in when creating the token) |
 
-Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too.
+Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too — provided the token carries the scope. The cross-workspace listing endpoints (`/2.0/workspaces`, `/2.0/repositories?role=member`) were removed under Atlassian's [CHANGE-2770](https://developer.atlassian.com/cloud/bitbucket/changelog/) on 2026-04-14; `bb workspaces` uses the replacement `/2.0/user/workspaces` endpoint (CHANGE-3022) which requires the `read:workspace:bitbucket` scope. Rotating the token to add it leaves existing tokens unchanged.
 
 ### Environment Variables
 
@@ -211,7 +212,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 
 ### What it exposes
 
-30 tools covering pipelines, pull requests, repos, branches, commits, pipeline variables, and git-context helpers:
+31 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
 
 | Category | Tools |
 |---|---|
@@ -219,6 +220,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pipelines (write) | `pipeline_trigger`, `pipeline_stop` |
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
+| Workspaces | `workspaces_list` (needs `read:workspace:bitbucket` scope — see [Required Bitbucket Permissions](#required-bitbucket-permissions)) |
 | Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
 | Meta | `whoami` (see note below) |
