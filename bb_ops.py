@@ -370,6 +370,38 @@ def _validate_pr_id(pr_id: int) -> None:
         raise ValueError(f"pr_id must be a positive int, got {pr_id!r}")
 
 
+# Fields stripped from each PR object in the LIST view (prs_list) by
+# default. Bitbucket PR objects carry the full rendered description +
+# summary (raw / html / markup variants) and the participants array,
+# which together push even a 3-PR list past the MCP 25k-token response
+# cap on repos with rich PR bodies (observed: johnny-server, 3 open PRs
+# = ~70 KB). The list/triage workflow (prs_list -> pick one -> pr_show)
+# only needs identity + state + branches + author + links; the full
+# body is one pr_show away. pr_show is intentionally NOT slimmed — it's
+# the drill-down where you WANT the whole object.
+_PR_LIST_BULKY_FIELDS = ("description", "summary", "rendered", "participants")
+
+
+def _slim_pr_list_item(pr: dict[str, Any]) -> dict[str, Any]:
+    """Drop the bulky fields from one PR list object. Shallow copy so
+    the caller's source dict is untouched. `reviewers`, when present,
+    is projected down to uuid + display_name per reviewer (the full
+    account blobs are the other big contributor) while preserving the
+    count and identities a triage view needs."""
+    slim = {k: v for k, v in pr.items() if k not in _PR_LIST_BULKY_FIELDS}
+    reviewers = pr.get("reviewers")
+    if isinstance(reviewers, list):
+        slim["reviewers"] = [
+            {
+                "uuid": r.get("uuid"),
+                "display_name": r.get("display_name"),
+            }
+            for r in reviewers
+            if isinstance(r, dict)
+        ]
+    return slim
+
+
 def prs_list(
     client: BBClient,
     workspace: str,
@@ -377,9 +409,16 @@ def prs_list(
     *,
     state: str = "OPEN",
     count: int = 25,
+    verbose: bool = False,
 ) -> list[dict[str, Any]]:
     """List pull requests filtered by state. Defaults match bash:
-    state=OPEN, count=25. Walks pages as needed to honour `count`."""
+    state=OPEN, count=25. Walks pages as needed to honour `count`.
+
+    By default each PR is slimmed (see _slim_pr_list_item) so the list
+    fits the MCP response cap on rich-PR repos. Pass verbose=True to get
+    the full Bitbucket PR objects (description, summary, rendered,
+    participants intact) — useful when a caller genuinely needs the
+    bodies and isn't going through the MCP transport."""
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
     if not isinstance(state, str) or not state:
@@ -399,7 +438,7 @@ def prs_list(
 
     out: list[dict[str, Any]] = []
     for pr in client.paginate(_prs_root(workspace, repo), query=query):
-        out.append(pr)
+        out.append(pr if verbose else _slim_pr_list_item(pr))
         if len(out) >= count:
             break
     return out
@@ -680,6 +719,51 @@ def pr_comment_add(
         f"{_prs_root(workspace, repo)}/{pr_id}/comments",
         json_body={"content": {"raw": body}},
     )
+
+
+# ===========================================================================
+#  WORKSPACES
+# ===========================================================================
+
+
+def workspaces_list(
+    client: BBClient,
+    *,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """List the Bitbucket workspaces the authenticated user belongs to.
+
+    Uses `GET /2.0/user/workspaces` — the CHANGE-3022 replacement for
+    the cross-workspace listing endpoints removed under CHANGE-2770
+    (effective 2026-04-14). The old `/2.0/workspaces` and
+    `/2.0/user/permissions/workspaces` both now return CHANGE-2770
+    errors regardless of token shape.
+
+    Requires `read:workspace:bitbucket` scope on the API token. A token
+    granted only repository/pullrequest/pipeline scopes will surface
+    Bitbucket's "credentials lack one or more required privilege
+    scopes" 403 verbatim through the BBApiError path — the agent /
+    user sees exactly which scope to add when rotating.
+
+    Each value is a `workspace_access` envelope with the new sparse
+    schema: `.administrator` (bool), `.workspace.slug`, `.workspace.uuid`,
+    `.workspace.links` (no `name` / no `permission` string — those were
+    legacy fields not carried into the new endpoint). Callers should
+    branch on `administrator` (bool) rather than expecting a role
+    string.
+    """
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"pagelen": pagelen}
+
+    out: list[dict[str, Any]] = []
+    for w in client.paginate("/user/workspaces", query=q):
+        out.append(w)
+        if len(out) >= count:
+            break
+    return out
 
 
 # ===========================================================================

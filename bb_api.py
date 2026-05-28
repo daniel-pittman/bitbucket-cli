@@ -156,7 +156,14 @@ def load_config(
     # Normalise trailing slash so api_base + "/path" never produces "//path".
     api_base = api_base.rstrip("/")
 
-    missing = [k for k, v in [("BB_USER", user), ("BB_TOKEN", token), ("BB_WORKSPACE", workspace)] if not v]
+    # BB_WORKSPACE is OPTIONAL (parity with the bash CLI as of v1.2.0):
+    # the MCP server's git-context layer auto-detects the workspace from
+    # the origin remote (_resolve_repo with repo="" → git_remote_repo),
+    # and the "workspace/slug" tool-arg form supplies it explicitly. Only
+    # BB_USER + BB_TOKEN are mandatory (auth). A bare-slug call with no
+    # configured workspace fails at _resolve_repo with a clear ValueError,
+    # not here.
+    missing = [k for k, v in [("BB_USER", user), ("BB_TOKEN", token)] if not v]
     if missing:
         raise BBConfigError(
             f"Missing required configuration: {', '.join(missing)}. "
@@ -164,9 +171,12 @@ def load_config(
         )
 
     # Explicit narrow (not `assert ... is not None`, which `python -O` strips).
-    if user is None or token is None or workspace is None:
+    if user is None or token is None:
         raise BBConfigError("Internal: required key resolved to None despite missing-check.")
-    return BBConfig(user=user, token=token, workspace=workspace, api_base=api_base)
+    # workspace may be absent — normalise None → "" so BBConfig.workspace
+    # stays a str. Consumers that need it (bare-slug resolution) check for
+    # emptiness and raise an actionable error.
+    return BBConfig(user=user, token=token, workspace=workspace or "", api_base=api_base)
 
 
 # --- Repo resolution ------------------------------------------------------

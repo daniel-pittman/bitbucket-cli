@@ -20,7 +20,7 @@ The bash CLI has no dependencies beyond `curl` and `jq`. The MCP server adds Pyt
 - **Pull Requests**: Create, view, approve, unapprove, merge, decline, diff, comment
 - **Repositories**: List repos, view details, list/show branches, list recent commits
 - **Browser Integration**: Quick-open any resource in your browser
-- **MCP server**: 30 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
+- **MCP server**: 31 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
 
 ## Requirements
 
@@ -92,9 +92,33 @@ mkdir -p ~/.config/bb
 cat > ~/.config/bb/config <<EOF
 BB_USER=your-email@example.com
 BB_TOKEN=your-api-token
-BB_WORKSPACE=your-workspace
+BB_WORKSPACE=your-workspace   # optional — see "How the workspace is resolved"
 EOF
 ```
+
+`BB_USER` and `BB_TOKEN` are required. `BB_WORKSPACE` is **optional**: when
+you run `bb` inside a Bitbucket git checkout, the workspace is auto-detected
+from the `origin` remote, so you only need `BB_WORKSPACE` as a fallback for
+commands run outside a repo (e.g. `bb repos` from an arbitrary directory).
+
+### How the workspace is resolved
+
+For any command that needs a workspace, `bb` resolves it in this order
+(highest priority first):
+
+1. **`-w/--workspace <name>` flag** — explicit, per-invocation override.
+2. **`workspace/slug` argument** — e.g. `bb pipelines acme/widget` targets the
+   `acme` workspace regardless of git context or config.
+3. **git `origin` auto-detect** — when you're inside a Bitbucket checkout, the
+   workspace comes from the remote URL. This is why `cd`-ing into any repo and
+   running `bb prs` / `bb pipelines` Just Works across multiple workspaces.
+4. **`BB_WORKSPACE`** — your configured default, used when none of the above
+   apply (notably for repo-less commands like `bb repos` run outside a checkout).
+5. If none resolve a workspace, the command fails with a message naming all
+   three ways to supply one.
+
+This mirrors the MCP server's `_resolve_repo` behavior, so the bash CLI and the
+Python tools agree on which workspace a given invocation targets.
 
 ### Getting an API Token
 
@@ -109,11 +133,12 @@ Your Bitbucket account needs these workspace permissions:
 
 | Feature | Required Permission |
 |---------|---------------------|
-| View pipelines, PRs, repos | **Read** access to repositories |
-| Trigger/stop pipelines | **Read + Write** access to Pipelines |
-| Create/approve/merge PRs | **Read + Write** access to Pull Requests |
+| View pipelines, PRs, repos | **Read** access to repositories (`read:repository:bitbucket`) |
+| Trigger/stop pipelines | **Read + Write** access to Pipelines (`read:pipeline:bitbucket`, `write:pipeline:bitbucket`) |
+| Create/approve/merge PRs | **Read + Write** access to Pull Requests (`read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`) |
+| List workspaces (`bb workspaces`) | `read:workspace:bitbucket` (new in v1.2.0 — Atlassian API token scope, opt-in when creating the token) |
 
-Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too.
+Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too — provided the token carries the scope. The cross-workspace listing endpoints (`/2.0/workspaces`, `/2.0/repositories?role=member`) were removed under Atlassian's [CHANGE-2770](https://developer.atlassian.com/cloud/bitbucket/changelog/) on 2026-04-14; `bb workspaces` uses the replacement `/2.0/user/workspaces` endpoint (CHANGE-3022) which requires the `read:workspace:bitbucket` scope. Rotating the token to add it leaves existing tokens unchanged.
 
 ### Environment Variables
 
@@ -181,7 +206,7 @@ bb help                               # Show help
 
 ### Auto-Detection
 
-When inside a git repository with a Bitbucket remote, the `[repo]` argument is optional - it will be auto-detected from the git remote URL.
+When inside a git repository with a Bitbucket remote, the `[repo]` argument is optional — **both the repo slug AND the workspace** are auto-detected from the `origin` remote URL. This is what lets you `cd` between repos in different workspaces and have commands target the right one without a `-w` flag. To override, pass `-w <workspace>`, a `workspace/slug` argument, or set `BB_WORKSPACE` as a default (see [How the workspace is resolved](#how-the-workspace-is-resolved)).
 
 ## Examples
 
@@ -211,7 +236,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 
 ### What it exposes
 
-30 tools covering pipelines, pull requests, repos, branches, commits, pipeline variables, and git-context helpers:
+31 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
 
 | Category | Tools |
 |---|---|
@@ -219,6 +244,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pipelines (write) | `pipeline_trigger`, `pipeline_stop` |
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
+| Workspaces | `workspaces_list` (needs `read:workspace:bitbucket` scope — see [Required Bitbucket Permissions](#required-bitbucket-permissions)) |
 | Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
 | Meta | `whoami` (see note below) |
@@ -227,7 +253,7 @@ Note on `whoami`: resolves config + git context + a workspace-reachability probe
 
 Every tool that takes a repo argument supports auto-detection (omit `repo` to resolve from the current git checkout's `origin` remote — or from `BB_DEFAULT_REPO_PATH` if set; see [Environment overrides](#environment-overrides) below) and workspace override (`workspace/repo` shape).
 
-### Requirements
+### MCP server requirements
 
 - Python 3.10+ available on PATH (the bash CLI doesn't need Python — only the MCP server does).
 - The same `~/.config/bb/config` (or `BB_USER` / `BB_TOKEN` / `BB_WORKSPACE` env vars) as the CLI — see [Configuration](#configuration) above.
@@ -276,7 +302,7 @@ claude mcp add --scope user bitbucket-work \
     --env BB_USER=you@work.com \
     --env BB_TOKEN=... \
     --env BB_WORKSPACE=acme \
-    -- python3 /absolute/path/to/bitbucket-cli/mcp_server.py
+    -- python3 /absolute/path/to/bitbucket-cli/mcp_server.py  # ← replace with your clone path
 ```
 
 ### Other MCP clients
@@ -287,6 +313,7 @@ claude mcp add --scope user bitbucket-work \
 
 | Variable | Purpose |
 |---|---|
+| `BB_API_BASE` | Override the Bitbucket REST base URL (default `https://api.bitbucket.org/2.0`). Useful for a test / proxied / staging mirror. |
 | `BB_DEFAULT_REPO_PATH` | Default working directory for repo auto-detection (when a Bitbucket tool is called with `repo=""`) AND for the `git_*` tools' default `path=""` resolution. Defaults to the MCP server's launch cwd. |
 | `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/venv`). |
 
