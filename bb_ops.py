@@ -683,6 +683,51 @@ def pr_comment_add(
 
 
 # ===========================================================================
+#  WORKSPACES
+# ===========================================================================
+
+
+def workspaces_list(
+    client: BBClient,
+    *,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """List the Bitbucket workspaces the authenticated user belongs to.
+
+    Uses `GET /2.0/user/workspaces` — the CHANGE-3022 replacement for
+    the cross-workspace listing endpoints removed under CHANGE-2770
+    (effective 2026-04-14). The old `/2.0/workspaces` and
+    `/2.0/user/permissions/workspaces` both now return CHANGE-2770
+    errors regardless of token shape.
+
+    Requires `read:workspace:bitbucket` scope on the API token. A token
+    granted only repository/pullrequest/pipeline scopes will surface
+    Bitbucket's "credentials lack one or more required privilege
+    scopes" 403 verbatim through the BBApiError path — the agent /
+    user sees exactly which scope to add when rotating.
+
+    Each value is a `workspace_access` envelope with the new sparse
+    schema: `.administrator` (bool), `.workspace.slug`, `.workspace.uuid`,
+    `.workspace.links` (no `name` / no `permission` string — those were
+    legacy fields not carried into the new endpoint). Callers should
+    branch on `administrator` (bool) rather than expecting a role
+    string.
+    """
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"pagelen": pagelen}
+
+    out: list[dict[str, Any]] = []
+    for w in client.paginate("/user/workspaces", query=q):
+        out.append(w)
+        if len(out) >= count:
+            break
+    return out
+
+
+# ===========================================================================
 #  REPOSITORY / BRANCH / VARIABLES / DOWNLOADS / COMMITS
 # ===========================================================================
 

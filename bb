@@ -1068,6 +1068,44 @@ cmd_commits() {
 #  REPOSITORY COMMANDS
 # =========================================================================
 
+cmd_workspaces() {
+    # GET /2.0/user/workspaces — the CHANGE-3022 replacement for the
+    # cross-workspace listing endpoints removed under CHANGE-2770
+    # (effective 2026-04-14). Workspace-scoped (no BB_WORKSPACE
+    # involvement), so no -w override applies here.
+    #
+    # Requires `read:workspace:bitbucket` scope on the API token.
+    # A token granted only repository/pullrequest/pipeline scopes
+    # returns 403 with a "credentials lack one or more required
+    # privilege scopes" message — surfaced verbatim to the user
+    # below so they know exactly which scope to add when rotating.
+    echo "Workspaces accessible to ${BB_USER}:"
+    echo ""
+
+    local response
+    if ! response=$(bb_get "/user/workspaces?pagelen=100"); then
+        local rc=$?
+        echo "Workspace listing failed (exit $rc)." >&2
+        echo "If the response mentioned a missing scope, rotate your token at" >&2
+        echo "https://id.atlassian.com/manage-profile/security/api-tokens with" >&2
+        echo "the read:workspace:bitbucket scope checked." >&2
+        exit $rc
+    fi
+
+    printf "  %-30s %s\n" "SLUG" "ROLE"
+    printf "  %-30s %s\n" "----" "----"
+
+    echo "$response" | jq -r '
+        .values[] |
+        [
+            .workspace.slug,
+            (if .administrator then "admin" else "member" end)
+        ] | @tsv
+    ' | while IFS=$'\t' read -r slug role; do
+        printf "  %-30s %s\n" "$slug" "$role"
+    done
+}
+
 cmd_repos() {
     echo "Repositories in ${BB_WORKSPACE}:"
     echo ""
@@ -1294,6 +1332,7 @@ BRANCHES
   bb commits [repo] [branch] [count]    List recent commits (default count: 10)
 
 REPOSITORY
+  bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
   bb downloads [repo]                   List repo downloads
@@ -1388,6 +1427,7 @@ case "$command" in
     branch)               cmd_branch_show "$@" ;;
     commits)              cmd_commits "$@" ;;
     # Repos
+    workspaces|ws)        cmd_workspaces ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;

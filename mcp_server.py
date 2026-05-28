@@ -965,6 +965,42 @@ def pr_comment_add(pr_id: int, body: str, repo: str = "") -> dict[str, Any]:
 
 
 # =============================================================================
+#  WORKSPACES TOOL
+# =============================================================================
+
+
+@mcp.tool()
+def workspaces_list(count: int = 100) -> dict[str, Any]:
+    """List the Bitbucket workspaces the authenticated user belongs to.
+
+    Uses the CHANGE-3022 endpoint GET /2.0/user/workspaces (the
+    replacement for the cross-workspace listing endpoints removed
+    under CHANGE-2770, effective 2026-04-14).
+
+    Requires the `read:workspace:bitbucket` scope on the API token. A
+    token granted only repository/pullrequest/pipeline scopes returns
+    `auth.ok=False` with `status=403` and Bitbucket's "credentials
+    lack one or more required privilege scopes" message surfaced
+    verbatim — exactly which scope to add is in the error body.
+
+    Each workspace entry is a `workspace_access` envelope:
+    `{administrator: bool, workspace: {slug, uuid, links, ...}}`.
+    The legacy `name` and `permission` string fields are NOT present
+    in the new schema — branch on `administrator` (bool) for
+    role-style decisions.
+
+    Args:
+        count: Maximum number of workspaces to return (default 100).
+    """
+    try:
+        client = _get_client()
+        workspaces = bb_ops.workspaces_list(client, count=count)
+        return {"ok": True, "workspaces": workspaces}
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, count=count)
+
+
+# =============================================================================
 #  REPO / BRANCH / VARS / DOWNLOADS / COMMITS TOOLS
 # =============================================================================
 
