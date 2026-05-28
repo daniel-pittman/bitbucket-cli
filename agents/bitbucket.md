@@ -65,7 +65,7 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 
 ### Workspaces
 
-- `workspaces_list(count?)` — workspaces the authenticated user belongs to. Uses `GET /2.0/user/workspaces` (CHANGE-3022 replacement for the cross-workspace listing endpoints removed under CHANGE-2770 on 2026-04-14). Requires the `read:workspace:bitbucket` scope on the API token — a token without that scope returns `auth.ok=False` with `status=403` and Bitbucket's "credentials lack one or more required privilege scopes" message surfaced verbatim (the scope name is recoverable from the error body). Returns workspace_access envelopes: `{administrator: bool, workspace: {slug, uuid, links}}`; the new schema has no `name` or `permission` string fields — branch on `administrator` (bool) for role-style decisions.
+- `workspaces_list(count?)` — workspaces the authenticated user belongs to. Uses `GET /2.0/user/workspaces` (CHANGE-3022 replacement for the cross-workspace listing endpoints removed under CHANGE-2770 on 2026-04-14). Requires the `read:workspace:bitbucket` scope on the API token — a token without that scope returns the standard flat error envelope `{ok: False, kind: "BBApiError", status: 403, body: ...}` (NOT the `auth.ok` shape — that's `whoami`-specific) with Bitbucket's "credentials lack one or more required privilege scopes" message in `body` (the scope name is recoverable from there). Returns workspace_access envelopes: `{administrator: bool, workspace: {slug, uuid, links}}`; the new schema has no `name` or `permission` string fields — branch on `administrator` (bool) for role-style decisions.
 
 ### Repos / branches / metadata
 

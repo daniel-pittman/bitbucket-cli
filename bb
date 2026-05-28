@@ -1076,9 +1076,15 @@ cmd_workspaces() {
     #
     # Requires `read:workspace:bitbucket` scope on the API token.
     # A token granted only repository/pullrequest/pipeline scopes
-    # returns 403 with a "credentials lack one or more required
-    # privilege scopes" message — surfaced verbatim to the user
-    # below so they know exactly which scope to add when rotating.
+    # returns 403 — bb_get (`curl -sf`) exits non-zero WITHOUT printing
+    # the body, so we can't echo Bitbucket's exact message; instead we
+    # name the scope unconditionally on the error path so the user
+    # knows the fix regardless.
+    if [[ $# -gt 0 ]]; then
+        echo "Usage: bb workspaces   (takes no arguments)" >&2
+        exit 1
+    fi
+
     echo "Workspaces accessible to ${BB_USER}:"
     echo ""
 
@@ -1086,9 +1092,10 @@ cmd_workspaces() {
     if ! response=$(bb_get "/user/workspaces?pagelen=100"); then
         local rc=$?
         echo "Workspace listing failed (exit $rc)." >&2
-        echo "If the response mentioned a missing scope, rotate your token at" >&2
-        echo "https://id.atlassian.com/manage-profile/security/api-tokens with" >&2
-        echo "the read:workspace:bitbucket scope checked." >&2
+        echo "A 403 here means the token lacks the read:workspace:bitbucket" >&2
+        echo "scope. Rotate it at" >&2
+        echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+        echo "with that scope checked (existing scopes stay as they are)." >&2
         exit $rc
     fi
 
@@ -1104,6 +1111,17 @@ cmd_workspaces() {
     ' | while IFS=$'\t' read -r slug role; do
         printf "  %-30s %s\n" "$slug" "$role"
     done
+
+    # Parity guard with bb_ops.workspaces_list, which paginates: bash
+    # fetches a single 100-item page (matching cmd_repos convention).
+    # >100 workspace memberships is vanishingly rare, but if the API
+    # signals more pages, say so rather than silently truncating —
+    # direct the user to the paginating MCP tool.
+    if [[ "$(echo "$response" | jq -r '.next // empty')" != "" ]]; then
+        echo ""
+        echo "  (showing first 100 — you belong to more; use the MCP" >&2
+        echo "   workspaces_list tool, which paginates, for the full set)" >&2
+    fi
 }
 
 cmd_repos() {
@@ -1427,7 +1445,7 @@ case "$command" in
     branch)               cmd_branch_show "$@" ;;
     commits)              cmd_commits "$@" ;;
     # Repos
-    workspaces|ws)        cmd_workspaces ;;
+    workspaces|ws)        cmd_workspaces "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;

@@ -11,7 +11,9 @@ All fixture data is fictional (acme / widget-service / alice / bob).
 
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -181,24 +183,32 @@ class TestWorkspacesList:
         result = bb_ops.workspaces_list(_client(opener), count=3)
         assert len(result) == 3
 
-    def test_403_no_scope_propagates_as_bbapi_error(self) -> None:
+    def test_403_no_scope_translates_from_httperror(self) -> None:
         """A token without `read:workspace:bitbucket` returns 403 with
         Bitbucket's "credentials lack one or more required privilege
-        scopes" body. We propagate the BBApiError unchanged — the MCP
-        wrapper / bash command surface it to the agent / user so they
-        know exactly which scope to add when rotating."""
+        scopes" body. This test raises the *real* urllib HTTPError from
+        the opener (not a pre-built BBApiError) so it exercises the
+        bb_api._request HTTPError→BBApiError translation layer — a
+        regression there would surface here, not only in test_bb_api.
+        The scope name must survive into BBApiError.body so the MCP
+        wrapper / bash command can tell the user which scope to add."""
         from bb_api import BBApiError
-        err = BBApiError(
-            status=403,
-            url=DEFAULT_API_BASE + "/user/workspaces?pagelen=100",
-            body='{"error": {"message": "Your credentials lack one or more required '
-                 'privilege scopes.", "detail": {"required": ["read:workspace:bitbucket"]}}}',
+        body = (
+            '{"error": {"message": "Your credentials lack one or more required '
+            'privilege scopes.", "detail": {"required": ["read:workspace:bitbucket"]}}}'
         )
-        opener = _CaptureOpener([err])
+        http_err = urllib.error.HTTPError(
+            url=DEFAULT_API_BASE + "/user/workspaces?pagelen=100",
+            code=403,
+            msg="Forbidden",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(body.encode("utf-8")),
+        )
+        opener = _CaptureOpener([http_err])
         with pytest.raises(BBApiError) as exc:
             bb_ops.workspaces_list(_client(opener))
         assert exc.value.status == 403
-        # Body must reach the caller intact so the scope name is recoverable.
+        # Body must survive the translation so the scope name is recoverable.
         assert "read:workspace:bitbucket" in exc.value.body
 
     @pytest.mark.parametrize("bad", [0, -1, True, False, "ten", None, 1.5])
