@@ -334,7 +334,7 @@ cp agents/bitbucket.md ~/.claude/agents/bitbucket.md
 #    don't type defaults from memory, let the CLI discover them:
 #      bb workspaces                # which workspaces you belong to
 #      bb -w <ws> repos             # what's in each
-#      bb repo <ws>/<repo>          # → Main branch = default dest branch
+#      bb repo <ws>/<repo>          # → Main branch (verify PR base; GitFlow repos target develop)
 #      bb pipelines <ws>/<repo>     # → TRIGGER column = custom pipelines
 #      bb branches <ws>/<repo>      # → branch-naming convention
 #      bb vars <ws>/<repo>          # → SECURED=true = sensitive vars to mask
