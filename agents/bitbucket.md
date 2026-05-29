@@ -149,7 +149,8 @@ When you're delegated work in a workspace that has no block yet under
 read-only discovery survey and propose a filled-in block for them to confirm:
 
 - `bb workspaces` → which workspaces exist
-- `bb repo <ws>/<repo>` → default destination branch (the "Main branch" field)
+- `bb -w <ws> repos` → what's in each workspace (+ recency)
+- `bb repo <ws>/<repo>` → default destination branch (the "Main branch" field — but verify the actual PR base; GitFlow repos take PRs against `develop`, not the `mainbranch`)
 - `bb pipelines <ws>/<repo>` → custom pipeline patterns (the TRIGGER column; filter out plain branch names)
 - `bb branches <ws>/<repo>` → branch-naming / ticket-key convention
 - `bb vars <ws>/<repo>` → sensitive variables (rows with `SECURED=true`)
@@ -264,7 +265,8 @@ mechanical survey rather than a guess:
 ```bash
 bb workspaces                      # enumerate the workspaces you belong to
 bb -w <ws> repos                   # what's in each one (+ recency)
-bb repo <ws>/<repo>                # → "Main branch" = default destination branch
+bb repo <ws>/<repo>                # → "Main branch" (but verify the PR base — GitFlow
+                                   #   repos take PRs against develop, not the mainbranch)
 bb pipelines <ws>/<repo>           # → TRIGGER column = custom pipeline patterns in use
 bb branches <ws>/<repo>            # → branch-name prefixes / ticket-key convention
 bb vars <ws>/<repo>                # → SECURED=true rows = sensitive variables to mask
