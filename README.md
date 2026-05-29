@@ -319,7 +319,7 @@ claude mcp add --scope user bitbucket-work \
 
 ### Optional: install the bundled `bitbucket` agent for delegated use
 
-The MCP server exposes the *tools*; the bundled **agent** (`agents/bitbucket.md` in this repo) is the *behavioral layer* that makes a Claude Code session use those tools intelligently — propose-first protocol for destructive ops (`pr_merge`, `pr_decline`, `pipeline_stop`, `pr_unapprove`), resolve-git-context-first before any Bitbucket call, show-diffs-before-merge discipline, bash/Python parity rule for delegated CLI maintenance, and the project-conventions checklist for tracking per-workspace defaults.
+The MCP server exposes the *tools*; the bundled **agent** (`agents/bitbucket.md` in this repo) is the *behavioral layer* that makes a Claude Code session use those tools intelligently — propose-first protocol for destructive ops (`pr_merge`, `pr_decline`, `pipeline_stop`, `pr_unapprove`), resolve-git-context-first before any Bitbucket call, show-diffs-before-merge discipline, bash/Python parity rule for delegated CLI maintenance, and the per-workspace conventions block for tracking each workspace's defaults.
 
 The bundled `agents/bitbucket.md` is a **deliberately-generic template** — it ships with placeholder examples (`acme/widget-service`, fictional reviewers, generic custom-pipeline patterns like `deploy-prod`) and an explicitly-blank "Per-workspace conventions" section at the bottom. After copying it to `~/.claude/agents/bitbucket.md`, personalize your local copy with your default workspace, required reviewers, custom pipeline patterns, branch naming conventions, and any other non-generic context. **Anything you contribute back to this repo via PR should be re-genericized first** — real workspace slugs, real ticket titles, real reviewer handles, and project-specific custom-pipeline patterns belong only in your personal `~/.claude/agents/` copy, never in the upstream-tracked version.
 
@@ -362,7 +362,7 @@ The MCP tools already do per-call auto-detection on their own (source-branch aut
 | **Pipeline failure investigation** | Caller must navigate `pipeline_show` → `pipeline_steps` → `pipeline_logs` manually | Triages in that order, surfaces the relevant log tail (last ~50 lines around the failure) instead of dumping the whole stream |
 | **Avoiding redundant probes** | Caller may re-fetch `git_current_branch` / `git_remote_repo` per call even when the tool would auto-detect | Lets tool-level auto-detect carry the call (passes `repo=""` and omits `source_branch=` instead of pre-fetching git context just to echo it back) |
 | **`bb`-CLI maintenance** (delegated) | Re-discovers the parity rule, naming conventions, redaction patterns per session | Owns the design → implement → test → docs → PR cycle with the rules already baked in |
-| **Project conventions** | Re-discovered each session | Reads (or bb-discovers and proposes) the agent file's "Per-workspace conventions" block for the active workspace before any write op |
+| **Per-workspace conventions** | Re-discovered each session | Reads (or bb-discovers and proposes) the agent file's "Per-workspace conventions" block for the active workspace before any write op |
 
 ### Security
 
