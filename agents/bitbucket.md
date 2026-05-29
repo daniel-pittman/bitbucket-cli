@@ -142,6 +142,23 @@ When the user says "open a PR for this branch," call `pr_create(title="...")` wi
 
 When invoking `pr_merge`, `pr_decline`, `pipeline_stop`, or `pr_unapprove` from a delegated context, surface the what / why / new-state to the user first when there's any ambiguity. `pr_approve` and `pr_comment_add` are reversible enough to fire without a propose step in normal flow.
 
+### 6. Populating conventions from `bb` (don't ask the user to recite them)
+
+When you're delegated work in a workspace that has no block yet under
+"Per-workspace conventions," don't interrogate the user for defaults — run the
+read-only discovery survey and propose a filled-in block for them to confirm:
+
+- `bb workspaces` → which workspaces exist
+- `bb repo <ws>/<repo>` → default destination branch (the "Main branch" field)
+- `bb pipelines <ws>/<repo>` → custom pipeline patterns (the TRIGGER column; filter out plain branch names)
+- `bb branches <ws>/<repo>` → branch-naming / ticket-key convention
+- `bb vars <ws>/<repo>` → sensitive variables (rows with `SECURED=true`)
+- `bb pr <ws>/<repo> <id>` on a recent PR → reviewer/author patterns
+
+These are all read-only — gather first, then show the user the proposed block
+and write it only on confirmation. Real values go in the user's local
+`~/.claude/agents/bitbucket.md`, never the upstream template.
+
 ---
 
 ## Operating examples (generic)
@@ -234,16 +251,44 @@ The CLI is two parallel implementations:
 
 ---
 
-## Project-specific conventions (placeholder — fill this in per project)
+## Per-workspace conventions (placeholder — fill this in per workspace)
 
-When this agent is delegated work in a specific project, capture the project's conventions here so they survive across sessions:
+Capture each workspace's conventions here so they survive across sessions.
+Add one block per workspace you work in (the workspace slug is the heading);
+a top-level default covers repo-less commands run outside a checkout.
 
-- **Default workspace:** _(e.g. `acme`)_
-- **Default destination branch:** _(e.g. `develop`)_
-- **Required reviewers:** _(e.g. team-lead handle)_
-- **Custom pipeline patterns:** _(e.g. `deploy-staging`, `deploy-prod`, `nightly-integration`)_
-- **PR title conventions:** _(e.g. `[TICKET-123] Add X` / `feat: …`)_
-- **Branch naming:** _(e.g. `feat/`, `fix/`, `chore/`)_
-- **Pipeline variables that are sensitive:** _(list so they aren't echoed in plaintext when surfacing trigger results)_
+**Don't type these from memory — let `bb` discover them.** Every field below
+is derivable from a read-only `bb` command, so populating this section is a
+mechanical survey rather than a guess:
 
-The fields above are intentionally blank in the bundled template — fill them in your own private copy after installing, never in the upstream-tracked version.
+```bash
+bb workspaces                      # enumerate the workspaces you belong to
+bb -w <ws> repos                   # what's in each one (+ recency)
+bb repo <ws>/<repo>                # → "Main branch" = default destination branch
+bb pipelines <ws>/<repo>           # → TRIGGER column = custom pipeline patterns in use
+bb branches <ws>/<repo>            # → branch-name prefixes / ticket-key convention
+bb vars <ws>/<repo>                # → SECURED=true rows = sensitive variables to mask
+bb pr <ws>/<repo> <id>             # → reviewers / author on a recent PR
+```
+
+The bundled agent can run this survey for you — see "Populating conventions
+from `bb`" under Operating principles.
+
+Template — copy per workspace:
+
+```markdown
+**Default workspace** (repo-less commands outside a checkout): `<slug>`
+
+### Workspace: `<slug>`
+- **Default destination branch:** _(from `bb repo` → Main branch)_
+- **Custom pipeline patterns:** _(from `bb pipelines` TRIGGER column; e.g. `deploy-prod`, `v*`)_
+- **Branch naming:** _(from `bb branches`; e.g. `feature/TICKET-NNN-…`)_
+- **PR / commit conventions:** _(e.g. Conventional Commits, ticket-key in scope, milestone tags)_
+- **Reviewers:** _(confirm per-PR via `bb pr` — reviewer arrays aren't a stable default)_
+- **Sensitive pipeline variables:** _(from `bb vars`, SECURED=true rows — so they aren't echoed on trigger)_
+```
+
+These fields are intentionally blank in the bundled template. Fill them in
+your own private copy (`~/.claude/agents/bitbucket.md`) after installing —
+real workspace slugs, repo names, reviewer handles, and pipeline patterns
+belong only there, **never in the upstream-tracked version**.
