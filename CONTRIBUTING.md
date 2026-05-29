@@ -14,7 +14,7 @@ Open a regular [GitHub issue](https://github.com/daniel-pittman/bitbucket-cli/is
 2. Make your change. The required `syntax` CI check runs:
    - `bash -n bb` (bash parser, catches syntax errors before runtime)
    - presence checks for `bash`, `jq`, `curl` on the runner
-3. Open the PR against `develop`. The `main` branch only receives release PRs from `develop` (it's the stable line that tags point at).
+3. Open the PR against `develop` (the default base). Contributions don't target `main` directly; it's the stable line that tags point at.
 4. Address review feedback. Once approved and CI is green, a maintainer will merge.
 
 The first time an outside contributor opens a PR, GitHub holds Actions execution pending maintainer approval — this is the "Require approval for all outside collaborators" gate documented in [`SECURITY.md` §1](SECURITY.md). The PR is fine; it just may sit briefly before workflows start.
