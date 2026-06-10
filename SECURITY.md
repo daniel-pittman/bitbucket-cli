@@ -139,15 +139,13 @@ branch-scoping that the hardened workflows in this repo already provide.
   issue author has at least **COLLABORATOR** access on the repository. Random
   outside users cannot trigger it even by including `@claude` in their text.
 
-#### `ANTHROPIC_API_KEY` — used by `claude-security-review.yml`
+#### Security scanning: Semgrep (OSS, no secret)
 
-The security-review action does not currently support OAuth, so this workflow
-uses a metered API key. Add it under **Settings → Secrets and variables →
-Actions → New repository secret** as `ANTHROPIC_API_KEY`. The workflow runs
-automatically on every PR whose base branch is `main` or `develop`, and can
-also be dispatched manually. As with the code-review workflow, the
-outside-collaborator approval gate bounds drive-by API-credit burn from
-random fork PRs.
+A free, token-free Semgrep OSS scan runs first on every pull request and posts
+its findings as a single sticky comment, which the `claude-code-review.yml`
+reviewer folds into its review. It uses the `p/python`, `p/bash`, `p/secrets`,
+and `p/ci` rule packs and needs no API key. This replaced the metered Claude
+security-review job, so no `ANTHROPIC_API_KEY` secret is required.
 
 ---
 

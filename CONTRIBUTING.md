@@ -23,7 +23,7 @@ The first time an outside contributor opens a PR, GitHub holds Actions execution
 
 - **`syntax` (required)** — bash syntax check, runtime-tooling presence check, and the Python test suite across Python 3.10 / 3.11 / 3.12. Must pass before merge into `develop` or `main`. No secrets needed; runs on every push and PR including from forks.
 - **Claude code review (advisory)** — automated PR review using a subscription-bound OAuth token. Output appears as a PR comment; not a merge gate.
-- **Claude security review (advisory)** — runs only on PRs targeting `main` or `develop`. Uses a metered Anthropic API key; also advisory.
+- **Semgrep security scan (advisory)**: free, token-free Semgrep OSS (`p/python`, `p/bash`, `p/secrets`, `p/ci`) runs first on every PR and posts a single sticky findings comment, which the Claude code review folds into its analysis. No API key; not a merge gate.
 
 The interactive `@claude` bot is available for maintainer-triggered triage. **Only comments authored by `OWNER`, `MEMBER`, or `COLLABORATOR` accounts trigger it**, by design — outside contributors who type `@claude` won't get a response, to bound subscription-quota burn. See [`SECURITY.md` §6](SECURITY.md) for the rationale.
 
