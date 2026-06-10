@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code when working with this repository.
 
+## Automated Review Policy
+
+The PR review workflow enforces two rules the automated reviewer applies on every pull request:
+
+- **Tests ship with code.** If a PR changes application or library source code in a way that warrants tests (new or changed behavior, bug fixes, new branches or edge cases) and does not add or update corresponding tests, the reviewer flags it as a HIGH-severity finding. Docs-only, README, comments, formatting, and pure-configuration changes (CI YAML, lockfile bumps, asset-only, version bumps) are exempt.
+- **Semgrep findings inform the review.** A free Semgrep (OSS) scan runs before the Claude review and posts its findings as a PR comment, which the reviewer folds into its analysis. It scans with the `p/python`, `p/bash`, `p/secrets`, and `p/ci` rule packs. This replaces the metered Claude security-review job.
+
 ## Overview
 
 `bb` is a Bitbucket Cloud client with two parallel implementations of the same REST contract:
