@@ -61,7 +61,7 @@ jobs:
         # review and a human decide), mirroring the comment-only behavior of
         # the security job it replaces. Packs: Python + Bash (the dual `bb`
         # implementation), committed-secret detection, and CI/workflow
-        # misconfig. No p/dockerfile pack — the repo has no Dockerfile.
+        # misconfig. No p/dockerfile pack: the repo has no Dockerfile.
         run: |
           semgrep scan --json --output semgrep.json \
             --config p/python \
