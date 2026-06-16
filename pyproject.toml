@@ -38,7 +38,7 @@ dependencies = []
 mcp = ["mcp >= 1.0"]
 
 # Test-time dependencies.
-test = ["pytest >= 7"]
+test = ["pytest >= 9.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/daniel-pittman/bitbucket-cli"
