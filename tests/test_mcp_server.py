@@ -1169,6 +1169,37 @@ class TestRepoTools:
         assert out["ok"] is False
         assert "at least one field" in out["message"]
 
+    def test_repo_update_empty_project_surfaces_error_not_dropped(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # An empty project must NOT be collapsed to None (which would
+        # silently drop the project move and report success). It must reach
+        # bb_ops.repo_update and surface as a project_key ValueError — the
+        # error names project_key, NOT "at least one field". No stub: the
+        # real bb_ops runs and rejects pre-network.
+        out = mcp_server.repo_update(repo="my-repo", project="")
+        assert out["ok"] is False
+        assert "project_key" in out["message"]
+
+    def test_repo_update_empty_project_with_description_does_not_silently_succeed(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # The trap case: project="" + a description must NOT succeed with
+        # only the description applied. The empty project surfaces as an
+        # error so the caller knows the move did not happen.
+        out = mcp_server.repo_update(
+            repo="my-repo", project="", description="d"
+        )
+        assert out["ok"] is False
+        assert "project_key" in out["message"]
+
+    def test_repo_update_whitespace_project_surfaces_error(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.repo_update(repo="my-repo", project="   ")
+        assert out["ok"] is False
+        assert "project_key" in out["message"]
+
 
 class TestGitTools:
     def test_git_current_branch_uses_default_path(

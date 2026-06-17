@@ -1160,7 +1160,7 @@ def repo_create(
 @mcp.tool()
 def repo_update(
     repo: str = "",
-    project: str = "",
+    project: str | None = None,
     description: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing repository (move its project, change description).
@@ -1177,8 +1177,13 @@ def repo_update(
 
     Args:
         repo: "", "slug", or "workspace/slug" (auto-detect when empty).
-        project: Target project KEY to move the repo into. Empty = leave
-            the project unchanged.
+        project: Target project KEY to move the repo into. `null` (omit) =
+            leave the project unchanged; an empty/whitespace string is
+            INVALID (there is no "clear the project" — every repo belongs
+            to a project) and surfaces as a ValueError error envelope
+            rather than being silently dropped. Silently dropping it would
+            let a `project=""` + `description="..."` call report success
+            while never moving the project.
         description: New repository description. `null` (omit) = leave it
             unchanged; `""` (empty string) = intentionally CLEAR the
             description; any other string = set it. This three-way
@@ -1196,7 +1201,16 @@ def repo_update(
             client,
             workspace,
             repo_slug,
-            project_key=_opt_str(project),
+            # project is passed through as-is (no _opt_str): None (the
+            # default / omitted) means "no change", while an empty or
+            # whitespace string is INVALID and must reach
+            # bb_ops.repo_update to raise ValueError. Collapsing "" to None
+            # (as _opt_str would) would let
+            # repo_update(project="", description="d") silently drop the
+            # project move and report success — the "did my project change
+            # actually happen?" trap. Unlike a workspace arg there is no
+            # "default project" for "" to mean.
+            project_key=project,
             # description is passed through as-is (no _opt_str): None means
             # "no change", "" means "clear" — both are meaningful and must
             # reach bb_ops.repo_update distinctly.

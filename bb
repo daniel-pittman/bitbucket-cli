@@ -296,8 +296,14 @@ _require_build_number() {
 # '/', and '.' / '..'. The repo-level commands get this for free via
 # repo_path, but the workspace-only commands (cmd_projects) don't route
 # through it, so the check is centralised here instead of duplicated.
-# Whitespace check is true parity with Python's `.strip()`: reject if the
-# stripped form differs (catches ` acme `) or is empty.
+#
+# The whitespace check uses `tr -d '[:space:]'` (the same idiom repo_path
+# uses for BB_WORKSPACE) and rejects if the stripped form is empty OR
+# differs from the input. Note this is STRICTER than Python's `.strip()`:
+# it rejects ANY whitespace including interior (`a b`), not just
+# leading/trailing. That's intentional and safe for a workspace slug,
+# which can never legitimately contain a space — unlike a `--project KEY`,
+# where cmd_repo_update strips leading/trailing only (true `.strip()`).
 _require_workspace() {
     local ws="$1"
     local stripped
