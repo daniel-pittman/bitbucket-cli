@@ -766,6 +766,65 @@ cmd_pipeline_approve() {
     open "$url" 2>/dev/null || xdg-open "$url" 2>/dev/null || true
 }
 
+# Pipelines must be ENABLED on a repo before pipeline variables, custom
+# pipelines, or builds work. Toggle via the pipelines_config resource:
+#   GET /repositories/{ws}/{slug}/pipelines_config  → {"enabled": bool}
+#   PUT  ...  {"enabled": true|false}
+# Verified live: the GET 404s when Pipelines has never been configured
+# (the pre-enable state), so cmd_pipelines_status reports "disabled (never
+# configured)" on a 404 rather than erroring.
+
+cmd_pipelines_status() {
+    local repo
+    resolve_repo "${1:-}"
+
+    local response rc=0
+    response=$(bb_get "$(repo_path "$repo")/pipelines_config") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        # curl -f exits 22 on HTTP >=400. A 404 here is the normal
+        # "never configured" state, not an error — report it as disabled.
+        if [[ "$rc" -eq 22 ]]; then
+            echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
+            return
+        fi
+        echo "Could not read pipelines config (exit $rc)." >&2
+        exit "$rc"
+    fi
+    local enabled
+    enabled=$(echo "$response" | jq -r '.enabled // false')
+    echo "Pipelines: $([[ "$enabled" == "true" ]] && echo enabled || echo disabled) for ${BB_WORKSPACE}/${repo}"
+}
+
+# Shared enable/disable body. Args: <repo-arg> <true|false>.
+_pipelines_set_enabled() {
+    local repo
+    resolve_repo "${1:-}"
+    local enabled="$2"
+
+    local payload
+    payload=$(jq -n --argjson e "$enabled" '{enabled: $e}')
+
+    local response rc=0
+    response=$(bb_put "$(repo_path "$repo")/pipelines_config" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Pipelines $([[ "$enabled" == "true" ]] && echo enable || echo disable) failed (exit $rc)." >&2
+        echo "  Common cause: the token lacks admin:pipeline:bitbucket scope" >&2
+        echo "  (write:pipeline:bitbucket alone is not enough)." >&2
+        exit "$rc"
+    fi
+    local now
+    now=$(echo "$response" | jq -r '.enabled // false')
+    echo "Pipelines $([[ "$now" == "true" ]] && echo enabled || echo disabled) for ${BB_WORKSPACE}/${repo}"
+}
+
+cmd_pipelines_enable() {
+    _pipelines_set_enabled "${1:-}" true
+}
+
+cmd_pipelines_disable() {
+    _pipelines_set_enabled "${1:-}" false
+}
+
 # =========================================================================
 #  PULL REQUEST COMMANDS
 # =========================================================================
@@ -1714,6 +1773,167 @@ cmd_downloads() {
 }
 
 # =========================================================================
+#  DEPLOYMENT ENVIRONMENTS
+# =========================================================================
+#
+# Deployment environments are the named targets a pipeline deploys to
+# (Test / Staging / Production); each carries its own deployment variables
+# (managed by `bb vars [set] --deployment <env>`). These commands manage
+# the environments themselves:
+#   GET    $(repo_path)/environments/            list
+#   POST   ...   {"name", "environment_type":{"name"}}   create
+#   DELETE ...   /{env_uuid}/                    delete
+# Body shape + 201/204 responses verified against the live API.
+
+cmd_environments() {
+    local repo
+    resolve_repo "${1:-}"
+
+    echo "Deployment environments for ${BB_WORKSPACE}/${repo}:"
+    echo ""
+
+    local response
+    response=$(bb_get "$(repo_path "$repo")/environments/?pagelen=100")
+
+    local count
+    count=$(echo "$response" | jq '.size // (.values | length) // 0')
+    if [[ "$count" == "0" ]]; then
+        echo "  No environments."
+        return
+    fi
+
+    printf "  %-25s %s\n" "NAME" "TYPE"
+    printf "  %-25s %s\n" "----" "----"
+    echo "$response" | jq -r '
+        .values[] | [.name, (.environment_type.name // "-")] | @tsv
+    ' | while IFS=$'\t' read -r name type; do
+        printf "  %-25s %s\n" "$name" "$type"
+    done
+}
+
+cmd_environment_create() {
+    # bb environment-create [repo] <name> [--type Test|Staging|Production]
+    local repo_arg="" name="" env_type="Test"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type)    _require_flag_value "$@"; env_type="$2"; shift 2 ;;
+            --type=*)  env_type="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for environment-create: $1" >&2
+                exit 1 ;;
+            *)
+                # First positional is the repo IF a second positional (name)
+                # follows; otherwise the single positional is the name and
+                # the repo auto-detects. Collect positionals, sort out after.
+                if [[ -z "$repo_arg" && -z "$name" ]]; then
+                    repo_arg="$1"
+                elif [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    # One positional → it's the name (repo auto-detects). Two → repo, name.
+    if [[ -z "$name" ]]; then
+        name="$repo_arg"
+        repo_arg=""
+    fi
+    if [[ -z "$name" ]]; then
+        echo "Usage: bb environment-create [repo] <name> [--type Test|Staging|Production]" >&2
+        exit 1
+    fi
+
+    # Validate + canonicalise the type (case-insensitive), matching
+    # bb_ops.environment_create's _ENVIRONMENT_TYPES contract.
+    local canonical
+    case "$(printf '%s' "$env_type" | tr '[:upper:]' '[:lower:]')" in
+        test)        canonical="Test" ;;
+        staging)     canonical="Staging" ;;
+        production)  canonical="Production" ;;
+        *)
+            echo "Error: --type must be one of Test / Staging / Production (got '$env_type')." >&2
+            exit 1 ;;
+    esac
+
+    local repo
+    resolve_repo "$repo_arg"
+
+    local payload
+    payload=$(jq -n --arg n "$name" --arg t "$canonical" \
+        '{name: $n, environment_type: {name: $t}}')
+
+    local response rc=0
+    response=$(bb_post "$(repo_path "$repo")/environments/" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Environment create failed (exit $rc)." >&2
+        echo "  Common cause: a same-named environment already exists, or the" >&2
+        echo "  token lacks admin:pipeline:bitbucket scope." >&2
+        exit "$rc"
+    fi
+    local created_name uuid
+    created_name=$(echo "$response" | jq -r '.name // "(unknown)"')
+    uuid=$(echo "$response" | jq -r '.uuid // "(none)"')
+    echo "Created environment '${created_name}' (${canonical}) in ${BB_WORKSPACE}/${repo}"
+    echo "  uuid: ${uuid}"
+}
+
+cmd_environment_delete() {
+    # bb environment-delete [repo] <name>
+    local repo_arg="" name=""
+    # Same one-or-two positional logic as create.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*)
+                echo "Error: unknown flag for environment-delete: $1" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$repo_arg" && -z "$name" ]]; then
+                    repo_arg="$1"
+                elif [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+    if [[ -z "$name" ]]; then
+        name="$repo_arg"
+        repo_arg=""
+    fi
+    if [[ -z "$name" ]]; then
+        echo "Usage: bb environment-delete [repo] <name>" >&2
+        exit 1
+    fi
+
+    local repo
+    resolve_repo "$repo_arg"
+
+    # Resolve the NAME to a UUID (walks all pages; kills the script with a
+    # clear message if no environment matches). Mirrors the deployment-var
+    # path's resolution.
+    local uuid encoded
+    uuid=$(_resolve_env_uuid "$repo" "$name")
+    encoded="${uuid//\{/%7B}"
+    encoded="${encoded//\}/%7D}"
+
+    local rc=0
+    bb_delete "$(repo_path "$repo")/environments/${encoded}/" > /dev/null || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Environment delete failed for '$name' (exit $rc)." >&2
+        echo "  The token may lack admin:pipeline:bitbucket scope." >&2
+        exit "$rc"
+    fi
+    echo "Deleted environment '${name}' from ${BB_WORKSPACE}/${repo}"
+}
+
+# =========================================================================
 #  ENVIRONMENT / DEPLOY VARIABLES
 # =========================================================================
 #
@@ -2276,6 +2496,10 @@ PIPELINES
   bb trigger [repo] [branch] [pattern]  Trigger a pipeline run
   bb stop [repo] <number>               Stop a running pipeline
   bb approve [repo] <number>            Open pipeline in browser (manual steps require UI)
+  bb pipelines-status [repo]            Show whether Pipelines (CI) is enabled
+  bb pipelines-enable [repo]            Enable Pipelines (CI) on a repo
+  bb pipelines-disable [repo]           Disable Pipelines (CI) on a repo
+                                          (enable/disable need admin:pipeline:bitbucket)
 
 PULL REQUESTS
   bb prs [repo] [state]                 List PRs (default: OPEN)
@@ -2306,6 +2530,12 @@ REPOSITORY
                                           opts: --project KEY, --description TEXT
                                           (at least one required)
   bb downloads [repo]                   List repo downloads
+  bb environments [repo]                List deployment environments
+  bb environment-create [repo] <name>   Create a deployment environment
+                                          opts: --type Test|Staging|Production
+                                          (default Test; needs admin:pipeline:bitbucket)
+  bb environment-delete [repo] <name>   Delete a deployment environment
+                                          (needs admin:pipeline:bitbucket)
   bb vars [scope] [repo]                List pipeline variables
                                           scope: --workspace | --deployment <env>
                                           (default: repo)
@@ -2388,6 +2618,9 @@ case "$command" in
     trigger|run)          cmd_pipeline_trigger "$@" ;;
     stop)                 cmd_pipeline_stop "$@" ;;
     approve|ap)           cmd_pipeline_approve "$@" ;;
+    pipelines-enable|pl-on)    cmd_pipelines_enable "$@" ;;
+    pipelines-disable|pl-off)  cmd_pipelines_disable "$@" ;;
+    pipelines-status|pl-status) cmd_pipelines_status "$@" ;;
     # Pull Requests
     prs|pr-list)          cmd_pr_list "$@" ;;
     pr|pr-view)           cmd_pr_view "$@" ;;
@@ -2411,6 +2644,9 @@ case "$command" in
     repo-create|rc)       cmd_repo_create "$@" ;;
     repo-update|ru)       cmd_repo_update "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;
+    environments|envs)    cmd_environments "$@" ;;
+    environment-create|env-create)  cmd_environment_create "$@" ;;
+    environment-delete|env-delete)  cmd_environment_delete "$@" ;;
     vars)
         # `vars set ...` is the create-or-update subcommand; bare `vars`
         # (or `vars <repo>`) lists. Peek at the first arg to route.

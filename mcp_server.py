@@ -724,6 +724,67 @@ def pipeline_logs(
         return _error_dict_with(e, number=number, step_index=step_index)
 
 
+@mcp.tool()
+def pipelines_config_show(repo: str = "") -> dict[str, Any]:
+    """Show whether Pipelines (CI) is enabled on a repo.
+
+    Pipelines must be enabled before repo pipeline variables, custom
+    pipelines, or builds work at all. Returns `enabled` (bool) and
+    `configured` (bool) — `configured: false` means Pipelines has never
+    been set up on this repo (the API 404s in that state, which this tool
+    translates to `enabled: false, configured: false` rather than an
+    error).
+
+    Args:
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        config = bb_ops.pipelines_config_show(client, workspace, repo_slug)
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "enabled": bool(config.get("enabled")),
+            "config": config,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict(e)
+
+
+@mcp.tool()
+def pipelines_config_set(enabled: bool, repo: str = "") -> dict[str, Any]:
+    """Enable or disable Pipelines (CI) on a repo.
+
+    Pass `enabled=true` to turn Pipelines on (required before pipeline
+    variables / custom pipelines / builds work), or `enabled=false` to
+    turn it off. Returns the updated `enabled` state.
+
+    Requires `admin:pipeline:bitbucket` scope on the token (toggling the
+    Pipelines feature is a pipeline-admin operation, same scope family as
+    vars_set). `write:pipeline:bitbucket` alone returns 403, whose body
+    names the missing scope under `error.detail.required`.
+
+    Args:
+        enabled: True to enable Pipelines, False to disable.
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        config = bb_ops.pipelines_config_set(
+            client, workspace, repo_slug, enabled=enabled
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "enabled": bool(config.get("enabled", enabled)),
+            "config": config,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, enabled=enabled)
+
+
 # =============================================================================
 #  PULL REQUEST TOOLS
 # =============================================================================
@@ -1225,6 +1286,100 @@ def repo_update(
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict(e)
+
+
+@mcp.tool()
+def environments_list(repo: str = "", count: int = 100) -> dict[str, Any]:
+    """List a repo's deployment environments (Test / Staging / Production).
+
+    Each record carries `.name`, `.slug`, `.uuid`, and `.environment_type`.
+    Deployment variables are managed separately via `vars_set` /
+    `vars_list` with `scope="deployment"`.
+
+    Args:
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        count: Maximum number of environments to return (default 100).
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        environments = bb_ops.environments_list(
+            client, workspace, repo_slug, count=count
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "environments": environments,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict(e)
+
+
+@mcp.tool()
+def environment_create(
+    name: str,
+    repo: str = "",
+    environment_type: str = "Test",
+) -> dict[str, Any]:
+    """Create a deployment environment on a repo.
+
+    Args:
+        name: Environment name (e.g. "Production", "ci-smoke").
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        environment_type: One of Test / Staging / Production
+            (case-insensitive, default "Test").
+
+    Returns the created environment record (including its `uuid`, needed
+    for deletion and for `vars_set --deployment`).
+
+    Requires `admin:pipeline:bitbucket` scope on the token; a 403 names
+    the missing scope under `error.detail.required`.
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        env = bb_ops.environment_create(
+            client, workspace, repo_slug, name,
+            environment_type=environment_type,
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "name": env.get("name"),
+            "uuid": env.get("uuid"),
+            "environment": env,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, name=name)
+
+
+@mcp.tool()
+def environment_delete(name: str, repo: str = "") -> dict[str, Any]:
+    """Delete a deployment environment by NAME (or slug).
+
+    Resolves the name to its UUID, then deletes it. Fails with a clear
+    BBOpNotFound (in the error envelope) if no environment matches the
+    name, so a typo doesn't silently no-op.
+
+    Args:
+        name: Environment name or slug to delete.
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+
+    Requires `admin:pipeline:bitbucket` scope on the token; a 403 names
+    the missing scope under `error.detail.required`.
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        bb_ops.environment_delete(client, workspace, repo_slug, name)
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "name": name,
+            "deleted": True,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, name=name)
 
 
 @mcp.tool()

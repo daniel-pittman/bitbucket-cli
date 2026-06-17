@@ -86,6 +86,8 @@ EXPECTED_TOOLS = {
     "pipeline_trigger",
     "pipeline_stop",
     "pipeline_logs",
+    "pipelines_config_show",
+    "pipelines_config_set",
     # PRs
     "prs_list",
     "pr_show",
@@ -112,6 +114,9 @@ EXPECTED_TOOLS = {
     "vars_set",
     "downloads_list",
     "commits_list",
+    "environments_list",
+    "environment_create",
+    "environment_delete",
     # Git context
     "git_current_branch",
     "git_status",
@@ -136,10 +141,11 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 35 = 6 pipelines
-    + 11 PRs + 2 workspaces/projects + 10 repos/metadata + 5 git context
-    + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 35
+    regression that drops a registration is visible. 40 = 8 pipelines
+    (incl. pipelines_config show/set) + 11 PRs + 2 workspaces/projects
+    + 13 repos/metadata (incl. environments list/create/delete) + 5 git
+    context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 40
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +613,48 @@ class TestPipelineTools:
                 number=42, step_index=0, repo="my-repo", timeout=600.0
             )
         assert recorder.calls[0][1]["timeout"] == 600.0
+
+    # --- pipelines_config_show / pipelines_config_set ---
+
+    def test_pipelines_config_show_surfaces_enabled(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"enabled": True, "configured": True})
+        with patch.object(bb_ops, "pipelines_config_show", recorder):
+            out = mcp_server.pipelines_config_show(repo="my-repo")
+        assert recorder.calls[0][0] == (stub_client, "acme", "my-repo")
+        assert out["ok"] is True
+        assert out["enabled"] is True
+
+    def test_pipelines_config_show_unconfigured_is_disabled(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # The 404→{enabled:False, configured:False} translation happens in
+        # bb_ops; the wrapper must surface enabled=False cleanly.
+        recorder = _recorder({"enabled": False, "configured": False})
+        with patch.object(bb_ops, "pipelines_config_show", recorder):
+            out = mcp_server.pipelines_config_show(repo="my-repo")
+        assert out["ok"] is True
+        assert out["enabled"] is False
+
+    def test_pipelines_config_set_enable(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"enabled": True})
+        with patch.object(bb_ops, "pipelines_config_set", recorder):
+            out = mcp_server.pipelines_config_set(enabled=True, repo="my-repo")
+        assert recorder.calls[0][0] == (stub_client, "acme", "my-repo")
+        assert recorder.calls[0][1]["enabled"] is True
+        assert out["enabled"] is True
+
+    def test_pipelines_config_set_disable(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"enabled": False})
+        with patch.object(bb_ops, "pipelines_config_set", recorder):
+            out = mcp_server.pipelines_config_set(enabled=False, repo="my-repo")
+        assert recorder.calls[0][1]["enabled"] is False
+        assert out["enabled"] is False
 
 
 class TestPullRequestTools:
@@ -1199,6 +1247,67 @@ class TestRepoTools:
         out = mcp_server.repo_update(repo="my-repo", project="   ")
         assert out["ok"] is False
         assert "project_key" in out["message"]
+
+    # --- environments (list / create / delete) ---
+
+    def test_environments_list_passes_args(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([{"name": "Production", "uuid": "{p}"}])
+        with patch.object(bb_ops, "environments_list", recorder):
+            out = mcp_server.environments_list(repo="my-repo")
+        assert recorder.calls[0][0] == (stub_client, "acme", "my-repo")
+        assert out["ok"] is True
+        assert out["environments"] == [{"name": "Production", "uuid": "{p}"}]
+
+    def test_environment_create_passes_name_and_type(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder(
+            {"name": "ci-smoke", "uuid": "{u}", "environment_type": {"name": "Test"}}
+        )
+        with patch.object(bb_ops, "environment_create", recorder):
+            out = mcp_server.environment_create(
+                name="ci-smoke", repo="my-repo", environment_type="Staging"
+            )
+        args, kwargs = recorder.calls[0]
+        assert args[1] == "acme"
+        assert args[2] == "my-repo"
+        assert args[3] == "ci-smoke"
+        assert kwargs["environment_type"] == "Staging"
+        assert out["ok"] is True
+        assert out["uuid"] == "{u}"
+
+    def test_environment_create_default_type(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"name": "e", "uuid": "{u}"})
+        with patch.object(bb_ops, "environment_create", recorder):
+            mcp_server.environment_create(name="e", repo="my-repo")
+        assert recorder.calls[0][1]["environment_type"] == "Test"
+
+    def test_environment_delete_passes_name(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder(None)
+        with patch.object(bb_ops, "environment_delete", recorder):
+            out = mcp_server.environment_delete(name="ci-smoke", repo="my-repo")
+        assert recorder.calls[0][0] == (stub_client, "acme", "my-repo", "ci-smoke")
+        assert out["ok"] is True
+        assert out["deleted"] is True
+
+    def test_environment_delete_unknown_surfaces_error(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # A BBOpNotFound from bb_ops must land in the error envelope, not
+        # raise out of the tool.
+        def raise_not_found(*a: Any, **k: Any) -> Any:
+            raise bb_ops.BBOpNotFound("no deployment environment named 'x'")
+
+        with patch.object(bb_ops, "environment_delete", raise_not_found):
+            out = mcp_server.environment_delete(name="x", repo="my-repo")
+        assert out["ok"] is False
+        assert out["name"] == "x"
 
 
 class TestGitTools:

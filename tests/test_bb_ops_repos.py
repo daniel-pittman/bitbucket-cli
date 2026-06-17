@@ -1008,6 +1008,162 @@ class TestVarsSetDeploymentScope:
 
 
 # ===========================================================================
+# environments (list / create / delete)
+# ===========================================================================
+
+
+class TestEnvironmentsList:
+    def test_lists_environments(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [
+                {"name": "Production", "slug": "production", "uuid": "{p}",
+                 "environment_type": {"name": "Production"}},
+                {"name": "Test", "slug": "test", "uuid": "{t}",
+                 "environment_type": {"name": "Test"}},
+            ]}]
+        )
+        result = bb_ops.environments_list(_client(opener), "acme", "widget-service")
+        assert [e["name"] for e in result] == ["Production", "Test"]
+        call = opener.calls[0]
+        # Trailing-slash collection path + pagelen.
+        assert call["url"].startswith(_env_list_url() + "?")
+        assert "pagelen=100" in call["url"]
+        assert call["method"] == "GET"
+
+    def test_count_caps_response(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": f"e{i}", "uuid": f"{{{i}}}"} for i in range(10)]}]
+        )
+        result = bb_ops.environments_list(
+            _client(opener), "acme", "widget-service", count=3
+        )
+        assert len(result) == 3
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "ten", None])
+    def test_rejects_non_positive_count(self, bad: Any) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="count"):
+            bb_ops.environments_list(
+                _client(opener), "acme", "widget-service", count=bad
+            )
+        assert opener.calls == []
+
+
+class TestEnvironmentCreate:
+    def test_posts_name_and_type(self) -> None:
+        opener = _CaptureOpener(
+            [{"name": "ci-smoke", "uuid": "{new}", "environment_type": {"name": "Test"}}]
+        )
+        result = bb_ops.environment_create(
+            _client(opener), "acme", "widget-service", "ci-smoke"
+        )
+        assert result["uuid"] == "{new}"
+        call = opener.calls[0]
+        assert call["url"] == _env_list_url()
+        assert call["method"] == "POST"
+        # Default type is Test; body shape verified against the live API.
+        assert call["body"] == {
+            "name": "ci-smoke",
+            "environment_type": {"name": "Test"},
+        }
+
+    @pytest.mark.parametrize(
+        "given,canonical",
+        [("staging", "Staging"), ("PRODUCTION", "Production"), ("Test", "Test")],
+    )
+    def test_type_canonicalised_case_insensitive(
+        self, given: str, canonical: str
+    ) -> None:
+        opener = _CaptureOpener([{"name": "e", "uuid": "{u}"}])
+        bb_ops.environment_create(
+            _client(opener), "acme", "widget-service", "e",
+            environment_type=given,
+        )
+        assert opener.calls[0]["body"]["environment_type"] == {"name": canonical}
+
+    def test_name_stripped(self) -> None:
+        opener = _CaptureOpener([{"name": "e", "uuid": "{u}"}])
+        bb_ops.environment_create(
+            _client(opener), "acme", "widget-service", "  prod  "
+        )
+        assert opener.calls[0]["body"]["name"] == "prod"
+
+    @pytest.mark.parametrize("bad_name", ["", "   "])
+    def test_rejects_empty_name_no_network(self, bad_name: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="name"):
+            bb_ops.environment_create(
+                _client(opener), "acme", "widget-service", bad_name
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_type", ["Bogus", "prod", "", "   "])
+    def test_rejects_bad_type_no_network(self, bad_type: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment_type"):
+            bb_ops.environment_create(
+                _client(opener), "acme", "widget-service", "e",
+                environment_type=bad_type,
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_slug", ["", "   ", "a/b", ".", ".."])
+    def test_rejects_bad_slug_no_network(self, bad_slug: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.environment_create(
+                _client(opener), "acme", bad_slug, "e"
+            )
+        assert opener.calls == []
+
+
+class TestEnvironmentDelete:
+    def test_resolves_name_then_deletes(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [
+                    {"name": "ci-smoke", "slug": "ci-smoke", "uuid": "{env-cs}"},
+                ]},
+                None,  # DELETE → 204 / no body
+            ]
+        )
+        bb_ops.environment_delete(
+            _client(opener), "acme", "widget-service", "ci-smoke"
+        )
+        # First: env list GET (resolve name → uuid). Second: DELETE to the
+        # uuid path (braces URL-encoded, trailing slash).
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[0]["method"] == "GET"
+        delete = opener.calls[1]
+        assert delete["method"] == "DELETE"
+        assert delete["url"] == _env_list_url() + "%7Benv-cs%7D/"
+
+    def test_case_insensitive_name_match(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Production", "slug": "production", "uuid": "{p}"}]},
+                None,
+            ]
+        )
+        bb_ops.environment_delete(
+            _client(opener), "acme", "widget-service", "production"
+        )
+        assert opener.calls[1]["url"] == _env_list_url() + "%7Bp%7D/"
+
+    def test_unknown_env_raises_before_delete(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Production", "slug": "production", "uuid": "{p}"}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound):
+            bb_ops.environment_delete(
+                _client(opener), "acme", "widget-service", "no-such-env"
+            )
+        # Only the resolve GET fired; no DELETE.
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "GET"
+
+
+# ===========================================================================
 # branches_list + branch_show
 # ===========================================================================
 

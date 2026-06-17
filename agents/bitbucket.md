@@ -41,11 +41,13 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 - `pipeline_show(number, repo?)` — full pipeline detail by build number.
 - `pipeline_steps(number, repo?)` — list of step records for a pipeline.
 - `pipeline_logs(number, step_index, repo?, timeout?)` — raw log text for a single step (0-based step index). Follows Bitbucket's 307 to S3 with cross-host Authorization stripping.
+- `pipelines_config_show(repo?)` — whether Pipelines (CI) is enabled on the repo. Returns `enabled` (bool) and a `config` record. Translates the API's 404 (Pipelines never configured) into `{enabled: False, configured: False}` so the "never enabled" state is a definite answer, not an error. Pipelines must be enabled before repo pipeline variables, custom pipelines, or builds work at all.
 
 ### Pipelines (write)
 
 - `pipeline_trigger(branch, repo?, pattern?, variables?)` — run a pipeline. Without `pattern`, the branch's default pipeline runs; with `pattern`, the named custom pipeline. `variables` is a `{name: value}` dict.
 - `pipeline_stop(number, repo?)` — stop a running pipeline.
+- `pipelines_config_set(enabled, repo?)` — enable (`enabled=True`) or disable (`enabled=False`) Pipelines on a repo. PUTs `/pipelines_config`. Required before repo variables / custom pipelines / builds will run. Requires `admin:pipeline:bitbucket` scope (same family as `vars_set`); `write:pipeline:bitbucket` alone returns 403, body names the missing scope under `error.detail.required`.
 
 ### Pull requests (read)
 
@@ -80,6 +82,12 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 - `vars_list(repo?, count?, scope?, environment?)` — pipeline configuration variables (with `secured` flag). `scope` is `repo` (default), `workspace`, or `deployment`. For `workspace` no repo is needed (variables are workspace-shared). For `deployment`, pass `environment` (the env NAME or slug, e.g. `Production`); it resolves to the environment UUID by listing the repo's environments first.
 - `vars_set(key, repo?, value?, value_file?, value_env?, secured?, scope?, environment?)` — create-or-update a pipeline variable at the chosen scope. Looks the key up first (walks all pages), then PUTs the existing UUID or POSTs a new one. `scope` is `repo` (default), `workspace`, or `deployment`; `deployment` requires `environment` (name/slug resolved to UUID; an unknown name fails with the available list and writes nothing). Provide the value via EXACTLY ONE of `value` / `value_file` / `value_env`; for secrets prefer `value_file` or `value_env` so the secret never lands in the tool-call arguments / transcript / process list. Set `secured=True` to mask it Bitbucket-side. The response NEVER echoes the value (masked as `***`) and reports `scope`, `environment`, and `action` (`created`/`updated`). The three scopes hit different endpoints (`pipelines_config` repo / `pipelines-config` workspace, hyphen / `deployments_config/environments/{uuid}` deployment) but all require `admin:pipeline:bitbucket` scope on the token; `write:pipeline:bitbucket` alone returns 403. As with `repo_create`, a read/write-only token must be ROTATED to add the admin scope. The 403 body names the missing scope under `error.detail.required`.
 - `downloads_list(repo?, count?)` — repository download artifacts.
+
+### Deployment environments
+
+- `environments_list(repo?, count?)` — the repo's deployment environments (the named targets a pipeline deploys to: Test / Staging / Production). Each record carries `.name`, `.slug`, `.uuid`, `.environment_type`. The per-environment deployment VARIABLES are managed separately via `vars_set` / `vars_list` with `scope="deployment"`.
+- `environment_create(name, repo?, environment_type?)` — create a deployment environment. `environment_type` is one of Test / Staging / Production (case-insensitive, default `Test`); an invalid type is rejected at the boundary with no network IO. Returns the created record including its `uuid` (needed for `vars_set --deployment`). Requires `admin:pipeline:bitbucket` scope; a 403 names the missing scope under `error.detail.required`.
+- `environment_delete(name, repo?)` — delete a deployment environment by NAME (or slug; resolved to its UUID by listing first, walking all pages). An unknown name fails with `BBOpNotFound` (in the error envelope) listing the available environments, so a typo never silently no-ops. Requires `admin:pipeline:bitbucket` scope.
 
 ### Git context (subprocess wrappers)
 
