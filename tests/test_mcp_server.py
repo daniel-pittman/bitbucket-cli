@@ -881,6 +881,33 @@ class TestRepoTools:
         assert out["ok"] is False
         assert "exactly one" in out["message"]
 
+    def test_vars_set_empty_string_value_is_settable(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """An explicit empty-string value is LEGAL (e.g. clearing a flag)
+        and must be settable via MCP — parity with bash `--value ""`.
+        The sentinel default is the real "not supplied" marker, so "" is
+        a supplied value, not "no source"."""
+        find = _recorder(None)
+        setter = _recorder({"key": "FLAG", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(key="FLAG", repo="my-repo", value="")
+        assert out["ok"] is True
+        # The empty string was forwarded as the value.
+        assert setter.calls[0][0][4] == ""
+
+    def test_vars_set_empty_value_plus_other_source_still_rejected(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # An explicit "" counts as a supplied source, so combining it with
+        # value_env is still ambiguous and must be rejected.
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value="", value_env="X"
+        )
+        assert out["ok"] is False
+        assert "exactly one" in out["message"]
+
     def test_vars_set_missing_env_var_errors(
         self, stub_client: bb_api.BBClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:

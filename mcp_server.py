@@ -1179,11 +1179,20 @@ def vars_list(repo: str = "", count: int = 100) -> dict[str, Any]:
         return _error_dict(e)
 
 
+# Sentinel for vars_set's `value` param. An empty string is a LEGAL
+# pipeline-variable value (e.g. clearing a feature flag), so "" can't
+# double as "value not supplied" — that would make an empty value
+# unsettable via MCP while the bash CLI accepts `--value ""` (a parity
+# break). This sentinel is the real "not supplied" marker; any string a
+# caller actually passes (including "") is treated as a supplied value.
+_VALUE_UNSET = "\x00__bb_value_unset__"
+
+
 @mcp.tool()
 def vars_set(
     key: str,
     repo: str = "",
-    value: str = "",
+    value: str = _VALUE_UNSET,
     value_file: str = "",
     value_env: str = "",
     secured: bool = False,
@@ -1217,8 +1226,12 @@ def vars_set(
         # Exactly-one-source check. Count the supplied sources so an
         # ambiguous call (two sources) or an empty call (no source) is
         # rejected before any value is read or any request is sent.
+        # `value` is "supplied" iff it differs from the sentinel — so an
+        # explicit empty string counts as supplied (parity with bash
+        # `--value ""`), while the default does not.
+        value_supplied = value != _VALUE_UNSET
         sources = [
-            ("value", value != ""),
+            ("value", value_supplied),
             ("value_file", (value_file or "").strip() != ""),
             ("value_env", (value_env or "").strip() != ""),
         ]
@@ -1229,7 +1242,7 @@ def vars_set(
                 f"(got: {supplied or 'none'})"
             )
 
-        if value != "":
+        if value_supplied:
             resolved_value = value
         elif (value_file or "").strip():
             path = value_file.strip()

@@ -1353,6 +1353,19 @@ cmd_repo() {
     '
 }
 
+# Guard a value-taking flag against a missing argument BEFORE consuming
+# $2. Under `set -u`, a bare `value="$2"` when $2 is unset (the flag was
+# the last token) aborts with a raw "$2: unbound variable" bash error
+# instead of a curated message. Call as `_require_flag_value "$@"` from
+# inside the case arm — $1 is the flag, $2 is its value if present, so a
+# count below 2 means the value is missing.
+_require_flag_value() {
+    if [[ "$#" -lt 2 ]]; then
+        echo "Error: $1 requires a value." >&2
+        exit 1
+    fi
+}
+
 cmd_repo_create() {
     # bb repo-create <name> [--private] [--public] [--project KEY] [--description TEXT]
     #
@@ -1369,9 +1382,9 @@ cmd_repo_create() {
         case "$1" in
             --private)        is_private="true"; shift ;;
             --public)         is_private="false"; shift ;;
-            --project)        project="$2"; shift 2 ;;
+            --project)        _require_flag_value "$@"; project="$2"; shift 2 ;;
             --project=*)      project="${1#*=}"; shift ;;
-            --description)    description="$2"; shift 2 ;;
+            --description)    _require_flag_value "$@"; description="$2"; shift 2 ;;
             --description=*)  description="${1#*=}"; shift ;;
             -*)
                 echo "Error: unknown flag for repo-create: $1" >&2
@@ -1526,11 +1539,11 @@ cmd_vars_set() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --secured)        secured="true"; shift ;;
-            --value)          value="$2"; value_set="1"; shift 2 ;;
+            --value)          _require_flag_value "$@"; value="$2"; value_set="1"; shift 2 ;;
             --value=*)        value="${1#*=}"; value_set="1"; shift ;;
-            --value-file)     value_file="$2"; shift 2 ;;
+            --value-file)     _require_flag_value "$@"; value_file="$2"; shift 2 ;;
             --value-file=*)   value_file="${1#*=}"; shift ;;
-            --value-env)      value_env="$2"; shift 2 ;;
+            --value-env)      _require_flag_value "$@"; value_env="$2"; shift 2 ;;
             --value-env=*)    value_env="${1#*=}"; shift ;;
             -*)
                 echo "Error: unknown flag for vars set: $1" >&2
@@ -1551,6 +1564,22 @@ cmd_vars_set() {
 
     if [[ -z "$key" ]]; then
         echo "Usage: bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)" >&2
+        exit 1
+    fi
+
+    # Strip surrounding whitespace from the key — parity with the Python
+    # side (bb_ops.vars_set does `key = key.strip()`). Without this, a
+    # copy-paste key like ` AWS_REGION ` would (a) not match the stored
+    # `AWS_REGION` in the find step and (b) POST a duplicate variable
+    # keyed with the stray spaces, breaking the never-duplicate contract
+    # across the two surfaces. Reject a whitespace-only key here too.
+    # Trim leading/trailing whitespace only (matches Python's .strip(),
+    # which does NOT collapse internal whitespace). `extglob` is not
+    # assumed; use two parameter expansions with a [:space:] class.
+    key="${key#"${key%%[![:space:]]*}"}"  # strip leading whitespace
+    key="${key%"${key##*[![:space:]]}"}"  # strip trailing whitespace
+    if [[ -z "$key" ]]; then
+        echo "Error: KEY must be a non-empty, non-whitespace string." >&2
         exit 1
     fi
 
@@ -1575,9 +1604,15 @@ cmd_vars_set() {
             echo "Error: cannot read --value-file '$value_file'." >&2
             exit 1
         fi
-        # Strip a single trailing newline (so `echo secret > f` doesn't
-        # carry the newline into Bitbucket); preserve other whitespace.
-        resolved_value="$(cat "$value_file")"
+        # Strip EXACTLY ONE trailing newline (so `echo secret > f` doesn't
+        # carry the newline into Bitbucket), matching the Python side
+        # (`if resolved_value.endswith("\n"): resolved_value[:-1]`). A
+        # bare `$(cat ...)` strips ALL trailing newlines, which would
+        # diverge from Python for a file ending in a blank line — read
+        # the raw bytes and drop just one '\n' if present.
+        resolved_value="$(cat "$value_file"; printf 'x')"
+        resolved_value="${resolved_value%x}"   # undo the sentinel that protected trailing newlines
+        resolved_value="${resolved_value%$'\n'}"  # strip exactly one trailing newline
     else
         # --value-env: read the named variable. `${!name}` is bash
         # indirect expansion. Guard "set but empty" vs "unset" via the
@@ -1614,8 +1649,14 @@ cmd_vars_set() {
             echo "  creating a duplicate. Check token scope / connectivity." >&2
             exit "$rc"
         fi
+        # Use jq's `first(...)` to emit at most one match rather than
+        # piping into `head -n1`: with duplicate-keyed variables (the
+        # case this find defends against), `jq ... | head -n1` makes head
+        # close the pipe early, jq dies on SIGPIPE, and `pipefail` turns
+        # a routine update into a hard abort. `first` keeps it all in jq.
+        # `// empty` yields "" when there's no match.
         existing_uuid=$(echo "$page" | jq -r --arg k "$key" \
-            '.values[] | select(.key == $k) | .uuid' | head -n1)
+            'first(.values[] | select(.key == $k) | .uuid) // empty')
         if [[ -n "$existing_uuid" ]]; then
             break
         fi
