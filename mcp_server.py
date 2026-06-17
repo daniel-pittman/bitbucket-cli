@@ -1074,6 +1074,60 @@ def repo_show(repo: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
+def repo_create(
+    name: str,
+    workspace: str = "",
+    is_private: bool = True,
+    project: str = "",
+    description: str = "",
+) -> dict[str, Any]:
+    """Create a new Bitbucket repository.
+
+    Args:
+        name: Repo slug to create (e.g. "widget-service").
+        workspace: Workspace slug. Empty = use BB_WORKSPACE from config.
+        is_private: Create as private (default True). Pass False for public.
+        project: Optional Bitbucket project key. A workspace with any
+            projects REQUIRES one; the create 400s without it (the error
+            body names the constraint).
+        description: Optional repository description.
+
+    Returns the created repo record. The clone URL is surfaced as
+    `clone_https` for convenience; the full record is under `info`.
+    """
+    try:
+        client = _get_client()
+        # Mirror repos_list: strip + fall back so " acme" / "acme " don't
+        # build `/repositories/%20acme`; whitespace-only falls back to the
+        # configured workspace.
+        ws = (workspace or "").strip() or client.config.workspace
+        info = bb_ops.repo_create(
+            client,
+            ws,
+            name,
+            is_private=is_private,
+            project_key=_opt_str(project),
+            description=_opt_str(description),
+        )
+        # Pull the https clone URL out of the links for the caller's
+        # convenience (matches what the bash command prints).
+        clone_https = None
+        for link in (info.get("links", {}) or {}).get("clone", []) or []:
+            if link.get("name") == "https":
+                clone_https = link.get("href")
+                break
+        return {
+            "ok": True,
+            "workspace": ws,
+            "repo": name,
+            "clone_https": clone_https,
+            "info": info,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, repo=name)
+
+
+@mcp.tool()
 def branches_list(
     repo: str = "",
     count: int = 50,
@@ -1123,6 +1177,102 @@ def vars_list(repo: str = "", count: int = 100) -> dict[str, Any]:
         return {"ok": True, "workspace": workspace, "repo": repo_slug, "variables": variables}
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict(e)
+
+
+@mcp.tool()
+def vars_set(
+    key: str,
+    repo: str = "",
+    value: str = "",
+    value_file: str = "",
+    value_env: str = "",
+    secured: bool = False,
+) -> dict[str, Any]:
+    """Create or update a repository pipeline variable (create-or-update).
+
+    Provide the value via EXACTLY ONE of `value`, `value_file`, or
+    `value_env`. For SECRET values prefer `value_file` (read from a file
+    on disk) or `value_env` (read from an environment variable) so the
+    secret never appears inline in the tool-call arguments / agent
+    transcript / process list.
+
+    Args:
+        key: Variable name (e.g. "AWS_SECRET").
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        value: Literal value. Use only for NON-secret values.
+        value_file: Path to a file whose contents (trailing newline
+            stripped) become the value. Preferred for secrets.
+        value_env: Name of an environment variable whose value is used.
+            Preferred for secrets.
+        secured: When True, mark the variable secured (Bitbucket masks it
+            and never echoes it back). Default False.
+
+    Secret hygiene: the value is NEVER echoed in the response. The
+    response reports the key, secured flag, and whether the operation
+    created or updated the variable — but masks the value as "***".
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+
+        # Exactly-one-source check. Count the supplied sources so an
+        # ambiguous call (two sources) or an empty call (no source) is
+        # rejected before any value is read or any request is sent.
+        sources = [
+            ("value", value != ""),
+            ("value_file", (value_file or "").strip() != ""),
+            ("value_env", (value_env or "").strip() != ""),
+        ]
+        supplied = [name for name, present in sources if present]
+        if len(supplied) != 1:
+            raise ValueError(
+                "provide exactly one of value / value_file / value_env "
+                f"(got: {supplied or 'none'})"
+            )
+
+        if value != "":
+            resolved_value = value
+        elif (value_file or "").strip():
+            path = value_file.strip()
+            # Read as text; strip a single trailing newline so a value
+            # piped into a file (`echo secret > f`) doesn't carry the
+            # newline into Bitbucket. Other whitespace is preserved (a
+            # value could legitimately contain leading spaces).
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    resolved_value = fh.read()
+            except OSError as e:
+                # Re-raise as OSError (already in _TOOL_EXPECTED_EXCEPTIONS).
+                raise OSError(f"could not read value_file {path!r}: {e}") from e
+            if resolved_value.endswith("\n"):
+                resolved_value = resolved_value[:-1]
+        else:
+            env_name = value_env.strip()
+            if env_name not in os.environ:
+                raise ValueError(
+                    f"value_env {env_name!r} is not set in the environment"
+                )
+            resolved_value = os.environ[env_name]
+
+        existing = bb_ops._find_var_by_key(client, workspace, repo_slug, key.strip())
+        action = "updated" if existing is not None else "created"
+
+        result = bb_ops.vars_set(
+            client, workspace, repo_slug, key, resolved_value,
+            secured=secured, existing=existing,
+        )
+        # NEVER surface the value. Report the key + secured flag + action.
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "key": key.strip(),
+            "secured": bool(secured),
+            "action": action,
+            "value": "***",
+            "uuid": result.get("uuid") if isinstance(result, dict) else None,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, key=key)
 
 
 @mcp.tool()

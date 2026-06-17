@@ -187,8 +187,27 @@ bb pr-comments [repo] <id>            # Show PR comments
 bb branches [repo]                    # List branches
 bb repos                              # List workspace repos
 bb repo [repo]                        # Show repo details
+bb repo-create <name> [opts]          # Create a repo (default PRIVATE)
 bb downloads [repo]                   # List repo downloads
 bb vars [repo]                        # List pipeline variables
+bb vars set [repo] <KEY> [opts]       # Create or update a pipeline variable
+```
+
+`bb repo-create` defaults to a **private** repo so a forgotten flag never publishes one. Flags: `--public` / `--private`, `--project KEY` (required on workspaces that use projects), `--description TEXT`.
+
+```bash
+bb repo-create widget-service                          # private, default project
+bb repo-create widget-service --project WID            # private, in project WID
+bb repo-create docs-site --public --description "Docs" # public
+```
+
+`bb vars set` creates the variable if its key is new, or updates the existing one. Provide the value via **exactly one** of `--value`, `--value-file`, or `--value-env`. For secrets prefer `--value-file` or `--value-env` so the secret never appears in `argv` / the process list / shell history, and pass `--secured` so Bitbucket masks it. The command never echoes a value back.
+
+```bash
+bb vars set widget-service AWS_REGION --value us-east-1            # non-secret
+bb vars set widget-service S3_BUCKET_NAME --value my-bucket
+bb vars set widget-service AWS_SECRET --secured --value-file ./secret.txt
+bb vars set widget-service AWS_KEY --secured --value-env AWS_KEY   # read from env
 ```
 
 ### Utilities
@@ -236,7 +255,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 
 ### What it exposes
 
-31 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
+33 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
 
 | Category | Tools |
 |---|---|
@@ -245,7 +264,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
 | Workspaces | `workspaces_list` (needs `read:workspace:bitbucket` scope — see [Required Bitbucket Permissions](#required-bitbucket-permissions)) |
-| Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
+| Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
 | Meta | `whoami` (see note below) |
 

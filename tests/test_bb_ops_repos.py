@@ -325,6 +325,207 @@ class TestRepoShow:
 
 
 # ===========================================================================
+# repo_create
+# ===========================================================================
+
+
+class TestRepoCreate:
+    def test_posts_to_repo_path_with_default_private_git(self) -> None:
+        opener = _CaptureOpener(
+            [{"full_name": "acme/widget-service", "is_private": True}]
+        )
+        result = bb_ops.repo_create(
+            _client(opener), "acme", "widget-service"
+        )
+        assert result["full_name"] == "acme/widget-service"
+        call = opener.calls[0]
+        # POST to the SAME path repo_show GETs.
+        assert call["url"] == _repo_url()
+        assert call["method"] == "POST"
+        # Default body: scm git, private true, no project / description.
+        assert call["body"] == {"scm": "git", "is_private": True}
+
+    def test_public_flag(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener), "acme", "widget-service", is_private=False
+        )
+        assert opener.calls[0]["body"]["is_private"] is False
+
+    def test_project_key_in_body(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener), "acme", "widget-service", project_key="WID"
+        )
+        assert opener.calls[0]["body"]["project"] == {"key": "WID"}
+
+    def test_description_in_body(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener),
+            "acme",
+            "widget-service",
+            description="A service for widgets",
+        )
+        assert opener.calls[0]["body"]["description"] == "A service for widgets"
+
+    def test_omits_project_and_description_when_none(self) -> None:
+        # Parity with the bash omit-when-empty body. The keys must be
+        # ABSENT, not present-with-null — Bitbucket treats a null project
+        # differently from a missing one.
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(_client(opener), "acme", "widget-service")
+        body = opener.calls[0]["body"]
+        assert "project" not in body
+        assert "description" not in body
+
+    def test_project_strips_whitespace(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener), "acme", "widget-service", project_key="  WID  "
+        )
+        assert opener.calls[0]["body"]["project"] == {"key": "WID"}
+
+    @pytest.mark.parametrize("bad_slug", ["", "   ", "a/b", ".", ".."])
+    def test_rejects_bad_slug_no_network(self, bad_slug: str) -> None:
+        # repo_path enforces the slug contract at the boundary; no POST
+        # may fire on a malformed slug.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.repo_create(_client(opener), "acme", bad_slug)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_project", ["", "   "])
+    def test_rejects_empty_project_when_provided(self, bad_project: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="project_key"):
+            bb_ops.repo_create(
+                _client(opener), "acme", "widget-service", project_key=bad_project
+            )
+        assert opener.calls == []
+
+
+# ===========================================================================
+# vars_set (create-or-update)
+# ===========================================================================
+
+
+def _vars_url() -> str:
+    return _repo_url() + "/pipelines_config/variables/"
+
+
+class TestVarsSet:
+    def test_creates_when_not_found_posts(self) -> None:
+        # First call: list (empty) → not found. Second call: POST create.
+        opener = _CaptureOpener(
+            [
+                {"values": []},
+                {"key": "AWS_REGION", "uuid": "{new-uuid}", "value": "us-east-1"},
+            ]
+        )
+        result = bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "AWS_REGION", "us-east-1"
+        )
+        assert result["key"] == "AWS_REGION"
+        # Lookup is a GET to the variables list.
+        assert opener.calls[0]["method"] == "GET"
+        assert opener.calls[0]["url"].startswith(_vars_url() + "?")
+        # Create is a POST to the collection (trailing slash, no uuid).
+        create = opener.calls[1]
+        assert create["method"] == "POST"
+        assert create["url"] == _vars_url()
+        assert create["body"] == {
+            "key": "AWS_REGION",
+            "value": "us-east-1",
+            "secured": False,
+        }
+
+    def test_updates_when_found_puts_to_uuid(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"key": "AWS_REGION", "uuid": "{abc-123}"}]},
+                {"key": "AWS_REGION", "uuid": "{abc-123}", "value": "us-west-2"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "AWS_REGION", "us-west-2"
+        )
+        update = opener.calls[1]
+        assert update["method"] == "PUT"
+        # uuid is URL-encoded into the path; braces become %7B / %7D.
+        assert update["url"] == _vars_url() + "%7Babc-123%7D"
+        assert update["body"]["value"] == "us-west-2"
+
+    def test_secured_flag_in_body(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": []}, {"key": "AWS_SECRET", "uuid": "{u}", "value": None}]
+        )
+        bb_ops.vars_set(
+            _client(opener),
+            "acme",
+            "widget-service",
+            "AWS_SECRET",
+            "super-secret",
+            secured=True,
+        )
+        assert opener.calls[1]["body"]["secured"] is True
+
+    def test_existing_passed_in_skips_lookup(self) -> None:
+        # When the caller pre-fetches the existing var, vars_set must NOT
+        # paginate the list again — only the PUT fires.
+        opener = _CaptureOpener(
+            [{"key": "AWS_REGION", "uuid": "{abc-123}", "value": "us-west-2"}]
+        )
+        bb_ops.vars_set(
+            _client(opener),
+            "acme",
+            "widget-service",
+            "AWS_REGION",
+            "us-west-2",
+            existing={"key": "AWS_REGION", "uuid": "{abc-123}"},
+        )
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "PUT"
+
+    def test_find_walks_all_pages_before_create(self) -> None:
+        # The match is on page 2. vars_set must follow `next` and find it
+        # (PUT), not stop at page 1 and POST a duplicate.
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [{"key": "OTHER", "uuid": "{x}"}],
+                    "next": _vars_url() + "?page=2",
+                },
+                {"values": [{"key": "TARGET", "uuid": "{target-uuid}"}]},
+                {"key": "TARGET", "uuid": "{target-uuid}"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "TARGET", "v"
+        )
+        # 2 GETs (page 1 + page 2) then a PUT.
+        assert [c["method"] for c in opener.calls] == ["GET", "GET", "PUT"]
+        assert opener.calls[2]["url"] == _vars_url() + "%7Btarget-uuid%7D"
+
+    @pytest.mark.parametrize("bad_key", ["", "   ", "\n"])
+    def test_rejects_empty_key_no_network(self, bad_key: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="key"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", bad_key, "v"
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_string_value_no_network(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="value"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "KEY", 123  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+
+# ===========================================================================
 # branches_list + branch_show
 # ===========================================================================
 

@@ -103,9 +103,11 @@ EXPECTED_TOOLS = {
     # Repos / branches / metadata
     "repos_list",
     "repo_show",
+    "repo_create",
     "branches_list",
     "branch_show",
     "vars_list",
+    "vars_set",
     "downloads_list",
     "commits_list",
     # Git context
@@ -132,9 +134,9 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 31 = 6 pipelines
-    + 11 PRs + 1 workspaces + 7 repos/metadata + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 31
+    regression that drops a registration is visible. 33 = 6 pipelines
+    + 11 PRs + 1 workspaces + 9 repos/metadata + 5 git context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 33
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +759,137 @@ class TestRepoTools:
         with patch.object(bb_ops, "repos_list", recorder):
             mcp_server.repos_list(workspace="   ")
         assert recorder.calls[0][1]["workspace"] == "acme"  # from config
+
+    def test_repo_create_passes_args_and_surfaces_clone_url(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        info = {
+            "full_name": "acme/widget-service",
+            "links": {
+                "clone": [
+                    {"name": "https", "href": "https://x@bitbucket.org/acme/widget-service.git"},
+                    {"name": "ssh", "href": "git@bitbucket.org:acme/widget-service.git"},
+                ]
+            },
+        }
+        recorder = _recorder(info)
+        with patch.object(bb_ops, "repo_create", recorder):
+            out = mcp_server.repo_create(
+                name="widget-service", project="WID", description="desc"
+            )
+        # workspace defaults to config ("acme"), slug is the name.
+        args, kwargs = recorder.calls[0]
+        assert args[1] == "acme"
+        assert args[2] == "widget-service"
+        assert kwargs["is_private"] is True
+        assert kwargs["project_key"] == "WID"
+        assert kwargs["description"] == "desc"
+        # The https clone URL is surfaced.
+        assert out["ok"] is True
+        assert out["clone_https"] == "https://x@bitbucket.org/acme/widget-service.git"
+
+    def test_repo_create_explicit_workspace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"full_name": "other/repo", "links": {"clone": []}})
+        with patch.object(bb_ops, "repo_create", recorder):
+            mcp_server.repo_create(name="repo", workspace="other")
+        assert recorder.calls[0][0][1] == "other"
+
+    def test_repo_create_public_passes_false(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"links": {"clone": []}})
+        with patch.object(bb_ops, "repo_create", recorder):
+            mcp_server.repo_create(name="repo", is_private=False)
+        assert recorder.calls[0][1]["is_private"] is False
+
+    def test_vars_set_value_inline_creates(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        find = _recorder(None)  # not found → "created"
+        setter = _recorder({"key": "AWS_REGION", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="AWS_REGION", repo="my-repo", value="us-east-1"
+            )
+        # The resolved value is passed positionally to vars_set.
+        args, kwargs = setter.calls[0]
+        assert args[3] == "AWS_REGION"
+        assert args[4] == "us-east-1"
+        assert kwargs["secured"] is False
+        # Action reported as created; value NEVER echoed.
+        assert out["action"] == "created"
+        assert out["value"] == "***"
+        assert out["secured"] is False
+
+    def test_vars_set_existing_reports_updated(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        find = _recorder({"key": "AWS_REGION", "uuid": "{u}"})  # found
+        setter = _recorder({"key": "AWS_REGION", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="AWS_REGION", repo="my-repo", value="us-west-2"
+            )
+        assert out["action"] == "updated"
+        # The pre-fetched existing dict is threaded through to skip a
+        # second lookup.
+        assert setter.calls[0][1]["existing"] == {"key": "AWS_REGION", "uuid": "{u}"}
+
+    def test_vars_set_value_file(
+        self, stub_client: bb_api.BBClient, tmp_path: Any
+    ) -> None:
+        f = tmp_path / "secret.txt"
+        f.write_text("file-value\n")  # trailing newline must be stripped
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(
+                key="K", repo="my-repo", value_file=str(f), secured=True
+            )
+        assert setter.calls[0][0][4] == "file-value"
+        assert setter.calls[0][1]["secured"] is True
+
+    def test_vars_set_value_env(
+        self, stub_client: bb_api.BBClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MY_SECRET_VAR", "env-value")
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(key="K", repo="my-repo", value_env="MY_SECRET_VAR")
+        assert setter.calls[0][0][4] == "env-value"
+
+    def test_vars_set_rejects_two_sources(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value="a", value_env="X"
+        )
+        assert out["ok"] is False
+        assert "exactly one" in out["message"]
+
+    def test_vars_set_rejects_no_source(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_set(key="K", repo="my-repo")
+        assert out["ok"] is False
+        assert "exactly one" in out["message"]
+
+    def test_vars_set_missing_env_var_errors(
+        self, stub_client: bb_api.BBClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ABSENT_VAR", raising=False)
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value_env="ABSENT_VAR"
+        )
+        assert out["ok"] is False
+        assert "ABSENT_VAR" in out["message"]
 
     def test_branch_show_passes_name(self, stub_client: bb_api.BBClient) -> None:
         recorder = _recorder({"name": "feat/widget"})

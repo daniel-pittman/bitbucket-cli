@@ -1353,6 +1353,92 @@ cmd_repo() {
     '
 }
 
+cmd_repo_create() {
+    # bb repo-create <name> [--private] [--public] [--project KEY] [--description TEXT]
+    #
+    # Creates a new repo via POST to /repositories/{ws}/{slug} — the same
+    # path `bb repo` GETs. The slug is in the URL; the body carries the
+    # settings. Workspace resolves from -w / BB_WORKSPACE / git origin.
+    #
+    # Default is PRIVATE so a forgotten flag never publishes a repo by
+    # accident. --public flips it; --private is accepted as an explicit
+    # no-op for callers who want to be explicit.
+    local name="" is_private="true" project="" description=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --private)        is_private="true"; shift ;;
+            --public)         is_private="false"; shift ;;
+            --project)        project="$2"; shift 2 ;;
+            --project=*)      project="${1#*=}"; shift ;;
+            --description)    description="$2"; shift 2 ;;
+            --description=*)  description="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for repo-create: $1" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Usage: bb repo-create <name> [--private|--public] [--project KEY] [--description TEXT]" >&2
+        echo "" >&2
+        echo "  Creates a repo in the resolved workspace (default: PRIVATE)." >&2
+        echo "  Workspace resolves from -w / BB_WORKSPACE / git origin." >&2
+        exit 1
+    fi
+
+    # Resolve the workspace (this command takes a bare name, not a
+    # repo arg, so use the workspace resolver). The slug is `name`.
+    resolve_workspace
+
+    # repo_path validates both the workspace and the slug at the boundary
+    # (empty / whitespace / embedded '/' / '.' / '..') — same contract as
+    # every other repo command. It also builds the POST path.
+    local path
+    path=$(repo_path "$name")
+
+    # Build the JSON body with jq so values are escaped. Always send scm
+    # and is_private; add project / description only when supplied so the
+    # body matches the Python omit-when-empty contract (bb_ops.repo_create).
+    local payload
+    payload=$(jq -n \
+        --argjson priv "$is_private" \
+        '{scm: "git", is_private: $priv}')
+    if [[ -n "$project" ]]; then
+        payload=$(echo "$payload" | jq --arg k "$project" '. + {project: {key: $k}}')
+    fi
+    if [[ -n "$description" ]]; then
+        payload=$(echo "$payload" | jq --arg d "$description" '. + {description: $d}')
+    fi
+
+    echo "Creating repository ${BB_WORKSPACE}/${name} (private: ${is_private})..."
+
+    local response rc=0
+    response=$(bb_post "$path" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Repo-create request failed (exit $rc)." >&2
+        echo "  Common causes: a repo with this slug already exists, the" >&2
+        echo "  workspace requires a --project KEY, or the token lacks" >&2
+        echo "  repository:admin scope." >&2
+        exit "$rc"
+    fi
+
+    local full_name clone_https
+    full_name=$(echo "$response" | jq -r '.full_name // "(unknown)"')
+    clone_https=$(echo "$response" | jq -r '[.links.clone[]? | select(.name == "https") | .href] | first // "n/a"')
+
+    echo "Created ${full_name}"
+    echo "  Clone (HTTPS): ${clone_https}"
+}
+
 # =========================================================================
 #  DOWNLOADS (deployment artifacts)
 # =========================================================================
@@ -1417,6 +1503,167 @@ cmd_vars() {
     ' | while IFS=$'\t' read -r key secured value; do
         printf "  %-30s %-8s %s\n" "$key" "$secured" "$value"
     done
+}
+
+cmd_vars_set() {
+    # bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)
+    #
+    # Create-or-update a repository pipeline variable. The value is read
+    # from a literal flag, a file, or an environment variable. For SECRET
+    # values prefer --value-file or --value-env so the secret never lands
+    # in argv / the process list / shell history. A secured value is
+    # NEVER echoed back by this command.
+    #
+    # `set` is consumed by the dispatcher before this function is called;
+    # the remaining args are [repo] KEY and the flags. The first non-flag
+    # positional may be a repo (slug or ws/slug); KEY is the positional
+    # that follows. To disambiguate, we collect positionals: 1 → it's the
+    # KEY (repo auto-detected); 2 → first is repo, second is KEY.
+    local secured="false"
+    local value_set="" value="" value_file="" value_env=""
+    local positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --secured)        secured="true"; shift ;;
+            --value)          value="$2"; value_set="1"; shift 2 ;;
+            --value=*)        value="${1#*=}"; value_set="1"; shift ;;
+            --value-file)     value_file="$2"; shift 2 ;;
+            --value-file=*)   value_file="${1#*=}"; shift ;;
+            --value-env)      value_env="$2"; shift 2 ;;
+            --value-env=*)    value_env="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for vars set: $1" >&2
+                exit 1 ;;
+            *)
+                positionals+=("$1"); shift ;;
+        esac
+    done
+
+    local repo_arg="" key=""
+    case "${#positionals[@]}" in
+        1) key="${positionals[0]}" ;;
+        2) repo_arg="${positionals[0]}"; key="${positionals[1]}" ;;
+        *)
+            echo "Usage: bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)" >&2
+            exit 1 ;;
+    esac
+
+    if [[ -z "$key" ]]; then
+        echo "Usage: bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)" >&2
+        exit 1
+    fi
+
+    # Exactly one value source. Count the supplied sources so an
+    # ambiguous (two) or empty (none) call is rejected before any value
+    # is read or any request is sent.
+    local source_count=0
+    [[ -n "$value_set" ]] && source_count=$((source_count + 1))
+    [[ -n "$value_file" ]] && source_count=$((source_count + 1))
+    [[ -n "$value_env" ]] && source_count=$((source_count + 1))
+    if [[ "$source_count" -ne 1 ]]; then
+        echo "Error: provide exactly one of --value, --value-file, or --value-env." >&2
+        exit 1
+    fi
+
+    # Resolve the value WITHOUT echoing it.
+    local resolved_value=""
+    if [[ -n "$value_set" ]]; then
+        resolved_value="$value"
+    elif [[ -n "$value_file" ]]; then
+        if [[ ! -r "$value_file" ]]; then
+            echo "Error: cannot read --value-file '$value_file'." >&2
+            exit 1
+        fi
+        # Strip a single trailing newline (so `echo secret > f` doesn't
+        # carry the newline into Bitbucket); preserve other whitespace.
+        resolved_value="$(cat "$value_file")"
+    else
+        # --value-env: read the named variable. `${!name}` is bash
+        # indirect expansion. Guard "set but empty" vs "unset" via the
+        # ${var+x} test so an unset var is a clear error, not a silent
+        # empty value.
+        if [[ -z "${!value_env+x}" ]]; then
+            echo "Error: --value-env '$value_env' is not set in the environment." >&2
+            exit 1
+        fi
+        resolved_value="${!value_env}"
+    fi
+
+    local repo
+    resolve_repo "$repo_arg"
+    local base
+    base="$(repo_path "$repo")/pipelines_config/variables/"
+
+    # Find an existing variable by key (walk all pages). Bitbucket allows
+    # duplicate keys via the API, so a POST when a PUT was needed creates
+    # a second variable with the same key — find-first prevents that.
+    local existing_uuid="" page_url="${base}?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        # Declare and assign on separate lines: a `local page=$(...)`
+        # one-liner masks the command substitution's exit status behind
+        # the `local` builtin's own (always 0), so a failed lookup GET
+        # would slip past `set -e` and leave `page` empty — which the jq
+        # below reads as "key not found", then we'd POST a duplicate. The
+        # rc-capture surfaces the auth/network failure instead.
+        local page rc=0
+        page=$(bb_get "$page_url") || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            echo "vars-set lookup failed (exit $rc) while checking for an" >&2
+            echo "  existing '${key}'. Aborting before any write to avoid" >&2
+            echo "  creating a duplicate. Check token scope / connectivity." >&2
+            exit "$rc"
+        fi
+        existing_uuid=$(echo "$page" | jq -r --arg k "$key" \
+            '.values[] | select(.key == $k) | .uuid' | head -n1)
+        if [[ -n "$existing_uuid" ]]; then
+            break
+        fi
+        # Follow the `next` link if present. bb_get takes a path, but the
+        # API's `next` is a full URL; strip the API base to re-derive the
+        # path. If there's no next link, stop.
+        local next
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
+
+    # Build the body with jq so the value is JSON-escaped regardless of
+    # content. --arg keeps it a string; never interpolated into a shell
+    # word, so a value with quotes / newlines / shell metacharacters is
+    # safe and never appears in a command line.
+    local payload
+    payload=$(jq -n \
+        --arg key "$key" \
+        --arg value "$resolved_value" \
+        --argjson secured "$secured" \
+        '{key: $key, value: $value, secured: $secured}')
+
+    local action response rc=0
+    if [[ -n "$existing_uuid" ]]; then
+        action="Updated"
+        # The uuid comes back brace-wrapped (`{...}`); URL-encode it for
+        # the path segment so the braces don't break the URL.
+        local encoded_uuid
+        encoded_uuid=$(_url_encode_segment "$existing_uuid")
+        response=$(bb_put "${base}${encoded_uuid}" "$payload") || rc=$?
+    else
+        action="Created"
+        response=$(bb_post "$base" "$payload") || rc=$?
+    fi
+
+    if [[ "$rc" -ne 0 ]]; then
+        echo "vars-set request failed (exit $rc)." >&2
+        echo "  Common causes: token lacks pipeline:write / repository:admin" >&2
+        echo "  scope, or the repo has no pipelines configuration yet." >&2
+        exit "$rc"
+    fi
+
+    # NEVER echo the value. Report key + secured flag + action only.
+    echo "${action} variable ${key} on ${BB_WORKSPACE}/${repo} (secured: ${secured})"
 }
 
 # =========================================================================
@@ -1557,8 +1804,15 @@ REPOSITORY
   bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
+  bb repo-create <name> [opts]          Create a repo (default PRIVATE)
+                                          opts: --public | --private,
+                                          --project KEY, --description TEXT
   bb downloads [repo]                   List repo downloads
   bb vars [repo]                        List pipeline variables
+  bb vars set [repo] <KEY> [opts]       Create or update a pipeline variable
+                                          opts: --secured, and exactly one of
+                                          --value V | --value-file F | --value-env E
+                                          (use --value-file/--value-env for secrets)
 
 UTILITIES
   bb whoami                             Show resolved config + git context
@@ -1652,8 +1906,18 @@ case "$command" in
     workspaces|ws)        cmd_workspaces "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
+    repo-create|rc)       cmd_repo_create "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;
-    vars)                 cmd_vars "$@" ;;
+    vars)
+        # `vars set ...` is the create-or-update subcommand; bare `vars`
+        # (or `vars <repo>`) lists. Peek at the first arg to route.
+        if [[ "${1:-}" == "set" ]]; then
+            shift
+            cmd_vars_set "$@"
+        else
+            cmd_vars "$@"
+        fi
+        ;;
     # Utilities
     whoami)               cmd_whoami ;;
     open|o)               cmd_open "$@" ;;

@@ -833,6 +833,55 @@ def repo_show(
     return client.get(repo_path(workspace, repo))
 
 
+def repo_create(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    is_private: bool = True,
+    project_key: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Create a new repository via POST /repositories/{workspace}/{repo}.
+
+    Bitbucket's create endpoint is a POST to the SAME path repo_show GETs;
+    the repo slug is in the URL and the body carries the settings. The
+    `scm` field is always "git" (Bitbucket Cloud dropped Mercurial), and
+    `is_private` defaults to true so a forgotten flag never publishes a
+    repo by accident.
+
+    `project_key` maps to the body's `{"project": {"key": ...}}`. A
+    workspace that has any projects REQUIRES one; Bitbucket 400s a
+    create with no project on such a workspace, so the caller surfaces
+    the error rather than this function inventing a default.
+
+    Returns the created repo record (includes slug, full_name, links —
+    the clone URLs are under `.links.clone`).
+    """
+    # repo_path validates workspace + slug at the boundary (empty,
+    # whitespace, embedded '/', '.', '..') — reuse it so create enforces
+    # the exact same slug contract as every other repo op.
+    path = repo_path(workspace, repo)
+
+    payload: dict[str, Any] = {"scm": "git", "is_private": bool(is_private)}
+    if project_key is not None:
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError(
+                f"project_key must be a non-empty, non-whitespace string when "
+                f"provided, got {project_key!r}"
+            )
+        payload["project"] = {"key": project_key.strip()}
+    if description is not None:
+        if not isinstance(description, str):
+            raise ValueError(
+                f"description must be a string when provided, got "
+                f"{type(description).__name__}"
+            )
+        payload["description"] = description
+
+    return client.post(path, json_body=payload)
+
+
 # --- Branches ---
 
 
@@ -922,6 +971,94 @@ def vars_list(
         if len(out) >= count:
             break
     return out
+
+
+def _find_var_by_key(
+    client: BBClient, workspace: str, repo: str, key: str
+) -> dict[str, Any] | None:
+    """Return the existing pipeline variable dict whose `key` matches, or
+    None if no variable with that key exists.
+
+    Walks the full variable list (no count cap) so a create-or-update
+    never mistakes "not on page 1" for "doesn't exist" and POSTs a
+    duplicate. Bitbucket allows duplicate keys via the API, so an
+    accidental POST-when-PUT-was-needed creates a second variable with
+    the same key — the exact bug this lookup prevents.
+    """
+    base = f"{repo_path(workspace, repo)}/pipelines_config/variables/"
+    for v in client.paginate(base, query={"pagelen": _BITBUCKET_MAX_PAGELEN}):
+        if v.get("key") == key:
+            return v
+    return None
+
+
+def vars_set(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    key: str,
+    value: str,
+    *,
+    secured: bool = False,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create or update a repository pipeline variable.
+
+    Finds an existing variable by `key`. If present, PUTs to
+    `.../variables/{uuid}` (update); otherwise POSTs to
+    `.../variables/` (create). Body is `{"key", "value", "secured"}`.
+
+    Secret hygiene: this function NEVER logs or echoes `value`. Bitbucket
+    does not echo a secured variable's value back on write either (the
+    response `value` is null when `secured` is true), so the returned
+    dict is safe to surface — but callers must still mask the value they
+    PASSED IN. The bash/MCP layers read the value from a file or env var
+    so it never lands in argv, and they mask it in any output.
+
+    Returns the created/updated variable record. For a secured variable
+    Bitbucket returns `{"key", "uuid", "secured": true, "value": null}` —
+    the absence of the value is by design, not an error.
+
+    `existing` lets a caller that already looked the variable up (e.g.
+    to report "created" vs "updated") pass the lookup result in so the
+    full variable list isn't paginated twice. Pass `None` (the default)
+    to look it up here.
+    """
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(
+            f"key must be a non-empty, non-whitespace string, got {key!r}"
+        )
+    if not isinstance(value, str):
+        raise ValueError(
+            f"value must be a string, got {type(value).__name__}"
+        )
+    key = key.strip()
+
+    base = f"{repo_path(workspace, repo)}/pipelines_config/variables/"
+    payload: dict[str, Any] = {
+        "key": key,
+        "value": value,
+        "secured": bool(secured),
+    }
+
+    if existing is None:
+        existing = _find_var_by_key(client, workspace, repo, key)
+    if existing is not None:
+        uuid = existing.get("uuid")
+        if not uuid:
+            # An existing entry with no uuid can't be addressed for PUT.
+            # Raise rather than fall through to POST (which would create
+            # a duplicate-keyed variable).
+            raise BBOpNotFound(
+                f"variable {key!r} found but has no uuid; cannot update"
+            )
+        # uuid comes back from the API already brace-wrapped (`{...}`);
+        # it must be URL-encoded for the path segment so the braces don't
+        # break the URL.
+        encoded_uuid = quote(uuid, safe="")
+        return client.put(f"{base}{encoded_uuid}", json_body=payload)
+
+    return client.post(base, json_body=payload)
 
 
 # --- Downloads (release artifacts) ---

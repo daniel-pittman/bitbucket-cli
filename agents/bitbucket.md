@@ -71,10 +71,12 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 
 - `repos_list(workspace?, count?, sort?, query?)` — workspace repos. `query` is a Bitbucket BBQL filter (e.g. `'name ~ "widget"'`).
 - `repo_show(repo?)` — single-repo metadata.
+- `repo_create(name, workspace?, is_private?, project?, description?)` — create a new repo. Defaults to `is_private=True` (a forgotten flag never publishes a repo). `project` is the Bitbucket project key (required on workspaces that use projects). Returns the record plus a convenience `clone_https`.
 - `branches_list(repo?, count?, sort?, query?)` — branches, default sort is most-recently-updated first.
 - `branch_show(name, repo?)` — single branch detail; URL-encodes slashes in the name.
 - `commits_list(repo?, branch?, count?)` — recent commits. With `branch` omitted (or `""`), lists across all branches; with a branch name, lists commits reachable from that branch.
 - `vars_list(repo?, count?)` — pipeline configuration variables (with `secured` flag).
+- `vars_set(key, repo?, value?, value_file?, value_env?, secured?)` — create-or-update a pipeline variable. Looks the key up first (walks all pages), then PUTs the existing UUID or POSTs a new one. Provide the value via EXACTLY ONE of `value` / `value_file` / `value_env`; for secrets prefer `value_file` or `value_env` so the secret never lands in the tool-call arguments / transcript / process list. Set `secured=True` to mask it Bitbucket-side. The response NEVER echoes the value (masked as `***`) and reports `action` (`created`/`updated`).
 - `downloads_list(repo?, count?)` — repository download artifacts.
 
 ### Git context (subprocess wrappers)
