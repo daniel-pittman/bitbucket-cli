@@ -376,9 +376,16 @@ class TestPipelineTrigger:
         call = opener.calls[0]
         assert call["method"] == "POST"
         assert call["url"] == _pipelines_url()
-        # Default pipeline: no `selector`, no `variables` key.
+        # Default pipeline: no `selector`, no `variables` key. The target
+        # MUST carry type="pipeline_ref_target" — without it Bitbucket 400s
+        # with "Unsupported reference target provided
+        # 'pipeline_unknown_target'" (verified live).
         assert call["body"] == {
-            "target": {"ref_name": "feat/widget", "ref_type": "branch"}
+            "target": {
+                "type": "pipeline_ref_target",
+                "ref_type": "branch",
+                "ref_name": "feat/widget",
+            }
         }
 
     def test_custom_pipeline_payload_shape(self) -> None:
@@ -390,13 +397,30 @@ class TestPipelineTrigger:
             branch="main",
             pattern="deploy-prod",
         )
+        # The custom-pattern path is the one that was broken: the target
+        # needs BOTH type="pipeline_ref_target" AND the custom selector.
         assert opener.calls[0]["body"] == {
             "target": {
-                "ref_name": "main",
+                "type": "pipeline_ref_target",
                 "ref_type": "branch",
+                "ref_name": "main",
                 "selector": {"type": "custom", "pattern": "deploy-prod"},
             }
         }
+
+    def test_target_type_present_in_both_default_and_custom(self) -> None:
+        # Explicit regression guard for the "Unsupported reference target"
+        # 400: every trigger payload's target carries the
+        # pipeline_ref_target type, with or without a custom pattern.
+        for pattern in (None, "deploy-prod"):
+            opener = _CaptureOpener([_make_pipeline(1)])
+            bb_ops.pipeline_trigger(
+                _client(opener), "acme", "widget-service",
+                branch="main", pattern=pattern,
+            )
+            assert (
+                opener.calls[0]["body"]["target"]["type"] == "pipeline_ref_target"
+            )
 
     def test_variables_dict_payload_shape(self) -> None:
         opener = _CaptureOpener([_make_pipeline(101)])
