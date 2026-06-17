@@ -778,14 +778,31 @@ cmd_pipelines_status() {
     local repo
     resolve_repo "${1:-}"
 
-    local response rc=0
-    response=$(bb_get "$(repo_path "$repo")/pipelines_config") || rc=$?
+    local path response rc=0
+    path="$(repo_path "$repo")/pipelines_config"
+    response=$(bb_get "$path") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        # curl -f exits 22 on HTTP >=400. A 404 here is the normal
-        # "never configured" state, not an error — report it as disabled.
+        # curl -f (bb_get) exits 22 on ANY HTTP >=400, so rc=22 alone
+        # cannot tell a 404 ("never configured" — the normal pre-enable
+        # state) from a 403 (token lacks read:pipeline:bitbucket) or a
+        # 500. The Python side (bb_ops.pipelines_config_show) only
+        # translates a 404 and re-raises everything else; mirror that here
+        # by re-probing for the exact status code. Reporting a 403 as
+        # "disabled" would send a user debugging "why won't my variables
+        # take?" after the wrong fix.
         if [[ "$rc" -eq 22 ]]; then
-            echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
-            return
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+                -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}")
+            if [[ "$code" == "404" ]]; then
+                echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
+                return
+            fi
+            echo "Could not read pipelines config (HTTP ${code})." >&2
+            if [[ "$code" == "403" ]]; then
+                echo "  The token lacks read:pipeline:bitbucket scope." >&2
+            fi
+            exit 22
         fi
         echo "Could not read pipelines config (exit $rc)." >&2
         exit "$rc"
@@ -1792,21 +1809,40 @@ cmd_environments() {
     echo "Deployment environments for ${BB_WORKSPACE}/${repo}:"
     echo ""
 
-    local response
-    response=$(bb_get "$(repo_path "$repo")/environments/?pagelen=100")
+    # Walk ALL pages, not just the first. The Python side
+    # (bb_ops.environments_list) paginates via client.paginate, and the
+    # sibling _resolve_env_uuid walks every page too — a single-page read
+    # here would be a parity divergence (an environment past page 1 would
+    # be invisible via bash but listed via the MCP tool). Accumulate rows
+    # across pages, then render once so the header prints only when there's
+    # at least one environment.
+    local page_url rows="" any=""
+    page_url="$(repo_path "$repo")/environments/?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        local page page_rows next
+        page=$(bb_get "$page_url")
+        page_rows=$(echo "$page" | jq -r '
+            .values[] | [.name, (.environment_type.name // "-")] | @tsv')
+        if [[ -n "$page_rows" ]]; then
+            any=1
+            rows="${rows}${rows:+$'\n'}${page_rows}"
+        fi
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
 
-    local count
-    count=$(echo "$response" | jq '.size // (.values | length) // 0')
-    if [[ "$count" == "0" ]]; then
+    if [[ -z "$any" ]]; then
         echo "  No environments."
         return
     fi
 
     printf "  %-25s %s\n" "NAME" "TYPE"
     printf "  %-25s %s\n" "----" "----"
-    echo "$response" | jq -r '
-        .values[] | [.name, (.environment_type.name // "-")] | @tsv
-    ' | while IFS=$'\t' read -r name type; do
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r name type; do
         printf "  %-25s %s\n" "$name" "$type"
     done
 }
