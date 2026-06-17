@@ -137,8 +137,12 @@ Your Bitbucket account needs these workspace permissions:
 | Trigger/stop pipelines | **Read + Write** access to Pipelines (`read:pipeline:bitbucket`, `write:pipeline:bitbucket`) |
 | Create/approve/merge PRs | **Read + Write** access to Pull Requests (`read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`) |
 | List workspaces (`bb workspaces`) | `read:workspace:bitbucket` (new in v1.2.0 — Atlassian API token scope, opt-in when creating the token) |
+| Create a repository (`bb repo-create`) | **Admin** access to repositories (`admin:repository:bitbucket`). `write:repository:bitbucket` alone is not sufficient. |
+| Set pipeline variables (`bb vars set`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. |
 
 Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too — provided the token carries the scope. The cross-workspace listing endpoints (`/2.0/workspaces`, `/2.0/repositories?role=member`) were removed under Atlassian's [CHANGE-2770](https://developer.atlassian.com/cloud/bitbucket/changelog/) on 2026-04-14; `bb workspaces` uses the replacement `/2.0/user/workspaces` endpoint (CHANGE-3022) which requires the `read:workspace:bitbucket` scope. Rotating the token to add it leaves existing tokens unchanged.
+
+The `bb repo-create` and `bb vars set` admin scopes are the most common to be missing, because most day-to-day tokens are scoped read + write only. A token's scopes are fixed at creation: adding a scope does not apply to an already-issued token. To use these two commands you must create a new token (or rotate the existing one) with the admin scope included. A token without the scope returns a 403 whose body names the exact missing scope under `error.detail.required`, so the failure is self-diagnosing.
 
 ### Environment Variables
 
@@ -201,6 +205,8 @@ bb repo-create widget-service --project WID            # private, in project WID
 bb repo-create docs-site --public --description "Docs" # public
 ```
 
+This needs `admin:repository:bitbucket` scope on the token. A read/write-only token must be rotated to add it (adding a scope does not apply to an already-issued token). See [Required Bitbucket Permissions](#required-bitbucket-permissions).
+
 `bb vars set` creates the variable if its key is new, or updates the existing one. Provide the value via **exactly one** of `--value`, `--value-file`, or `--value-env`. For secrets prefer `--value-file` or `--value-env` so the secret never appears in `argv` / the process list / shell history, and pass `--secured` so Bitbucket masks it. The command never echoes a value back.
 
 ```bash
@@ -209,6 +215,8 @@ bb vars set widget-service S3_BUCKET_NAME --value my-bucket
 bb vars set widget-service AWS_SECRET --secured --value-file ./secret.txt
 bb vars set widget-service AWS_KEY --secured --value-env AWS_KEY   # read from env
 ```
+
+This needs `admin:pipeline:bitbucket` scope on the token (`write:pipeline:bitbucket` alone is not enough). A read/write-only token must be rotated to add it. See [Required Bitbucket Permissions](#required-bitbucket-permissions).
 
 ### Utilities
 
