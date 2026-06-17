@@ -766,6 +766,52 @@ def workspaces_list(
     return out
 
 
+def projects_list(
+    client: BBClient,
+    workspace: str | None = None,
+    *,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """List the projects in a workspace.
+
+    Uses `GET /2.0/workspaces/{workspace}/projects` (paginated). Each
+    value is a project record carrying `.key` (the short project key used
+    in repo bodies, e.g. `WID`), `.name`, `.uuid`, and `.links`.
+
+    `workspace=None` defaults to the client's configured workspace
+    (`client.config.workspace`); pass an explicit workspace to query a
+    different one.
+
+    Requires the `read:project:bitbucket` scope on the API token. A token
+    without it surfaces Bitbucket's "credentials lack one or more required
+    privilege scopes" 403 verbatim through the BBApiError path; the exact
+    missing scope is recoverable from the error body under
+    `error.detail.required`.
+    """
+    ws = workspace if workspace is not None else client.config.workspace
+    # Mirror repos_list: this op doesn't route through repo_path (it's a
+    # workspace-level listing, no slug), so the workspace contract is
+    # validated inline — empty/whitespace AND embedded `/`, `.`, `..`.
+    if not isinstance(ws, str) or not ws.strip():
+        raise ValueError(f"workspace must be a non-empty string, got {ws!r}")
+    if "/" in ws:
+        raise ValueError(f"workspace must not contain '/', got {ws!r}")
+    if ws in (".", ".."):
+        raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"pagelen": pagelen}
+
+    out: list[dict[str, Any]] = []
+    for p in client.paginate(f"/workspaces/{ws}/projects", query=q):
+        out.append(p)
+        if len(out) >= count:
+            break
+    return out
+
+
 # ===========================================================================
 #  REPOSITORY / BRANCH / VARIABLES / DOWNLOADS / COMMITS
 # ===========================================================================
@@ -880,6 +926,64 @@ def repo_create(
         payload["description"] = description
 
     return client.post(path, json_body=payload)
+
+
+def repo_update(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    project_key: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Update an existing repository via PUT /repositories/{workspace}/{repo}.
+
+    Bitbucket's update endpoint is a PUT to the SAME path repo_show GETs
+    and repo_create POSTs; only the fields present in the body change. The
+    dominant use is moving a repo between projects (repo_create takes a
+    project but nothing could change it afterward — this closes that gap).
+
+    `project_key` maps to the body's `{"project": {"key": ...}}` — that's
+    how Bitbucket reassigns a repo's project. `description` updates the
+    repo description. At least one field must be supplied; a PUT with an
+    empty body would be a no-op round-trip, so it's rejected at the
+    boundary rather than burning an API call.
+
+    Requires `admin:repository:bitbucket` scope on the token (same as
+    repo_create — changing repo settings is an admin operation).
+    `write:repository:bitbucket` alone returns 403, whose body names the
+    missing scope under `error.detail.required`.
+
+    Returns the updated repo record.
+    """
+    # repo_path validates workspace + slug at the boundary (empty,
+    # whitespace, embedded '/', '.', '..') — reuse it so update enforces
+    # the exact same slug contract as every other repo op.
+    path = repo_path(workspace, repo)
+
+    payload: dict[str, Any] = {}
+    if project_key is not None:
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError(
+                f"project_key must be a non-empty, non-whitespace string when "
+                f"provided, got {project_key!r}"
+            )
+        payload["project"] = {"key": project_key.strip()}
+    if description is not None:
+        if not isinstance(description, str):
+            raise ValueError(
+                f"description must be a string when provided, got "
+                f"{type(description).__name__}"
+            )
+        payload["description"] = description
+
+    if not payload:
+        raise ValueError(
+            "repo_update requires at least one field to change "
+            "(project_key and/or description)"
+        )
+
+    return client.put(path, json_body=payload)
 
 
 # --- Branches ---

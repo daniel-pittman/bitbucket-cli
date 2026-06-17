@@ -137,7 +137,9 @@ Your Bitbucket account needs these workspace permissions:
 | Trigger/stop pipelines | **Read + Write** access to Pipelines (`read:pipeline:bitbucket`, `write:pipeline:bitbucket`) |
 | Create/approve/merge PRs | **Read + Write** access to Pull Requests (`read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`) |
 | List workspaces (`bb workspaces`) | `read:workspace:bitbucket` (new in v1.2.0 — Atlassian API token scope, opt-in when creating the token) |
+| List projects (`bb projects`) | `read:project:bitbucket` (Atlassian API token scope, opt-in when creating the token). Verified against the live 403 envelope: the missing scope is named under `error.detail.required`. |
 | Create a repository (`bb repo-create`) | **Admin** access to repositories (`admin:repository:bitbucket`). `write:repository:bitbucket` alone is not sufficient. |
+| Update a repository (`bb repo-update`, e.g. move its project) | **Admin** access to repositories (`admin:repository:bitbucket`). `write:repository:bitbucket` alone is not sufficient — same scope as `bb repo-create`. |
 | Set pipeline variables, any scope (`bb vars set`, `bb vars set --workspace`, `bb vars set --deployment <env>`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. This one scope covers all three variable scopes (repo, workspace, deployment-environment); verified against the live 403 envelope for each. |
 
 Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too — provided the token carries the scope. The cross-workspace listing endpoints (`/2.0/workspaces`, `/2.0/repositories?role=member`) were removed under Atlassian's [CHANGE-2770](https://developer.atlassian.com/cloud/bitbucket/changelog/) on 2026-04-14; `bb workspaces` uses the replacement `/2.0/user/workspaces` endpoint (CHANGE-3022) which requires the `read:workspace:bitbucket` scope. Rotating the token to add it leaves existing tokens unchanged.
@@ -189,12 +191,21 @@ bb pr-comments [repo] <id>            # Show PR comments
 
 ```bash
 bb branches [repo]                    # List branches
+bb projects [workspace]               # List workspace projects
 bb repos                              # List workspace repos
 bb repo [repo]                        # Show repo details
 bb repo-create <name> [opts]          # Create a repo (default PRIVATE)
+bb repo-update [repo] <opts>          # Update a repo (move project, change description)
 bb downloads [repo]                   # List repo downloads
 bb vars [scope] [repo]                # List pipeline variables (repo|workspace|deployment)
 bb vars set [scope] [repo] <KEY> [opts]  # Create or update a pipeline variable
+```
+
+`bb projects` lists a workspace's projects (KEY and NAME). The KEY is what `--project` expects on `bb repo-create` and `bb repo-update`. The workspace defaults to the resolved one (`-w` / git origin / `BB_WORKSPACE`); pass an explicit `[workspace]` to list another's. Needs `read:project:bitbucket` scope. See [Required Bitbucket Permissions](#required-bitbucket-permissions).
+
+```bash
+bb projects                # projects in the resolved workspace
+bb projects acme           # projects in workspace "acme"
 ```
 
 `bb repo-create` defaults to a **private** repo so a forgotten flag never publishes one. Flags: `--public` / `--private`, `--project KEY` (required on workspaces that use projects), `--description TEXT`.
@@ -205,7 +216,15 @@ bb repo-create widget-service --project WID            # private, in project WID
 bb repo-create docs-site --public --description "Docs" # public
 ```
 
-This needs `admin:repository:bitbucket` scope on the token. A read/write-only token must be rotated to add it (adding a scope does not apply to an already-issued token). See [Required Bitbucket Permissions](#required-bitbucket-permissions).
+`bb repo-update` changes an existing repo's settings. The dominant use is moving a repo between projects (`bb repo-create` takes a project but nothing else could change it afterward). At least one of `--project KEY` / `--description TEXT` is required; `[repo]` accepts the same shapes as every other repo command (bare slug, `ws/slug`, or omitted to auto-detect from the git origin).
+
+```bash
+bb repo-update widget-service --project WID            # move into project WID
+bb repo-update acme/widget-service --description "..."  # change description
+bb repo-update --project WID                            # current checkout, move project
+```
+
+Both `bb repo-create` and `bb repo-update` need `admin:repository:bitbucket` scope on the token. A read/write-only token must be rotated to add it (adding a scope does not apply to an already-issued token). See [Required Bitbucket Permissions](#required-bitbucket-permissions).
 
 `bb vars` and `bb vars set` operate at three scopes, selected by a flag (default is repo):
 
@@ -279,7 +298,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 
 ### What it exposes
 
-33 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
+35 tools covering pipelines, pull requests, workspaces, projects, repos, branches, commits, pipeline variables, and git-context helpers:
 
 | Category | Tools |
 |---|---|
@@ -287,8 +306,8 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pipelines (write) | `pipeline_trigger`, `pipeline_stop` |
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
-| Workspaces | `workspaces_list` (needs `read:workspace:bitbucket` scope — see [Required Bitbucket Permissions](#required-bitbucket-permissions)) |
-| Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `downloads_list` |
+| Workspaces / projects | `workspaces_list` (needs `read:workspace:bitbucket` scope), `projects_list` (needs `read:project:bitbucket` scope) — see [Required Bitbucket Permissions](#required-bitbucket-permissions) |
+| Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `repo_update`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
 | Meta | `whoami` (see note below) |
 

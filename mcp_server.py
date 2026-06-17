@@ -1024,6 +1024,36 @@ def workspaces_list(count: int = 100) -> dict[str, Any]:
         return _error_dict_with(e, count=count)
 
 
+@mcp.tool()
+def projects_list(workspace: str = "", count: int = 100) -> dict[str, Any]:
+    """List the projects in a Bitbucket workspace.
+
+    Each project record carries `.key` (the short key used in repo
+    bodies, e.g. "WID"), `.name`, `.uuid`, and `.links`. The key is what
+    `repo_create(project=...)` and `repo_update(project=...)` expect.
+
+    Requires the `read:project:bitbucket` scope on the API token. A token
+    without it returns the standard error envelope `{"ok": False, "kind":
+    "BBApiError", "status": 403, "body": ...}`; Bitbucket's "credentials
+    lack one or more required privilege scopes" message is in `body`, and
+    the exact missing scope is under `error.detail.required`.
+
+    Args:
+        workspace: Workspace slug. Empty = use BB_WORKSPACE from config.
+        count: Maximum number of projects to return (default 100).
+    """
+    try:
+        client = _get_client()
+        # Mirror repos_list: strip + fall back so " acme" / "acme " don't
+        # build `/workspaces/%20acme/projects`; whitespace-only falls back
+        # to the configured workspace.
+        ws = (workspace or "").strip() or client.config.workspace
+        projects = bb_ops.projects_list(client, workspace=ws, count=count)
+        return {"ok": True, "workspace": ws, "projects": projects}
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict(e)
+
+
 # =============================================================================
 #  REPO / BRANCH / VARS / DOWNLOADS / COMMITS TOOLS
 # =============================================================================
@@ -1125,6 +1155,54 @@ def repo_create(
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict_with(e, repo=name)
+
+
+@mcp.tool()
+def repo_update(
+    repo: str = "",
+    project: str = "",
+    description: str = "",
+) -> dict[str, Any]:
+    """Update an existing repository (move its project, change description).
+
+    The dominant use is reassigning a repo's project: pass `project` with
+    the target project KEY (e.g. "WID"). `repo_create` accepts a project
+    on creation but nothing else could change it afterward — this closes
+    that gap. At least one of `project` / `description` must be supplied.
+
+    Requires `admin:repository:bitbucket` scope on the token (same as
+    repo_create — changing repo settings is an admin operation).
+    `write:repository:bitbucket` alone returns 403, whose body names the
+    missing scope under `error.detail.required`.
+
+    Args:
+        repo: "", "slug", or "workspace/slug" (auto-detect when empty).
+        project: Target project KEY to move the repo into. Empty = leave
+            the project unchanged.
+        description: New repository description. Empty = leave it
+            unchanged.
+
+    Returns the updated repo record under `info`, plus the resolved
+    `project` key for convenience.
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        info = bb_ops.repo_update(
+            client,
+            workspace,
+            repo_slug,
+            project_key=_opt_str(project),
+            description=_opt_str(description),
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "project": (info.get("project", {}) or {}).get("key"),
+            "info": info,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict(e)
 
 
 @mcp.tool()

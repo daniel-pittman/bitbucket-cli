@@ -100,10 +100,12 @@ EXPECTED_TOOLS = {
     "pr_comment_add",
     # Workspaces
     "workspaces_list",
+    "projects_list",
     # Repos / branches / metadata
     "repos_list",
     "repo_show",
     "repo_create",
+    "repo_update",
     "branches_list",
     "branch_show",
     "vars_list",
@@ -134,9 +136,10 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 33 = 6 pipelines
-    + 11 PRs + 1 workspaces + 9 repos/metadata + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 33
+    regression that drops a registration is visible. 35 = 6 pipelines
+    + 11 PRs + 2 workspaces/projects + 10 repos/metadata + 5 git context
+    + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 35
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1059,93 @@ class TestRepoTools:
         with patch.object(bb_ops, "commits_list", recorder):
             mcp_server.commits_list(repo="my-repo")
         assert recorder.calls[0][1]["branch"] is None
+
+    # --- projects_list ---
+
+    def test_projects_list_uses_config_workspace_when_omitted(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([{"key": "WID"}])
+        with patch.object(bb_ops, "projects_list", recorder):
+            out = mcp_server.projects_list()
+        assert recorder.calls[0][1]["workspace"] == "acme"
+        assert out["ok"] is True
+        assert out["workspace"] == "acme"
+        assert out["projects"] == [{"key": "WID"}]
+
+    def test_projects_list_explicit_workspace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "projects_list", recorder):
+            mcp_server.projects_list(workspace="other")
+        assert recorder.calls[0][1]["workspace"] == "other"
+
+    def test_projects_list_strips_workspace_whitespace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "projects_list", recorder):
+            mcp_server.projects_list(workspace="  other-org  ")
+        assert recorder.calls[0][1]["workspace"] == "other-org"
+
+    def test_projects_list_whitespace_only_workspace_falls_back(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "projects_list", recorder):
+            mcp_server.projects_list(workspace="   ")
+        assert recorder.calls[0][1]["workspace"] == "acme"  # from config
+
+    # --- repo_update ---
+
+    def test_repo_update_passes_project_and_surfaces_key(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        info = {"full_name": "acme/my-repo", "project": {"key": "WID"}}
+        recorder = _recorder(info)
+        with patch.object(bb_ops, "repo_update", recorder):
+            out = mcp_server.repo_update(repo="my-repo", project="WID")
+        # Bare slug resolves to config workspace ("acme"); slug is the repo.
+        args, kwargs = recorder.calls[0]
+        assert args[1] == "acme"
+        assert args[2] == "my-repo"
+        assert kwargs["project_key"] == "WID"
+        # description omitted → _opt_str("") → None (no change).
+        assert kwargs["description"] is None
+        assert out["ok"] is True
+        assert out["project"] == "WID"
+
+    def test_repo_update_passes_description(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"full_name": "acme/my-repo"})
+        with patch.object(bb_ops, "repo_update", recorder):
+            mcp_server.repo_update(repo="my-repo", description="new desc")
+        kwargs = recorder.calls[0][1]
+        assert kwargs["description"] == "new desc"
+        # project omitted → None (no change).
+        assert kwargs["project_key"] is None
+
+    def test_repo_update_explicit_workspace_slug(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"full_name": "other/repo"})
+        with patch.object(bb_ops, "repo_update", recorder):
+            mcp_server.repo_update(repo="other/repo", project="WID")
+        args = recorder.calls[0][0]
+        assert args[1] == "other"
+        assert args[2] == "repo"
+
+    def test_repo_update_no_fields_surfaces_error(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # The MCP wrapper passes both as None when omitted; bb_ops raises
+        # ValueError, which the wrapper catches into the error envelope.
+        # No stub: the real bb_ops.repo_update runs and rejects pre-network.
+        out = mcp_server.repo_update(repo="my-repo")
+        assert out["ok"] is False
+        assert "at least one field" in out["message"]
 
 
 class TestGitTools:

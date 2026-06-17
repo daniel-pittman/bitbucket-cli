@@ -63,15 +63,17 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 - `pr_decline(pr_id, repo?)` — close without merging.
 - `pr_comment_add(pr_id, body, repo?)` — post a top-level comment.
 
-### Workspaces
+### Workspaces / projects
 
 - `workspaces_list(count?)` — workspaces the authenticated user belongs to. Uses `GET /2.0/user/workspaces` (CHANGE-3022 replacement for the cross-workspace listing endpoints removed under CHANGE-2770 on 2026-04-14). Requires the `read:workspace:bitbucket` scope on the API token — a token without that scope returns the standard flat error envelope `{ok: False, kind: "BBApiError", status: 403, body: ...}` (NOT the `auth.ok` shape — that's `whoami`-specific) with Bitbucket's "credentials lack one or more required privilege scopes" message in `body` (the scope name is recoverable from there). Returns workspace_access envelopes: `{administrator: bool, workspace: {slug, uuid, links}}`; the new schema has no `name` or `permission` string fields — branch on `administrator` (bool) for role-style decisions.
+- `projects_list(workspace?, count?)` — projects in a workspace via `GET /2.0/workspaces/{workspace}/projects`. `workspace` omitted defaults to the configured workspace. Each record carries `.key` (the short project key used in repo bodies, e.g. `WID`), `.name`, `.uuid`, `.links`. The `.key` is what `repo_create(project=...)` and `repo_update(project=...)` expect. Requires the `read:project:bitbucket` scope on the API token; a token without it returns the standard flat error envelope with the missing scope under `error.detail.required` in `body`.
 
 ### Repos / branches / metadata
 
 - `repos_list(workspace?, count?, sort?, query?)` — workspace repos. `query` is a Bitbucket BBQL filter (e.g. `'name ~ "widget"'`).
 - `repo_show(repo?)` — single-repo metadata.
 - `repo_create(name, workspace?, is_private?, project?, description?)` — create a new repo. Defaults to `is_private=True` (a forgotten flag never publishes a repo). `project` is the Bitbucket project key (required on workspaces that use projects). Returns the record plus a convenience `clone_https`. Requires `admin:repository:bitbucket` scope on the token; `write:repository:bitbucket` alone returns 403. A token's scopes are fixed at creation, so a read/write-only token must be ROTATED to add the admin scope (adding it does not apply to an already-issued token). The 403 body names the missing scope under `error.detail.required`.
+- `repo_update(repo?, project?, description?)` — update an existing repo via PUT to the same path `repo_show` GETs. The dominant use is moving a repo between projects: pass `project` with the target project KEY (`repo_create` takes a project on creation but nothing else could change it afterward). At least one of `project` / `description` must be supplied; an empty-body update is rejected at the boundary (no network IO). Accepts the repo in the same shapes as every other repo command (`"slug"`, `"ws/slug"`, or `""` auto-detect). Returns the updated record under `info` plus the resolved `project` key. Requires `admin:repository:bitbucket` scope (same as `repo_create`); `write:repository:bitbucket` alone returns 403, body names the missing scope under `error.detail.required`.
 - `branches_list(repo?, count?, sort?, query?)` — branches, default sort is most-recently-updated first.
 - `branch_show(name, repo?)` — single branch detail; URL-encodes slashes in the name.
 - `commits_list(repo?, branch?, count?)` — recent commits. With `branch` omitted (or `""`), lists across all branches; with a branch name, lists commits reachable from that branch.

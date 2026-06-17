@@ -1309,6 +1309,80 @@ cmd_workspaces() {
     fi
 }
 
+cmd_projects() {
+    # bb projects [workspace]
+    #
+    # GET /2.0/workspaces/{ws}/projects — list a workspace's projects.
+    # An explicit [workspace] positional argument names the workspace
+    # directly (matches the Python projects_list(workspace?) surface and
+    # is the natural way to list projects in a workspace you're not
+    # checked out in). When omitted, resolve_workspace handles -w / git
+    # origin / BB_WORKSPACE just like cmd_repos.
+    #
+    # Requires the `read:project:bitbucket` scope on the API token. A
+    # token without it returns 403; bb_get (`curl -sf`) exits non-zero
+    # WITHOUT printing the body, so we name the scope on the error path
+    # so the user knows the fix regardless.
+    local ws_arg="${1:-}"
+    if [[ "$ws_arg" == */* ]]; then
+        echo "Error: workspace must not contain '/', got '$ws_arg'." >&2
+        exit 1
+    fi
+    if [[ -n "$ws_arg" ]]; then
+        # Explicit positional workspace wins over the resolver. A -w flag
+        # is the only thing more explicit, so it still takes precedence.
+        if [[ -n "${BB_WORKSPACE_OVERRIDE:-}" ]]; then
+            BB_WORKSPACE="$BB_WORKSPACE_OVERRIDE"
+        else
+            BB_WORKSPACE="$ws_arg"
+        fi
+    else
+        resolve_workspace
+    fi
+
+    echo "Projects in ${BB_WORKSPACE}:"
+    echo ""
+
+    # Capture rc via `|| rc=$?` (not `if ! cmd`) so curl's real exit code
+    # survives — same idiom as cmd_workspaces. curl -f exits 22 on HTTP
+    # >=400; other codes are transport-level.
+    local response rc=0
+    response=$(bb_get "/workspaces/${BB_WORKSPACE}/projects?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Project listing failed (exit $rc)." >&2
+        if [[ "$rc" -eq 22 ]]; then
+            echo "If this is a 403, the token lacks the read:project:bitbucket" >&2
+            echo "scope. Rotate it at" >&2
+            echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+            echo "with that scope checked (existing scopes stay as they are)." >&2
+        else
+            echo "This looks like a connectivity error (not an HTTP response)." >&2
+            echo "Check your network and that api.bitbucket.org is reachable." >&2
+        fi
+        exit "$rc"
+    fi
+
+    printf "  %-12s %s\n" "KEY" "NAME"
+    printf "  %-12s %s\n" "---" "----"
+
+    echo "$response" | jq -r '
+        .values[] |
+        [.key, .name] | @tsv
+    ' | while IFS=$'\t' read -r key name; do
+        printf "  %-12s %s\n" "$key" "$name"
+    done
+
+    # Parity guard with bb_ops.projects_list, which paginates: bash fetches
+    # a single 100-item page (matching cmd_repos / cmd_workspaces). If the
+    # API signals more pages, point the user at the paginating MCP tool
+    # rather than silently truncating.
+    if [[ "$(echo "$response" | jq -r '.next // empty')" != "" ]]; then
+        echo "" >&2
+        echo "  (showing first 100 — workspace has more; use the MCP" >&2
+        echo "   projects_list tool, which paginates, for the full set)" >&2
+    fi
+}
+
 cmd_repos() {
     resolve_workspace
     echo "Repositories in ${BB_WORKSPACE}:"
@@ -1463,6 +1537,94 @@ cmd_repo_create() {
 
     echo "Created ${full_name}"
     echo "  Clone (HTTPS): ${clone_https}"
+}
+
+cmd_repo_update() {
+    # bb repo-update [repo] --project KEY [--description TEXT]
+    #
+    # Updates an existing repo via PUT to /repositories/{ws}/{slug} — the
+    # same path `bb repo` GETs and `bb repo-create` POSTs. Only the fields
+    # in the body change. The dominant use is moving a repo between
+    # projects (repo-create takes a project but nothing could change it
+    # afterward — this closes that gap).
+    #
+    # [repo] accepts the same shapes as every other repo command: bare
+    # slug, ws/slug, or omitted (auto-detect from git origin). At least
+    # one of --project / --description must be supplied.
+    local repo_arg="" project="" description="" have_description=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project)        _require_flag_value "$@"; project="$2"; shift 2 ;;
+            --project=*)      project="${1#*=}"; shift ;;
+            --description)    _require_flag_value "$@"; description="$2"; have_description=1; shift 2 ;;
+            --description=*)  description="${1#*=}"; have_description=1; shift ;;
+            -*)
+                echo "Error: unknown flag for repo-update: $1" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$repo_arg" ]]; then
+                    repo_arg="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    # At least one field must change; a PUT with an empty body is a no-op
+    # round-trip. Reject BEFORE resolving the repo so the usage error
+    # surfaces without an API call (parity with bb_ops.repo_update).
+    # `have_description` (not `-n "$description"`) so `--description ""`
+    # (an intentional clear) counts as a field to change.
+    if [[ -z "$project" && -z "$have_description" ]]; then
+        echo "Usage: bb repo-update [repo] --project KEY [--description TEXT]" >&2
+        echo "" >&2
+        echo "  Updates an existing repo. At least one of --project /" >&2
+        echo "  --description is required." >&2
+        echo "  [repo] is auto-detected from the git origin if omitted." >&2
+        exit 1
+    fi
+
+    local repo
+    resolve_repo "$repo_arg"
+
+    # repo_path validates the workspace + slug at the boundary (empty /
+    # whitespace / embedded '/' / '.' / '..') and builds the PUT path.
+    local path
+    path=$(repo_path "$repo")
+
+    # Build the body with jq so values are escaped. Add only the fields
+    # supplied so the body matches the Python omit-when-absent contract
+    # (bb_ops.repo_update). `have_description` gates description so an
+    # intentional clear (`--description ""`) is still sent.
+    local payload="{}"
+    if [[ -n "$project" ]]; then
+        payload=$(echo "$payload" | jq --arg k "$project" '. + {project: {key: $k}}')
+    fi
+    if [[ -n "$have_description" ]]; then
+        payload=$(echo "$payload" | jq --arg d "$description" '. + {description: $d}')
+    fi
+
+    echo "Updating repository ${BB_WORKSPACE}/${repo}..."
+
+    local response rc=0
+    response=$(bb_put "$path" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Repo-update request failed (exit $rc)." >&2
+        echo "  Common causes: the target --project KEY doesn't exist in" >&2
+        echo "  the workspace, the repo slug is wrong, or the token lacks" >&2
+        echo "  admin:repository:bitbucket scope (write alone is not enough)." >&2
+        exit "$rc"
+    fi
+
+    local full_name new_project
+    full_name=$(echo "$response" | jq -r '.full_name // "(unknown)"')
+    new_project=$(echo "$response" | jq -r '.project.key // "(none)"')
+
+    echo "Updated ${full_name}"
+    echo "  Project: ${new_project}"
 }
 
 # =========================================================================
@@ -2085,11 +2247,15 @@ BRANCHES
 
 REPOSITORY
   bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
+  bb projects [workspace]               List workspace projects (needs read:project:bitbucket scope)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
   bb repo-create <name> [opts]          Create a repo (default PRIVATE)
                                           opts: --public | --private,
                                           --project KEY, --description TEXT
+  bb repo-update [repo] <opts>          Update a repo (move project, change description)
+                                          opts: --project KEY, --description TEXT
+                                          (at least one required)
   bb downloads [repo]                   List repo downloads
   bb vars [scope] [repo]                List pipeline variables
                                           scope: --workspace | --deployment <env>
@@ -2190,9 +2356,11 @@ case "$command" in
     commits)              cmd_commits "$@" ;;
     # Repos
     workspaces|ws)        cmd_workspaces "$@" ;;
+    projects|proj)        cmd_projects "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
     repo-create|rc)       cmd_repo_create "$@" ;;
+    repo-update|ru)       cmd_repo_update "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;
     vars)
         # `vars set ...` is the create-or-update subcommand; bare `vars`
