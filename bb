@@ -289,6 +289,39 @@ _require_build_number() {
     fi
 }
 
+# Validate a resolved workspace slug at the boundary before it's
+# interpolated into a workspace-level request URL (e.g.
+# /workspaces/{ws}/projects). Mirrors the inline contract in
+# bb_ops.projects_list / repos_list: reject empty / whitespace, embedded
+# '/', and '.' / '..'. The repo-level commands get this for free via
+# repo_path, but the workspace-only commands (cmd_projects) don't route
+# through it, so the check is centralised here instead of duplicated.
+#
+# The whitespace check uses `tr -d '[:space:]'` (the same idiom repo_path
+# uses for BB_WORKSPACE) and rejects if the stripped form is empty OR
+# differs from the input. Note this is STRICTER than Python's `.strip()`:
+# it rejects ANY whitespace including interior (`a b`), not just
+# leading/trailing. That's intentional and safe for a workspace slug,
+# which can never legitimately contain a space — unlike a `--project KEY`,
+# where cmd_repo_update strips leading/trailing only (true `.strip()`).
+_require_workspace() {
+    local ws="$1"
+    local stripped
+    stripped="$(printf '%s' "$ws" | tr -d '[:space:]')"
+    if [[ -z "$stripped" || "$stripped" != "$ws" ]]; then
+        echo "Error: workspace must be a non-empty, non-whitespace string (got '$ws')." >&2
+        exit 1
+    fi
+    if [[ "$ws" == */* ]]; then
+        echo "Error: workspace must not contain '/' (got '$ws')." >&2
+        exit 1
+    fi
+    if [[ "$ws" == "." || "$ws" == ".." ]]; then
+        echo "Error: workspace must not be '.' or '..' (got '$ws')." >&2
+        exit 1
+    fi
+}
+
 # Allowlist the PR state before it's interpolated into the request URL.
 # Mirrors the Python _KNOWN_PR_STATES boundary check (bb_ops.py) — both
 # surfaces reject anything outside the four valid states. Also closes a
@@ -731,6 +764,93 @@ cmd_pipeline_approve() {
     local url="https://bitbucket.org/${BB_WORKSPACE}/${repo}/addon/pipelines/home#!/results/${build_number}"
     echo "  ${url}"
     open "$url" 2>/dev/null || xdg-open "$url" 2>/dev/null || true
+}
+
+# Pipelines must be ENABLED on a repo before pipeline variables, custom
+# pipelines, or builds work. Toggle via the pipelines_config resource:
+#   GET /repositories/{ws}/{slug}/pipelines_config  → {"enabled": bool}
+#   PUT  ...  {"enabled": true|false}
+# Verified live: the GET 404s when Pipelines has never been configured
+# (the pre-enable state), so cmd_pipelines_status reports "disabled (never
+# configured)" on a 404 rather than erroring.
+
+cmd_pipelines_status() {
+    local repo
+    resolve_repo "${1:-}"
+
+    # The status command must distinguish a 404 ("never configured" — the
+    # normal pre-enable state, reported as disabled) from a 403 (token
+    # lacks read:pipeline:bitbucket) or any other error, which must be
+    # surfaced. The Python side (bb_ops.pipelines_config_show) translates
+    # ONLY a 404 and re-raises everything else. `bb_get` uses `curl -f`,
+    # which collapses every HTTP >=400 to exit 22 with no body, so it can't
+    # make that distinction. Do a single un-`-f`'d curl that writes the
+    # body to stdout with the status code appended on its own line, then
+    # split the two. One request (no re-probe), so there's no window where
+    # the state changes between two calls. Mirrors the auth + base that
+    # bb_get uses, so BB_API_BASE overrides still apply.
+    local path raw code body rc=0
+    path="$(repo_path "$repo")/pipelines_config"
+    # `|| rc=$?` so a transport-level curl failure (DNS, TLS, connection
+    # refused — NOT an HTTP error, since we don't pass -f) surfaces a
+    # friendly message instead of tripping `set -e` and exiting silently.
+    raw=$(curl -s -w '\n%{http_code}' \
+        -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Could not read pipelines config (curl exit $rc)." >&2
+        echo "  This looks like a connectivity error (not an HTTP response)." >&2
+        exit "$rc"
+    fi
+    code="${raw##*$'\n'}"     # last line: the HTTP status code
+    body="${raw%$'\n'*}"      # everything before it: the response body
+
+    case "$code" in
+        2*)
+            local enabled
+            enabled=$(echo "$body" | jq -r '.enabled // false')
+            echo "Pipelines: $([[ "$enabled" == "true" ]] && echo enabled || echo disabled) for ${BB_WORKSPACE}/${repo}"
+            ;;
+        404)
+            echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
+            ;;
+        *)
+            echo "Could not read pipelines config (HTTP ${code})." >&2
+            if [[ "$code" == "403" ]]; then
+                echo "  The token lacks read:pipeline:bitbucket scope." >&2
+            fi
+            exit 22
+            ;;
+    esac
+}
+
+# Shared enable/disable body. Args: <repo-arg> <true|false>.
+_pipelines_set_enabled() {
+    local repo
+    resolve_repo "${1:-}"
+    local enabled="$2"
+
+    local payload
+    payload=$(jq -n --argjson e "$enabled" '{enabled: $e}')
+
+    local response rc=0
+    response=$(bb_put "$(repo_path "$repo")/pipelines_config" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Pipelines $([[ "$enabled" == "true" ]] && echo enable || echo disable) failed (exit $rc)." >&2
+        echo "  Common cause: the token lacks admin:pipeline:bitbucket scope" >&2
+        echo "  (write:pipeline:bitbucket alone is not enough)." >&2
+        exit "$rc"
+    fi
+    local now
+    now=$(echo "$response" | jq -r '.enabled // false')
+    echo "Pipelines $([[ "$now" == "true" ]] && echo enabled || echo disabled) for ${BB_WORKSPACE}/${repo}"
+}
+
+cmd_pipelines_enable() {
+    _pipelines_set_enabled "${1:-}" true
+}
+
+cmd_pipelines_disable() {
+    _pipelines_set_enabled "${1:-}" false
 }
 
 # =========================================================================
@@ -1309,6 +1429,82 @@ cmd_workspaces() {
     fi
 }
 
+cmd_projects() {
+    # bb projects [workspace]
+    #
+    # GET /2.0/workspaces/{ws}/projects — list a workspace's projects.
+    # An explicit [workspace] positional argument names the workspace
+    # directly (matches the Python projects_list(workspace?) surface and
+    # is the natural way to list projects in a workspace you're not
+    # checked out in). When omitted, resolve_workspace handles -w / git
+    # origin / BB_WORKSPACE just like cmd_repos.
+    #
+    # Requires the `read:project:bitbucket` scope on the API token. A
+    # token without it returns 403; bb_get (`curl -sf`) exits non-zero
+    # WITHOUT printing the body, so we name the scope on the error path
+    # so the user knows the fix regardless.
+    # Precedence: a -w flag (BB_WORKSPACE_OVERRIDE) is the most explicit
+    # signal and wins; otherwise an explicit positional [workspace] wins
+    # over the git-origin / BB_WORKSPACE default. resolve_workspace owns
+    # the -w / git-origin / config logic, so set BB_WORKSPACE from the
+    # positional ONLY when no -w override is present, then let
+    # resolve_workspace fill in any remaining case — keeping the
+    # precedence logic in one place.
+    local ws_arg="${1:-}"
+    if [[ -n "$ws_arg" && -z "${BB_WORKSPACE_OVERRIDE:-}" ]]; then
+        BB_WORKSPACE="$ws_arg"
+    else
+        resolve_workspace
+    fi
+
+    # Validate the resolved workspace at the boundary (empty / whitespace /
+    # embedded '/' / '.' / '..') — parity with bb_ops.projects_list, which
+    # rejects these before any network call.
+    _require_workspace "$BB_WORKSPACE"
+
+    echo "Projects in ${BB_WORKSPACE}:"
+    echo ""
+
+    # Capture rc via `|| rc=$?` (not `if ! cmd`) so curl's real exit code
+    # survives — same idiom as cmd_workspaces. curl -f exits 22 on HTTP
+    # >=400; other codes are transport-level.
+    local response rc=0
+    response=$(bb_get "/workspaces/${BB_WORKSPACE}/projects?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Project listing failed (exit $rc)." >&2
+        if [[ "$rc" -eq 22 ]]; then
+            echo "If this is a 403, the token lacks the read:project:bitbucket" >&2
+            echo "scope. Rotate it at" >&2
+            echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+            echo "with that scope checked (existing scopes stay as they are)." >&2
+        else
+            echo "This looks like a connectivity error (not an HTTP response)." >&2
+            echo "Check your network and that api.bitbucket.org is reachable." >&2
+        fi
+        exit "$rc"
+    fi
+
+    printf "  %-12s %s\n" "KEY" "NAME"
+    printf "  %-12s %s\n" "---" "----"
+
+    echo "$response" | jq -r '
+        .values[] |
+        [.key, .name] | @tsv
+    ' | while IFS=$'\t' read -r key name; do
+        printf "  %-12s %s\n" "$key" "$name"
+    done
+
+    # Parity guard with bb_ops.projects_list, which paginates: bash fetches
+    # a single 100-item page (matching cmd_repos / cmd_workspaces). If the
+    # API signals more pages, point the user at the paginating MCP tool
+    # rather than silently truncating.
+    if [[ "$(echo "$response" | jq -r '.next // empty')" != "" ]]; then
+        echo "" >&2
+        echo "  (showing first 100 — workspace has more; use the MCP" >&2
+        echo "   projects_list tool, which paginates, for the full set)" >&2
+    fi
+}
+
 cmd_repos() {
     resolve_workspace
     echo "Repositories in ${BB_WORKSPACE}:"
@@ -1465,6 +1661,108 @@ cmd_repo_create() {
     echo "  Clone (HTTPS): ${clone_https}"
 }
 
+cmd_repo_update() {
+    # bb repo-update [repo] --project KEY [--description TEXT]
+    #
+    # Updates an existing repo via PUT to /repositories/{ws}/{slug} — the
+    # same path `bb repo` GETs and `bb repo-create` POSTs. Only the fields
+    # in the body change. The dominant use is moving a repo between
+    # projects (repo-create takes a project but nothing could change it
+    # afterward — this closes that gap).
+    #
+    # [repo] accepts the same shapes as every other repo command: bare
+    # slug, ws/slug, or omitted (auto-detect from git origin). At least
+    # one of --project / --description must be supplied.
+    local repo_arg="" project="" description="" have_project="" have_description=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project)        _require_flag_value "$@"; project="$2"; have_project=1; shift 2 ;;
+            --project=*)      project="${1#*=}"; have_project=1; shift ;;
+            --description)    _require_flag_value "$@"; description="$2"; have_description=1; shift 2 ;;
+            --description=*)  description="${1#*=}"; have_description=1; shift ;;
+            -*)
+                echo "Error: unknown flag for repo-update: $1" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$repo_arg" ]]; then
+                    repo_arg="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    # When --project is supplied, validate + strip the KEY at the boundary
+    # so the two surfaces agree on the contract: bb_ops.repo_update rejects
+    # an empty/whitespace project_key and strips a padded one. Without this,
+    # `--project ""` would be silently dropped (and `--project "  WID  "`
+    # sent verbatim, 400ing at the API) — a parity divergence from Python.
+    # Strip first (true `.strip()` parity), then reject if nothing remains.
+    if [[ -n "$have_project" ]]; then
+        project="$(printf '%s' "$project" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [[ -z "$project" ]]; then
+            echo "Error: --project requires a non-empty, non-whitespace KEY." >&2
+            exit 1
+        fi
+    fi
+
+    # At least one field must change; a PUT with an empty body is a no-op
+    # round-trip. Reject BEFORE resolving the repo so the usage error
+    # surfaces without an API call (parity with bb_ops.repo_update).
+    # Gate on the `have_*` flags (not `-n "$value"`) so `--description ""`
+    # (an intentional clear) counts as a field to change.
+    if [[ -z "$have_project" && -z "$have_description" ]]; then
+        echo "Usage: bb repo-update [repo] --project KEY [--description TEXT]" >&2
+        echo "" >&2
+        echo "  Updates an existing repo. At least one of --project /" >&2
+        echo "  --description is required." >&2
+        echo "  [repo] is auto-detected from the git origin if omitted." >&2
+        exit 1
+    fi
+
+    local repo
+    resolve_repo "$repo_arg"
+
+    # repo_path validates the workspace + slug at the boundary (empty /
+    # whitespace / embedded '/' / '.' / '..') and builds the PUT path.
+    local path
+    path=$(repo_path "$repo")
+
+    # Build the body with jq so values are escaped. Add only the fields
+    # supplied so the body matches the Python omit-when-absent contract
+    # (bb_ops.repo_update). The `have_*` flags gate each field so an
+    # intentional clear (`--description ""`) is still sent.
+    local payload="{}"
+    if [[ -n "$have_project" ]]; then
+        payload=$(echo "$payload" | jq --arg k "$project" '. + {project: {key: $k}}')
+    fi
+    if [[ -n "$have_description" ]]; then
+        payload=$(echo "$payload" | jq --arg d "$description" '. + {description: $d}')
+    fi
+
+    echo "Updating repository ${BB_WORKSPACE}/${repo}..."
+
+    local response rc=0
+    response=$(bb_put "$path" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Repo-update request failed (exit $rc)." >&2
+        echo "  Common causes: the target --project KEY doesn't exist in" >&2
+        echo "  the workspace, the repo slug is wrong, or the token lacks" >&2
+        echo "  admin:repository:bitbucket scope (write alone is not enough)." >&2
+        exit "$rc"
+    fi
+
+    local full_name new_project
+    full_name=$(echo "$response" | jq -r '.full_name // "(unknown)"')
+    new_project=$(echo "$response" | jq -r '.project.key // "(none)"')
+
+    echo "Updated ${full_name}"
+    echo "  Project: ${new_project}"
+}
+
 # =========================================================================
 #  DOWNLOADS (deployment artifacts)
 # =========================================================================
@@ -1500,6 +1798,186 @@ cmd_downloads() {
     ' | while IFS=$'\t' read -r name size date; do
         printf "  %-40s %-10s %s\n" "$name" "$size" "$date"
     done
+}
+
+# =========================================================================
+#  DEPLOYMENT ENVIRONMENTS
+# =========================================================================
+#
+# Deployment environments are the named targets a pipeline deploys to
+# (Test / Staging / Production); each carries its own deployment variables
+# (managed by `bb vars [set] --deployment <env>`). These commands manage
+# the environments themselves:
+#   GET    $(repo_path)/environments/            list
+#   POST   ...   {"name", "environment_type":{"name"}}   create
+#   DELETE ...   /{env_uuid}/                    delete
+# Body shape + 201/204 responses verified against the live API.
+
+cmd_environments() {
+    local repo
+    resolve_repo "${1:-}"
+
+    echo "Deployment environments for ${BB_WORKSPACE}/${repo}:"
+    echo ""
+
+    # Walk ALL pages, not just the first. The Python side
+    # (bb_ops.environments_list) paginates via client.paginate, and the
+    # sibling _resolve_env_uuid walks every page too — a single-page read
+    # here would be a parity divergence (an environment past page 1 would
+    # be invisible via bash but listed via the MCP tool). Accumulate rows
+    # across pages, then render once so the header prints only when there's
+    # at least one environment.
+    local page_url rows="" any=""
+    page_url="$(repo_path "$repo")/environments/?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        local page page_rows next
+        page=$(bb_get "$page_url")
+        page_rows=$(echo "$page" | jq -r '
+            .values[] | [.name, (.environment_type.name // "-")] | @tsv')
+        if [[ -n "$page_rows" ]]; then
+            any=1
+            rows="${rows}${rows:+$'\n'}${page_rows}"
+        fi
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
+
+    if [[ -z "$any" ]]; then
+        echo "  No environments."
+        return
+    fi
+
+    printf "  %-25s %s\n" "NAME" "TYPE"
+    printf "  %-25s %s\n" "----" "----"
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r name type; do
+        printf "  %-25s %s\n" "$name" "$type"
+    done
+}
+
+cmd_environment_create() {
+    # bb environment-create [repo] <name> [--type Test|Staging|Production]
+    local repo_arg="" name="" env_type="Test"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type)    _require_flag_value "$@"; env_type="$2"; shift 2 ;;
+            --type=*)  env_type="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for environment-create: $1" >&2
+                exit 1 ;;
+            *)
+                # First positional is the repo IF a second positional (name)
+                # follows; otherwise the single positional is the name and
+                # the repo auto-detects. Collect positionals, sort out after.
+                if [[ -z "$repo_arg" && -z "$name" ]]; then
+                    repo_arg="$1"
+                elif [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    # One positional → it's the name (repo auto-detects). Two → repo, name.
+    if [[ -z "$name" ]]; then
+        name="$repo_arg"
+        repo_arg=""
+    fi
+    if [[ -z "$name" ]]; then
+        echo "Usage: bb environment-create [repo] <name> [--type Test|Staging|Production]" >&2
+        exit 1
+    fi
+
+    # Validate + canonicalise the type (case-insensitive), matching
+    # bb_ops.environment_create's _ENVIRONMENT_TYPES contract.
+    local canonical
+    case "$(printf '%s' "$env_type" | tr '[:upper:]' '[:lower:]')" in
+        test)        canonical="Test" ;;
+        staging)     canonical="Staging" ;;
+        production)  canonical="Production" ;;
+        *)
+            echo "Error: --type must be one of Test / Staging / Production (got '$env_type')." >&2
+            exit 1 ;;
+    esac
+
+    local repo
+    resolve_repo "$repo_arg"
+
+    local payload
+    payload=$(jq -n --arg n "$name" --arg t "$canonical" \
+        '{name: $n, environment_type: {name: $t}}')
+
+    local response rc=0
+    response=$(bb_post "$(repo_path "$repo")/environments/" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Environment create failed (exit $rc)." >&2
+        echo "  Common cause: a same-named environment already exists, or the" >&2
+        echo "  token lacks admin:pipeline:bitbucket scope." >&2
+        exit "$rc"
+    fi
+    local created_name uuid
+    created_name=$(echo "$response" | jq -r '.name // "(unknown)"')
+    uuid=$(echo "$response" | jq -r '.uuid // "(none)"')
+    echo "Created environment '${created_name}' (${canonical}) in ${BB_WORKSPACE}/${repo}"
+    echo "  uuid: ${uuid}"
+}
+
+cmd_environment_delete() {
+    # bb environment-delete [repo] <name>
+    local repo_arg="" name=""
+    # Same one-or-two positional logic as create.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*)
+                echo "Error: unknown flag for environment-delete: $1" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$repo_arg" && -z "$name" ]]; then
+                    repo_arg="$1"
+                elif [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+    if [[ -z "$name" ]]; then
+        name="$repo_arg"
+        repo_arg=""
+    fi
+    if [[ -z "$name" ]]; then
+        echo "Usage: bb environment-delete [repo] <name>" >&2
+        exit 1
+    fi
+
+    local repo
+    resolve_repo "$repo_arg"
+
+    # Resolve the NAME to a UUID (walks all pages; kills the script with a
+    # clear message if no environment matches). Mirrors the deployment-var
+    # path's resolution.
+    local uuid encoded
+    uuid=$(_resolve_env_uuid "$repo" "$name")
+    encoded="${uuid//\{/%7B}"
+    encoded="${encoded//\}/%7D}"
+
+    local rc=0
+    bb_delete "$(repo_path "$repo")/environments/${encoded}/" > /dev/null || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Environment delete failed for '$name' (exit $rc)." >&2
+        echo "  The token may lack admin:pipeline:bitbucket scope." >&2
+        exit "$rc"
+    fi
+    echo "Deleted environment '${name}' from ${BB_WORKSPACE}/${repo}"
 }
 
 # =========================================================================
@@ -2065,6 +2543,10 @@ PIPELINES
   bb trigger [repo] [branch] [pattern]  Trigger a pipeline run
   bb stop [repo] <number>               Stop a running pipeline
   bb approve [repo] <number>            Open pipeline in browser (manual steps require UI)
+  bb pipelines-status [repo]            Show whether Pipelines (CI) is enabled
+  bb pipelines-enable [repo]            Enable Pipelines (CI) on a repo
+  bb pipelines-disable [repo]           Disable Pipelines (CI) on a repo
+                                          (enable/disable need admin:pipeline:bitbucket)
 
 PULL REQUESTS
   bb prs [repo] [state]                 List PRs (default: OPEN)
@@ -2085,12 +2567,22 @@ BRANCHES
 
 REPOSITORY
   bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
+  bb projects [workspace]               List workspace projects (needs read:project:bitbucket scope)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
   bb repo-create <name> [opts]          Create a repo (default PRIVATE)
                                           opts: --public | --private,
                                           --project KEY, --description TEXT
+  bb repo-update [repo] <opts>          Update a repo (move project, change description)
+                                          opts: --project KEY, --description TEXT
+                                          (at least one required)
   bb downloads [repo]                   List repo downloads
+  bb environments [repo]                List deployment environments
+  bb environment-create [repo] <name>   Create a deployment environment
+                                          opts: --type Test|Staging|Production
+                                          (default Test; needs admin:pipeline:bitbucket)
+  bb environment-delete [repo] <name>   Delete a deployment environment
+                                          (needs admin:pipeline:bitbucket)
   bb vars [scope] [repo]                List pipeline variables
                                           scope: --workspace | --deployment <env>
                                           (default: repo)
@@ -2173,6 +2665,9 @@ case "$command" in
     trigger|run)          cmd_pipeline_trigger "$@" ;;
     stop)                 cmd_pipeline_stop "$@" ;;
     approve|ap)           cmd_pipeline_approve "$@" ;;
+    pipelines-enable|pl-on)    cmd_pipelines_enable "$@" ;;
+    pipelines-disable|pl-off)  cmd_pipelines_disable "$@" ;;
+    pipelines-status|pl-status) cmd_pipelines_status "$@" ;;
     # Pull Requests
     prs|pr-list)          cmd_pr_list "$@" ;;
     pr|pr-view)           cmd_pr_view "$@" ;;
@@ -2190,10 +2685,15 @@ case "$command" in
     commits)              cmd_commits "$@" ;;
     # Repos
     workspaces|ws)        cmd_workspaces "$@" ;;
+    projects|proj)        cmd_projects "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
     repo-create|rc)       cmd_repo_create "$@" ;;
+    repo-update|ru)       cmd_repo_update "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;
+    environments|envs)    cmd_environments "$@" ;;
+    environment-create|env-create)  cmd_environment_create "$@" ;;
+    environment-delete|env-delete)  cmd_environment_delete "$@" ;;
     vars)
         # `vars set ...` is the create-or-update subcommand; bare `vars`
         # (or `vars <repo>`) lists. Peek at the first arg to route.

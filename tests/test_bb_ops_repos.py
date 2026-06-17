@@ -220,6 +220,129 @@ class TestWorkspacesList:
 
 
 # ===========================================================================
+# projects_list
+# ===========================================================================
+
+
+def _project_value(key: str, name: str) -> dict[str, Any]:
+    """Mirror the shape Bitbucket's /workspaces/{ws}/projects returns:
+    a project record keyed by the short `.key` used in repo bodies,
+    plus `.name` and `.uuid`."""
+    return {
+        "type": "project",
+        "key": key,
+        "name": name,
+        "uuid": "{" + key.lower() + "-uuid}",
+        "links": {
+            "self": {
+                "href": f"https://api.bitbucket.org/2.0/workspaces/acme/projects/{key}"
+            }
+        },
+    }
+
+
+class TestProjectsList:
+    def test_hits_workspace_projects_endpoint(self) -> None:
+        # Must be /workspaces/{ws}/projects (the workspace-scoped projects
+        # collection), NOT /repositories/... — projects are a workspace
+        # resource, not a repo one.
+        opener = _CaptureOpener(
+            [{"values": [_project_value("WID", "Widget"), _project_value("SVC", "Services")]}]
+        )
+        result = bb_ops.projects_list(_client(opener))
+        assert len(result) == 2
+        assert result[0]["key"] == "WID"
+        assert result[1]["name"] == "Services"
+        url = opener.calls[0]["url"]
+        assert url.startswith(DEFAULT_API_BASE + "/workspaces/acme/projects?")
+        assert "pagelen=100" in url
+        assert opener.calls[0]["method"] == "GET"
+        assert opener.calls[0]["body"] is None
+
+    def test_default_workspace_from_client(self) -> None:
+        # workspace=None defaults to client.config.workspace ("acme").
+        opener = _CaptureOpener([{"values": [_project_value("WID", "Widget")]}])
+        bb_ops.projects_list(_client(opener))
+        assert opener.calls[0]["url"].startswith(
+            DEFAULT_API_BASE + "/workspaces/acme/projects?"
+        )
+
+    def test_explicit_workspace_overrides_config(self) -> None:
+        opener = _CaptureOpener([{"values": [_project_value("WID", "Widget")]}])
+        bb_ops.projects_list(_client(opener), workspace="widget-co")
+        assert opener.calls[0]["url"].startswith(
+            DEFAULT_API_BASE + "/workspaces/widget-co/projects?"
+        )
+
+    def test_returns_raw_records_not_just_key(self) -> None:
+        # Callers (agent, bash) decide how to render — surface the full
+        # record including uuid so downstream tools can target by uuid.
+        opener = _CaptureOpener([{"values": [_project_value("WID", "Widget")]}])
+        result = bb_ops.projects_list(_client(opener))
+        assert result[0]["uuid"] == "{wid-uuid}"
+
+    def test_count_walks_pages(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [_project_value(f"P{i}", f"Proj {i}") for i in range(100)],
+                    "next": DEFAULT_API_BASE + "/workspaces/acme/projects?page=2",
+                },
+                {"values": [_project_value(f"P{i}", f"Proj {i}") for i in range(100, 150)]},
+            ]
+        )
+        result = bb_ops.projects_list(_client(opener), count=150)
+        assert len(result) == 150
+        assert len(opener.calls) == 2
+        assert "page=2" in opener.calls[1]["url"]
+
+    def test_count_caps_response(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [_project_value(f"P{i}", f"Proj {i}") for i in range(10)]}]
+        )
+        result = bb_ops.projects_list(_client(opener), count=3)
+        assert len(result) == 3
+
+    def test_403_no_scope_translates_from_httperror(self) -> None:
+        """A token without `read:project:bitbucket` returns 403 with
+        Bitbucket's scope-error body. Raise the real urllib HTTPError so
+        the HTTPError→BBApiError translation layer is exercised; the
+        scope name must survive into BBApiError.body so the caller can
+        tell the user which scope to add."""
+        from bb_api import BBApiError
+        body = (
+            '{"error": {"message": "Your credentials lack one or more required '
+            'privilege scopes.", "detail": {"required": ["read:project:bitbucket"]}}}'
+        )
+        http_err = urllib.error.HTTPError(
+            url=DEFAULT_API_BASE + "/workspaces/acme/projects?pagelen=100",
+            code=403,
+            msg="Forbidden",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(body.encode("utf-8")),
+        )
+        opener = _CaptureOpener([http_err])
+        with pytest.raises(BBApiError) as exc:
+            bb_ops.projects_list(_client(opener))
+        assert exc.value.status == 403
+        assert "read:project:bitbucket" in exc.value.body
+
+    @pytest.mark.parametrize("bad_ws", ["", "   ", "acme/widget", ".", ".."])
+    def test_rejects_bad_workspace_no_network(self, bad_ws: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.projects_list(_client(opener), workspace=bad_ws)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad", [0, -1, True, False, "ten", None, 1.5])
+    def test_rejects_non_positive_count(self, bad: Any) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="count"):
+            bb_ops.projects_list(_client(opener), count=bad)
+        assert opener.calls == []
+
+
+# ===========================================================================
 # repos_list
 # ===========================================================================
 
@@ -400,6 +523,99 @@ class TestRepoCreate:
         opener = _CaptureOpener([])
         with pytest.raises(ValueError, match="project_key"):
             bb_ops.repo_create(
+                _client(opener), "acme", "widget-service", project_key=bad_project
+            )
+        assert opener.calls == []
+
+
+# ===========================================================================
+# repo_update
+# ===========================================================================
+
+
+class TestRepoUpdate:
+    def test_puts_project_to_repo_path(self) -> None:
+        # The move use case: PUT to the SAME path repo_show GETs, with a
+        # body carrying only the new project key.
+        opener = _CaptureOpener(
+            [{"full_name": "acme/widget-service", "project": {"key": "WID"}}]
+        )
+        result = bb_ops.repo_update(
+            _client(opener), "acme", "widget-service", project_key="WID"
+        )
+        assert result["project"]["key"] == "WID"
+        call = opener.calls[0]
+        assert call["url"] == _repo_url()
+        assert call["method"] == "PUT"
+        # Body carries ONLY the project — description absent (not sent).
+        assert call["body"] == {"project": {"key": "WID"}}
+
+    def test_puts_description_only(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_update(
+            _client(opener), "acme", "widget-service", description="New desc"
+        )
+        body = opener.calls[0]["body"]
+        assert body == {"description": "New desc"}
+        assert "project" not in body
+
+    def test_puts_both_fields(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            project_key="WID",
+            description="New desc",
+        )
+        assert opener.calls[0]["body"] == {
+            "project": {"key": "WID"},
+            "description": "New desc",
+        }
+
+    def test_project_strips_whitespace(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_update(
+            _client(opener), "acme", "widget-service", project_key="  WID  "
+        )
+        assert opener.calls[0]["body"]["project"] == {"key": "WID"}
+
+    def test_empty_description_is_a_change_and_is_sent(self) -> None:
+        # An empty-string description is an intentional clear, NOT "no
+        # field supplied". It must be sent (body present) and must NOT
+        # trip the "at least one field" guard. project_key=None means the
+        # project key stays absent from the body.
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_update(
+            _client(opener), "acme", "widget-service", description=""
+        )
+        assert opener.calls[0]["body"] == {"description": ""}
+
+    def test_rejects_no_fields_no_network(self) -> None:
+        # A PUT with an empty body is a no-op round-trip. Reject at the
+        # boundary before any API call fires.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="at least one field"):
+            bb_ops.repo_update(_client(opener), "acme", "widget-service")
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_slug", ["", "   ", "a/b", ".", ".."])
+    def test_rejects_bad_slug_no_network(self, bad_slug: str) -> None:
+        # repo_path enforces the slug contract; no PUT may fire on a
+        # malformed slug. Pass a valid field so the rejection is the slug,
+        # not the empty-body guard.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.repo_update(
+                _client(opener), "acme", bad_slug, project_key="WID"
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_project", ["", "   "])
+    def test_rejects_empty_project_when_provided(self, bad_project: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="project_key"):
+            bb_ops.repo_update(
                 _client(opener), "acme", "widget-service", project_key=bad_project
             )
         assert opener.calls == []
@@ -787,6 +1003,162 @@ class TestVarsSetDeploymentScope:
                 scope="deployment", environment="Nonexistent",
             )
         # Only the env-list GET happened; no variable lookup, no write.
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "GET"
+
+
+# ===========================================================================
+# environments (list / create / delete)
+# ===========================================================================
+
+
+class TestEnvironmentsList:
+    def test_lists_environments(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [
+                {"name": "Production", "slug": "production", "uuid": "{p}",
+                 "environment_type": {"name": "Production"}},
+                {"name": "Test", "slug": "test", "uuid": "{t}",
+                 "environment_type": {"name": "Test"}},
+            ]}]
+        )
+        result = bb_ops.environments_list(_client(opener), "acme", "widget-service")
+        assert [e["name"] for e in result] == ["Production", "Test"]
+        call = opener.calls[0]
+        # Trailing-slash collection path + pagelen.
+        assert call["url"].startswith(_env_list_url() + "?")
+        assert "pagelen=100" in call["url"]
+        assert call["method"] == "GET"
+
+    def test_count_caps_response(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": f"e{i}", "uuid": f"{{{i}}}"} for i in range(10)]}]
+        )
+        result = bb_ops.environments_list(
+            _client(opener), "acme", "widget-service", count=3
+        )
+        assert len(result) == 3
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "ten", None])
+    def test_rejects_non_positive_count(self, bad: Any) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="count"):
+            bb_ops.environments_list(
+                _client(opener), "acme", "widget-service", count=bad
+            )
+        assert opener.calls == []
+
+
+class TestEnvironmentCreate:
+    def test_posts_name_and_type(self) -> None:
+        opener = _CaptureOpener(
+            [{"name": "ci-smoke", "uuid": "{new}", "environment_type": {"name": "Test"}}]
+        )
+        result = bb_ops.environment_create(
+            _client(opener), "acme", "widget-service", "ci-smoke"
+        )
+        assert result["uuid"] == "{new}"
+        call = opener.calls[0]
+        assert call["url"] == _env_list_url()
+        assert call["method"] == "POST"
+        # Default type is Test; body shape verified against the live API.
+        assert call["body"] == {
+            "name": "ci-smoke",
+            "environment_type": {"name": "Test"},
+        }
+
+    @pytest.mark.parametrize(
+        "given,canonical",
+        [("staging", "Staging"), ("PRODUCTION", "Production"), ("Test", "Test")],
+    )
+    def test_type_canonicalised_case_insensitive(
+        self, given: str, canonical: str
+    ) -> None:
+        opener = _CaptureOpener([{"name": "e", "uuid": "{u}"}])
+        bb_ops.environment_create(
+            _client(opener), "acme", "widget-service", "e",
+            environment_type=given,
+        )
+        assert opener.calls[0]["body"]["environment_type"] == {"name": canonical}
+
+    def test_name_stripped(self) -> None:
+        opener = _CaptureOpener([{"name": "e", "uuid": "{u}"}])
+        bb_ops.environment_create(
+            _client(opener), "acme", "widget-service", "  prod  "
+        )
+        assert opener.calls[0]["body"]["name"] == "prod"
+
+    @pytest.mark.parametrize("bad_name", ["", "   "])
+    def test_rejects_empty_name_no_network(self, bad_name: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="name"):
+            bb_ops.environment_create(
+                _client(opener), "acme", "widget-service", bad_name
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_type", ["Bogus", "prod", "", "   "])
+    def test_rejects_bad_type_no_network(self, bad_type: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment_type"):
+            bb_ops.environment_create(
+                _client(opener), "acme", "widget-service", "e",
+                environment_type=bad_type,
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_slug", ["", "   ", "a/b", ".", ".."])
+    def test_rejects_bad_slug_no_network(self, bad_slug: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.environment_create(
+                _client(opener), "acme", bad_slug, "e"
+            )
+        assert opener.calls == []
+
+
+class TestEnvironmentDelete:
+    def test_resolves_name_then_deletes(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [
+                    {"name": "ci-smoke", "slug": "ci-smoke", "uuid": "{env-cs}"},
+                ]},
+                None,  # DELETE → 204 / no body
+            ]
+        )
+        bb_ops.environment_delete(
+            _client(opener), "acme", "widget-service", "ci-smoke"
+        )
+        # First: env list GET (resolve name → uuid). Second: DELETE to the
+        # uuid path (braces URL-encoded, trailing slash).
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[0]["method"] == "GET"
+        delete = opener.calls[1]
+        assert delete["method"] == "DELETE"
+        assert delete["url"] == _env_list_url() + "%7Benv-cs%7D/"
+
+    def test_case_insensitive_name_match(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Production", "slug": "production", "uuid": "{p}"}]},
+                None,
+            ]
+        )
+        bb_ops.environment_delete(
+            _client(opener), "acme", "widget-service", "production"
+        )
+        assert opener.calls[1]["url"] == _env_list_url() + "%7Bp%7D/"
+
+    def test_unknown_env_raises_before_delete(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Production", "slug": "production", "uuid": "{p}"}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound):
+            bb_ops.environment_delete(
+                _client(opener), "acme", "widget-service", "no-such-env"
+            )
+        # Only the resolve GET fired; no DELETE.
         assert len(opener.calls) == 1
         assert opener.calls[0]["method"] == "GET"
 

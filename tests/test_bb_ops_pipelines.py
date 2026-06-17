@@ -642,3 +642,102 @@ class TestResolveStepUuid:
                 _client(opener), "acme", "widget-service", "pipe-uuid", -1
             )
         assert opener.calls == []
+
+
+# ===========================================================================
+# pipelines_config_show / pipelines_config_set (enable / disable / status)
+# ===========================================================================
+
+
+def _pipelines_config_url() -> str:
+    return DEFAULT_API_BASE + "/repositories/acme/widget-service/pipelines_config"
+
+
+class TestPipelinesConfigShow:
+    def test_gets_pipelines_config(self) -> None:
+        opener = _CaptureOpener(
+            [{"enabled": True, "type": "repository_pipelines_configuration"}]
+        )
+        result = bb_ops.pipelines_config_show(
+            _client(opener), "acme", "widget-service"
+        )
+        assert result["enabled"] is True
+        # Existing config gets a `configured: True` marker added.
+        assert result["configured"] is True
+        call = opener.calls[0]
+        assert call["url"] == _pipelines_config_url()
+        assert call["method"] == "GET"
+        assert call["body"] is None
+
+    def test_404_translates_to_disabled_unconfigured(self) -> None:
+        # Verified live: the GET 404s when Pipelines has never been
+        # configured. That's the normal "never enabled" state, NOT an
+        # error, so it must translate to enabled=False, configured=False.
+        # Raise the REAL urllib HTTPError so the HTTPError->BBApiError
+        # translation in bb_api._request is exercised before the 404
+        # branch in pipelines_config_show runs.
+        http_err = urllib.error.HTTPError(
+            url=_pipelines_config_url(),
+            code=404,
+            msg="Not Found",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(b'{"error": {"message": "Not found"}}'),
+        )
+        opener = _CaptureOpener([http_err])
+        result = bb_ops.pipelines_config_show(
+            _client(opener), "acme", "widget-service"
+        )
+        assert result == {"enabled": False, "configured": False}
+
+    def test_non_404_error_propagates(self) -> None:
+        # A 403 (scope) or 500 must NOT be swallowed as "disabled" — only
+        # 404 means "never configured".
+        http_err = urllib.error.HTTPError(
+            url=_pipelines_config_url(),
+            code=403,
+            msg="Forbidden",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(b'{"error": {"message": "scope"}}'),
+        )
+        opener = _CaptureOpener([http_err])
+        with pytest.raises(BBApiError) as exc:
+            bb_ops.pipelines_config_show(_client(opener), "acme", "widget-service")
+        assert exc.value.status == 403
+
+
+class TestPipelinesConfigSet:
+    def test_enable_puts_enabled_true(self) -> None:
+        opener = _CaptureOpener([{"enabled": True}])
+        result = bb_ops.pipelines_config_set(
+            _client(opener), "acme", "widget-service", enabled=True
+        )
+        assert result["enabled"] is True
+        call = opener.calls[0]
+        assert call["url"] == _pipelines_config_url()
+        assert call["method"] == "PUT"
+        assert call["body"] == {"enabled": True}
+
+    def test_disable_puts_enabled_false(self) -> None:
+        opener = _CaptureOpener([{"enabled": False}])
+        bb_ops.pipelines_config_set(
+            _client(opener), "acme", "widget-service", enabled=False
+        )
+        assert opener.calls[0]["body"] == {"enabled": False}
+
+    @pytest.mark.parametrize("bad", ["true", 1, 0, None])
+    def test_rejects_non_bool_enabled_no_network(self, bad: object) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="enabled"):
+            bb_ops.pipelines_config_set(
+                _client(opener), "acme", "widget-service", enabled=bad  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_slug", ["", "   ", "a/b", ".", ".."])
+    def test_rejects_bad_slug_no_network(self, bad_slug: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.pipelines_config_set(
+                _client(opener), "acme", bad_slug, enabled=True
+            )
+        assert opener.calls == []

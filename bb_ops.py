@@ -333,6 +333,63 @@ def pipeline_logs(
     return client.fetch_redirected_text(path, timeout=timeout)
 
 
+# --- Pipelines configuration (enable / disable / status) ---
+#
+# A repo's Pipelines feature is toggled via the pipelines_config resource:
+#   GET /repositories/{ws}/{slug}/pipelines_config   → {"enabled": bool, ...}
+#   PUT  ...                          {"enabled": true|false} → updated config
+# Pipelines must be ENABLED before repo pipeline variables, custom
+# pipelines, or builds work at all — this is the "CI won't run / vars
+# won't take" gap. Note (verified live): the GET 404s when Pipelines has
+# never been configured on the repo (the pre-enable state), rather than
+# returning {"enabled": false}. pipelines_config_show translates that 404
+# into a clean {"enabled": false, "configured": false} so callers get a
+# definite answer instead of an exception for the common "never enabled"
+# case.
+
+
+def pipelines_config_show(
+    client: BBClient, workspace: str, repo: str
+) -> dict[str, Any]:
+    """Return the repo's Pipelines configuration: `{"enabled": bool, ...}`.
+
+    GET /repositories/{ws}/{slug}/pipelines_config. When Pipelines has
+    never been configured the API 404s; this is the normal "never enabled"
+    state, so it's translated to `{"enabled": False, "configured": False}`
+    rather than propagating BBApiError. When the config exists, the raw
+    record is returned with a `"configured": True` marker added.
+    """
+    path = f"{repo_path(workspace, repo)}/pipelines_config"
+    try:
+        result = client.get(path)
+    except BBApiError as e:
+        if e.status == 404:
+            return {"enabled": False, "configured": False}
+        raise
+    if isinstance(result, dict):
+        result.setdefault("configured", True)
+    return result
+
+
+def pipelines_config_set(
+    client: BBClient, workspace: str, repo: str, *, enabled: bool
+) -> dict[str, Any]:
+    """Enable or disable Pipelines on a repo.
+
+    PUT /repositories/{ws}/{slug}/pipelines_config with
+    `{"enabled": true|false}`. Returns the updated configuration record.
+
+    Requires `admin:pipeline:bitbucket` scope on the token (toggling the
+    Pipelines feature is a pipeline-admin operation, same scope family as
+    `vars_set`). `write:pipeline:bitbucket` alone is insufficient; a 403
+    names the missing scope under `error.detail.required`.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a bool, got {type(enabled).__name__}")
+    path = f"{repo_path(workspace, repo)}/pipelines_config"
+    return client.put(path, json_body={"enabled": enabled})
+
+
 # ===========================================================================
 #  PULL REQUEST OPERATIONS
 # ===========================================================================
@@ -766,6 +823,52 @@ def workspaces_list(
     return out
 
 
+def projects_list(
+    client: BBClient,
+    workspace: str | None = None,
+    *,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """List the projects in a workspace.
+
+    Uses `GET /2.0/workspaces/{workspace}/projects` (paginated). Each
+    value is a project record carrying `.key` (the short project key used
+    in repo bodies, e.g. `WID`), `.name`, `.uuid`, and `.links`.
+
+    `workspace=None` defaults to the client's configured workspace
+    (`client.config.workspace`); pass an explicit workspace to query a
+    different one.
+
+    Requires the `read:project:bitbucket` scope on the API token. A token
+    without it surfaces Bitbucket's "credentials lack one or more required
+    privilege scopes" 403 verbatim through the BBApiError path; the exact
+    missing scope is recoverable from the error body under
+    `error.detail.required`.
+    """
+    ws = workspace if workspace is not None else client.config.workspace
+    # Mirror repos_list: this op doesn't route through repo_path (it's a
+    # workspace-level listing, no slug), so the workspace contract is
+    # validated inline — empty/whitespace AND embedded `/`, `.`, `..`.
+    if not isinstance(ws, str) or not ws.strip():
+        raise ValueError(f"workspace must be a non-empty string, got {ws!r}")
+    if "/" in ws:
+        raise ValueError(f"workspace must not contain '/', got {ws!r}")
+    if ws in (".", ".."):
+        raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"pagelen": pagelen}
+
+    out: list[dict[str, Any]] = []
+    for p in client.paginate(f"/workspaces/{ws}/projects", query=q):
+        out.append(p)
+        if len(out) >= count:
+            break
+    return out
+
+
 # ===========================================================================
 #  REPOSITORY / BRANCH / VARIABLES / DOWNLOADS / COMMITS
 # ===========================================================================
@@ -880,6 +983,166 @@ def repo_create(
         payload["description"] = description
 
     return client.post(path, json_body=payload)
+
+
+def repo_update(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    *,
+    project_key: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Update an existing repository via PUT /repositories/{workspace}/{repo}.
+
+    Bitbucket's update endpoint is a PUT to the SAME path repo_show GETs
+    and repo_create POSTs; only the fields present in the body change. The
+    dominant use is moving a repo between projects (repo_create takes a
+    project but nothing could change it afterward — this closes that gap).
+
+    `project_key` maps to the body's `{"project": {"key": ...}}` — that's
+    how Bitbucket reassigns a repo's project. `description` updates the
+    repo description. At least one field must be supplied; a PUT with an
+    empty body would be a no-op round-trip, so it's rejected at the
+    boundary rather than burning an API call.
+
+    Requires `admin:repository:bitbucket` scope on the token (same as
+    repo_create — changing repo settings is an admin operation).
+    `write:repository:bitbucket` alone returns 403, whose body names the
+    missing scope under `error.detail.required`.
+
+    Returns the updated repo record.
+    """
+    # repo_path validates workspace + slug at the boundary (empty,
+    # whitespace, embedded '/', '.', '..') — reuse it so update enforces
+    # the exact same slug contract as every other repo op.
+    path = repo_path(workspace, repo)
+
+    payload: dict[str, Any] = {}
+    if project_key is not None:
+        if not isinstance(project_key, str) or not project_key.strip():
+            raise ValueError(
+                f"project_key must be a non-empty, non-whitespace string when "
+                f"provided, got {project_key!r}"
+            )
+        payload["project"] = {"key": project_key.strip()}
+    if description is not None:
+        if not isinstance(description, str):
+            raise ValueError(
+                f"description must be a string when provided, got "
+                f"{type(description).__name__}"
+            )
+        payload["description"] = description
+
+    if not payload:
+        raise ValueError(
+            "repo_update requires at least one field to change "
+            "(project_key and/or description)"
+        )
+
+    return client.put(path, json_body=payload)
+
+
+# --- Deployment environments ---
+#
+# Deployment environments are the named targets a pipeline deploys to
+# (Test / Staging / Production), each carrying its own deployment
+# variables (covered separately by vars_set --deployment). These ops
+# manage the environments themselves:
+#   GET    /repositories/{ws}/{slug}/environments/            → list
+#   POST   ...   {"name", "environment_type": {"name"}}       → create
+#   DELETE ...   /{env_uuid}/                                 → delete
+# Body shape + 201/204 responses verified against the live API. The
+# environment_type.name is one of Bitbucket's deployment categories:
+# Test, Staging, Production.
+
+# Bitbucket's deployment environment categories. The POST body's
+# environment_type.name must be one of these (verified live: "Test"
+# accepted). Compared case-insensitively, sent in Bitbucket's canonical
+# capitalisation.
+_ENVIRONMENT_TYPES = {"test": "Test", "staging": "Staging", "production": "Production"}
+
+
+def environments_list(
+    client: BBClient, workspace: str, repo: str, *, count: int = 100
+) -> list[dict[str, Any]]:
+    """List the repo's deployment environments.
+
+    GET /repositories/{ws}/{slug}/environments/ (paginated). Each record
+    carries `.name`, `.slug`, `.uuid`, and `.environment_type`.
+    """
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    out: list[dict[str, Any]] = []
+    for env in client.paginate(
+        f"{repo_path(workspace, repo)}/environments/",
+        query={"pagelen": pagelen},
+    ):
+        out.append(env)
+        if len(out) >= count:
+            break
+    return out
+
+
+def environment_create(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    name: str,
+    *,
+    environment_type: str = "Test",
+) -> dict[str, Any]:
+    """Create a deployment environment.
+
+    POST /repositories/{ws}/{slug}/environments/ with
+    `{"name": ..., "environment_type": {"name": ...}}`. `environment_type`
+    is one of Test / Staging / Production (case-insensitive; sent in
+    canonical capitalisation). Returns the created environment record
+    (includes its `uuid`, needed for delete and for vars --deployment).
+
+    Requires `admin:pipeline:bitbucket` scope on the token (deployment
+    environments are part of the Pipelines admin surface). A 403 names the
+    missing scope under `error.detail.required`.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            f"name must be a non-empty, non-whitespace string, got {name!r}"
+        )
+    if not isinstance(environment_type, str) or not environment_type.strip():
+        raise ValueError(
+            f"environment_type must be a non-empty string, got {environment_type!r}"
+        )
+    canonical = _ENVIRONMENT_TYPES.get(environment_type.strip().casefold())
+    if canonical is None:
+        raise ValueError(
+            f"environment_type must be one of Test / Staging / Production, "
+            f"got {environment_type!r}"
+        )
+    path = f"{repo_path(workspace, repo)}/environments/"
+    payload = {"name": name.strip(), "environment_type": {"name": canonical}}
+    return client.post(path, json_body=payload)
+
+
+def environment_delete(
+    client: BBClient, workspace: str, repo: str, environment: str
+) -> Any:
+    """Delete a deployment environment by NAME (or slug).
+
+    Resolves the name to its UUID (reusing the same lookup as
+    vars --deployment), then DELETEs
+    /repositories/{ws}/{slug}/environments/{env_uuid}/. Returns the raw
+    response (None on success — Bitbucket returns 204). Raises
+    BBOpNotFound if no environment matches the name, so a typo fails
+    clearly instead of silently no-op'ing.
+
+    Requires `admin:pipeline:bitbucket` scope on the token (same as
+    create). A 403 names the missing scope under `error.detail.required`.
+    """
+    uuid = _resolve_environment_uuid(client, workspace, repo, environment)
+    encoded = quote(uuid, safe="")
+    path = f"{repo_path(workspace, repo)}/environments/{encoded}/"
+    return client.delete(path)
 
 
 # --- Branches ---
