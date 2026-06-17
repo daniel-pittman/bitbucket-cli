@@ -789,10 +789,18 @@ cmd_pipelines_status() {
     # split the two. One request (no re-probe), so there's no window where
     # the state changes between two calls. Mirrors the auth + base that
     # bb_get uses, so BB_API_BASE overrides still apply.
-    local path raw code body
+    local path raw code body rc=0
     path="$(repo_path "$repo")/pipelines_config"
+    # `|| rc=$?` so a transport-level curl failure (DNS, TLS, connection
+    # refused — NOT an HTTP error, since we don't pass -f) surfaces a
+    # friendly message instead of tripping `set -e` and exiting silently.
     raw=$(curl -s -w '\n%{http_code}' \
-        -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}")
+        -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Could not read pipelines config (curl exit $rc)." >&2
+        echo "  This looks like a connectivity error (not an HTTP response)." >&2
+        exit "$rc"
+    fi
     code="${raw##*$'\n'}"     # last line: the HTTP status code
     body="${raw%$'\n'*}"      # everything before it: the response body
 
