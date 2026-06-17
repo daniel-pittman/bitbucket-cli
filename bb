@@ -1580,12 +1580,12 @@ cmd_repo_update() {
     # [repo] accepts the same shapes as every other repo command: bare
     # slug, ws/slug, or omitted (auto-detect from git origin). At least
     # one of --project / --description must be supplied.
-    local repo_arg="" project="" description="" have_description=""
+    local repo_arg="" project="" description="" have_project="" have_description=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --project)        _require_flag_value "$@"; project="$2"; shift 2 ;;
-            --project=*)      project="${1#*=}"; shift ;;
+            --project)        _require_flag_value "$@"; project="$2"; have_project=1; shift 2 ;;
+            --project=*)      project="${1#*=}"; have_project=1; shift ;;
             --description)    _require_flag_value "$@"; description="$2"; have_description=1; shift 2 ;;
             --description=*)  description="${1#*=}"; have_description=1; shift ;;
             -*)
@@ -1602,12 +1602,26 @@ cmd_repo_update() {
         esac
     done
 
+    # When --project is supplied, validate + strip the KEY at the boundary
+    # so the two surfaces agree on the contract: bb_ops.repo_update rejects
+    # an empty/whitespace project_key and strips a padded one. Without this,
+    # `--project ""` would be silently dropped (and `--project "  WID  "`
+    # sent verbatim, 400ing at the API) — a parity divergence from Python.
+    # Strip first (true `.strip()` parity), then reject if nothing remains.
+    if [[ -n "$have_project" ]]; then
+        project="$(printf '%s' "$project" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [[ -z "$project" ]]; then
+            echo "Error: --project requires a non-empty, non-whitespace KEY." >&2
+            exit 1
+        fi
+    fi
+
     # At least one field must change; a PUT with an empty body is a no-op
     # round-trip. Reject BEFORE resolving the repo so the usage error
     # surfaces without an API call (parity with bb_ops.repo_update).
-    # `have_description` (not `-n "$description"`) so `--description ""`
+    # Gate on the `have_*` flags (not `-n "$value"`) so `--description ""`
     # (an intentional clear) counts as a field to change.
-    if [[ -z "$project" && -z "$have_description" ]]; then
+    if [[ -z "$have_project" && -z "$have_description" ]]; then
         echo "Usage: bb repo-update [repo] --project KEY [--description TEXT]" >&2
         echo "" >&2
         echo "  Updates an existing repo. At least one of --project /" >&2
@@ -1626,10 +1640,10 @@ cmd_repo_update() {
 
     # Build the body with jq so values are escaped. Add only the fields
     # supplied so the body matches the Python omit-when-absent contract
-    # (bb_ops.repo_update). `have_description` gates description so an
+    # (bb_ops.repo_update). The `have_*` flags gate each field so an
     # intentional clear (`--description ""`) is still sent.
     local payload="{}"
-    if [[ -n "$project" ]]; then
+    if [[ -n "$have_project" ]]; then
         payload=$(echo "$payload" | jq --arg k "$project" '. + {project: {key: $k}}')
     fi
     if [[ -n "$have_description" ]]; then
