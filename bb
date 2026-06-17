@@ -2508,7 +2508,9 @@ cmd_vars_delete() {
         page=$(bb_get "$page_url") || rc=$?
         if [[ "$rc" -ne 0 ]]; then
             echo "vars-delete lookup failed (exit $rc) while resolving '${key}'." >&2
-            echo "  Aborting before any delete. Check token scope / connectivity." >&2
+            echo "  Aborting before any delete. The token may lack" >&2
+            echo "  admin:pipeline:bitbucket scope (write:pipeline alone is not" >&2
+            echo "  enough for any variable scope), or check connectivity." >&2
             exit "$rc"
         fi
         local matched uuid_val
@@ -2722,7 +2724,7 @@ REPOSITORY
                                           --value V | --value-file F | --value-env E
                                           (use --value-file/--value-env for secrets)
   bb vars delete [scope] [repo] <KEY>   Delete a pipeline variable (destructive)
-                                          scope: --workspace | --deployment <env>
+    (alias: bb vars rm ...)               scope: --workspace | --deployment <env>
                                           (default: repo)
 
 UTILITIES

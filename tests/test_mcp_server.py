@@ -1131,6 +1131,23 @@ class TestRepoTools:
         assert deleter.calls[0][1]["scope"] == "workspace"
         assert out["ok"] is True
 
+    def test_vars_delete_workspace_scope_borrows_workspace_from_hint(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # Parity with vars_set: a "otherws/x" repo hint at workspace scope
+        # borrows the alternate workspace via _resolve_vars_scope while
+        # still threading repo_slug=None (workspace vars have no repo).
+        deleter = _recorder({"key": "SHARED", "scope": "workspace",
+                             "environment": None, "uuid": "{u}"})
+        with patch.object(bb_ops, "vars_delete", deleter):
+            out = mcp_server.vars_delete(
+                key="SHARED", repo="otherws/x", scope="workspace"
+            )
+        assert deleter.calls[0][0][1] == "otherws"   # workspace from hint
+        assert deleter.calls[0][0][2] is None         # no repo at ws scope
+        assert out["ok"] is True
+        assert out["workspace"] == "otherws"
+
     def test_vars_delete_deployment_passes_environment(
         self, stub_client: bb_api.BBClient
     ) -> None:
