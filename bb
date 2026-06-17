@@ -778,38 +778,41 @@ cmd_pipelines_status() {
     local repo
     resolve_repo "${1:-}"
 
-    local path response rc=0
+    # The status command must distinguish a 404 ("never configured" — the
+    # normal pre-enable state, reported as disabled) from a 403 (token
+    # lacks read:pipeline:bitbucket) or any other error, which must be
+    # surfaced. The Python side (bb_ops.pipelines_config_show) translates
+    # ONLY a 404 and re-raises everything else. `bb_get` uses `curl -f`,
+    # which collapses every HTTP >=400 to exit 22 with no body, so it can't
+    # make that distinction. Do a single un-`-f`'d curl that writes the
+    # body to stdout with the status code appended on its own line, then
+    # split the two. One request (no re-probe), so there's no window where
+    # the state changes between two calls. Mirrors the auth + base that
+    # bb_get uses, so BB_API_BASE overrides still apply.
+    local path raw code body
     path="$(repo_path "$repo")/pipelines_config"
-    response=$(bb_get "$path") || rc=$?
-    if [[ "$rc" -ne 0 ]]; then
-        # curl -f (bb_get) exits 22 on ANY HTTP >=400, so rc=22 alone
-        # cannot tell a 404 ("never configured" — the normal pre-enable
-        # state) from a 403 (token lacks read:pipeline:bitbucket) or a
-        # 500. The Python side (bb_ops.pipelines_config_show) only
-        # translates a 404 and re-raises everything else; mirror that here
-        # by re-probing for the exact status code. Reporting a 403 as
-        # "disabled" would send a user debugging "why won't my variables
-        # take?" after the wrong fix.
-        if [[ "$rc" -eq 22 ]]; then
-            local code
-            code=$(curl -s -o /dev/null -w '%{http_code}' \
-                -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}")
-            if [[ "$code" == "404" ]]; then
-                echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
-                return
-            fi
+    raw=$(curl -s -w '\n%{http_code}' \
+        -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}")
+    code="${raw##*$'\n'}"     # last line: the HTTP status code
+    body="${raw%$'\n'*}"      # everything before it: the response body
+
+    case "$code" in
+        2*)
+            local enabled
+            enabled=$(echo "$body" | jq -r '.enabled // false')
+            echo "Pipelines: $([[ "$enabled" == "true" ]] && echo enabled || echo disabled) for ${BB_WORKSPACE}/${repo}"
+            ;;
+        404)
+            echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
+            ;;
+        *)
             echo "Could not read pipelines config (HTTP ${code})." >&2
             if [[ "$code" == "403" ]]; then
                 echo "  The token lacks read:pipeline:bitbucket scope." >&2
             fi
             exit 22
-        fi
-        echo "Could not read pipelines config (exit $rc)." >&2
-        exit "$rc"
-    fi
-    local enabled
-    enabled=$(echo "$response" | jq -r '.enabled // false')
-    echo "Pipelines: $([[ "$enabled" == "true" ]] && echo enabled || echo disabled) for ${BB_WORKSPACE}/${repo}"
+            ;;
+    esac
 }
 
 # Shared enable/disable body. Args: <repo-arg> <true|false>.
