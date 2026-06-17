@@ -144,7 +144,7 @@ Your Bitbucket account needs these workspace permissions:
 | Enable/disable Pipelines (`bb pipelines-enable`, `bb pipelines-disable`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. |
 | List deployment environments (`bb environments`) | **Read** access to Pipelines (`read:pipeline:bitbucket`). |
 | Create/delete deployment environments (`bb environment-create`, `bb environment-delete`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. |
-| Set pipeline variables, any scope (`bb vars set`, `bb vars set --workspace`, `bb vars set --deployment <env>`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. This one scope covers all three variable scopes (repo, workspace, deployment-environment); verified against the live 403 envelope for each. |
+| Set or delete pipeline variables, any scope (`bb vars set`, `bb vars delete`, with `--workspace` / `--deployment <env>`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. This one scope covers set and delete at all three variable scopes (repo, workspace, deployment-environment); verified against the live 403 envelope. |
 
 Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too — provided the token carries the scope. The cross-workspace listing endpoints (`/2.0/workspaces`, `/2.0/repositories?role=member`) were removed under Atlassian's [CHANGE-2770](https://developer.atlassian.com/cloud/bitbucket/changelog/) on 2026-04-14; `bb workspaces` uses the replacement `/2.0/user/workspaces` endpoint (CHANGE-3022) which requires the `read:workspace:bitbucket` scope. Rotating the token to add it leaves existing tokens unchanged.
 
@@ -211,6 +211,7 @@ bb environment-create [repo] <name> [--type T]  # Create a deployment environmen
 bb environment-delete [repo] <name>   # Delete a deployment environment
 bb vars [scope] [repo]                # List pipeline variables (repo|workspace|deployment)
 bb vars set [scope] [repo] <KEY> [opts]  # Create or update a pipeline variable
+bb vars delete [scope] [repo] <KEY>   # Delete a pipeline variable (destructive)
 ```
 
 `bb environments` lists a repo's deployment environments (the named targets a pipeline deploys to: Test / Staging / Production). `bb environment-create <name> [--type Test|Staging|Production]` adds one (default type `Test`); `bb environment-delete <name>` removes it by name. Each environment carries its own deployment variables, managed via `bb vars [set] --deployment <env>`. Create and delete need `admin:pipeline:bitbucket` scope.
@@ -240,7 +241,7 @@ bb repo-update --project WID                            # current checkout, move
 
 Both `bb repo-create` and `bb repo-update` need `admin:repository:bitbucket` scope on the token. A read/write-only token must be rotated to add it (adding a scope does not apply to an already-issued token). See [Required Bitbucket Permissions](#required-bitbucket-permissions).
 
-`bb vars` and `bb vars set` operate at three scopes, selected by a flag (default is repo):
+`bb vars`, `bb vars set`, and `bb vars delete` operate at three scopes, selected by a flag (default is repo):
 
 - repo (default): no flag.
 - workspace: `--workspace` (no repo argument; variables are shared across the workspace).
@@ -265,7 +266,15 @@ bb vars --deployment Production widget-service
 bb vars set --deployment Production widget-service DB_URL --secured --value-file ./db_url.txt
 ```
 
-All three scopes need `admin:pipeline:bitbucket` scope on the token (`write:pipeline:bitbucket` alone is not enough). A read/write-only token must be rotated to add it. See [Required Bitbucket Permissions](#required-bitbucket-permissions).
+`bb vars delete <KEY>` removes a variable by key at the chosen scope (it resolves the key to its UUID first, walking all pages). A key that does not exist at the scope fails with a clean not-found error and issues no delete. This is destructive (a secured value can't be recovered after deletion), so confirm the key and scope before running it.
+
+```bash
+bb vars delete widget-service AWS_ACCESS_KEY_ID            # repo scope
+bb vars delete --workspace DOCKERHUB_TOKEN                 # workspace scope
+bb vars delete --deployment Production widget-service DB_URL  # deployment scope
+```
+
+All three scopes, for `bb vars`, `bb vars set`, and `bb vars delete`, need `admin:pipeline:bitbucket` scope on the token (`write:pipeline:bitbucket` alone is not enough). A read/write-only token must be rotated to add it. See [Required Bitbucket Permissions](#required-bitbucket-permissions).
 
 ### Utilities
 
@@ -312,7 +321,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 
 ### What it exposes
 
-40 tools covering pipelines, pull requests, workspaces, projects, repos, branches, commits, pipeline config + variables, deployment environments, and git-context helpers:
+41 tools covering pipelines, pull requests, workspaces, projects, repos, branches, commits, pipeline config + variables, deployment environments, and git-context helpers:
 
 | Category | Tools |
 |---|---|
@@ -321,7 +330,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
 | Workspaces / projects | `workspaces_list` (needs `read:workspace:bitbucket` scope), `projects_list` (needs `read:project:bitbucket` scope) — see [Required Bitbucket Permissions](#required-bitbucket-permissions) |
-| Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `repo_update`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `downloads_list` |
+| Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `repo_update`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `vars_delete`, `downloads_list` |
 | Deployment environments | `environments_list`, `environment_create`, `environment_delete` (create/delete need `admin:pipeline:bitbucket`) |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
 | Meta | `whoami` (see note below) |

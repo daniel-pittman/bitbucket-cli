@@ -2433,6 +2433,130 @@ cmd_vars_set() {
     echo "${action} ${scope} variable ${key} on ${target} (secured: ${secured})"
 }
 
+cmd_vars_delete() {
+    # bb vars delete [--workspace | --deployment <env>] [repo] <KEY>
+    #
+    # Delete a pipeline variable by key at the chosen scope. Resolves the
+    # key to its uuid (walking all pages, same as `vars set`), then DELETEs
+    # `.../variables/{uuid}`. A key that doesn't exist at the scope is a
+    # clean not-found error with NO delete issued, so a typo can't no-op.
+    #
+    # `delete` is consumed by the dispatcher before this runs; remaining
+    # args are [repo] KEY plus scope flags. Same positional disambiguation
+    # as `vars set`: 1 positional → KEY (repo auto-detected); 2 → repo, KEY.
+    local scope="repo" environment=""
+    local positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --workspace)      scope="workspace"; shift ;;
+            --deployment)     _require_flag_value "$@"; scope="deployment"; environment="$2"; shift 2 ;;
+            --deployment=*)   scope="deployment"; environment="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for vars delete: $1" >&2
+                exit 1 ;;
+            *)
+                positionals+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$scope" == "deployment" && -z "$environment" ]]; then
+        echo "Error: --deployment requires an environment name." >&2
+        exit 1
+    fi
+    if [[ "$scope" != "deployment" && -n "$environment" ]]; then
+        echo "Error: --deployment <env> conflicts with --workspace / repo scope." >&2
+        exit 1
+    fi
+
+    local repo_arg="" key=""
+    case "${#positionals[@]}" in
+        1) key="${positionals[0]}" ;;
+        2) repo_arg="${positionals[0]}"; key="${positionals[1]}" ;;
+        *)
+            echo "Usage: bb vars delete [--workspace | --deployment <env>] [repo] <KEY>" >&2
+            exit 1 ;;
+    esac
+
+    # Strip leading/trailing whitespace from the key (parity with
+    # bb_ops.vars_delete's `key.strip()`); reject whitespace-only.
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    if [[ -z "$key" ]]; then
+        echo "Usage: bb vars delete [--workspace | --deployment <env>] [repo] <KEY>" >&2
+        exit 1
+    fi
+
+    local repo=""
+    if [[ "$scope" == "workspace" ]]; then
+        if [[ -n "$repo_arg" ]]; then
+            resolve_repo "$repo_arg"
+        else
+            resolve_workspace
+        fi
+    else
+        resolve_repo "$repo_arg"
+    fi
+    local base
+    base=$(_vars_base_path "$scope" "$repo" "$environment")
+
+    # Find the variable by key (walk all pages). Same rc-capture and
+    # `first(...)`-not-`head` discipline as cmd_vars_set's lookup.
+    local existing_uuid="" page_url="${base}?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        local page rc=0
+        page=$(bb_get "$page_url") || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            echo "vars-delete lookup failed (exit $rc) while resolving '${key}'." >&2
+            echo "  Aborting before any delete. Check token scope / connectivity." >&2
+            exit "$rc"
+        fi
+        local matched uuid_val
+        matched=$(echo "$page" | jq -c --arg k "$key" \
+            'first(.values[] | select(.key == $k)) // empty')
+        if [[ -n "$matched" ]]; then
+            uuid_val=$(printf '%s' "$matched" | jq -r '.uuid // empty')
+            if [[ -z "$uuid_val" ]]; then
+                echo "Error: variable '${key}' found but has no uuid; cannot delete." >&2
+                exit 1
+            fi
+            existing_uuid="$uuid_val"
+            break
+        fi
+        local next
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
+
+    # Not found → clean error, NO delete issued (parity with
+    # bb_ops.vars_delete raising BBOpNotFound before any DELETE).
+    if [[ -z "$existing_uuid" ]]; then
+        local where="the ${scope} scope"
+        [[ "$scope" == "deployment" ]] && where="${where} (environment '${environment}')"
+        echo "Error: no variable named '${key}' at ${where}." >&2
+        exit 1
+    fi
+
+    local encoded_uuid rc=0
+    encoded_uuid=$(_url_encode_segment "$existing_uuid")
+    bb_delete "${base}${encoded_uuid}" > /dev/null || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "vars-delete request failed (exit $rc)." >&2
+        echo "  The token may lack admin:pipeline:bitbucket scope" >&2
+        echo "  (write:pipeline alone is not enough for any variable scope)." >&2
+        exit "$rc"
+    fi
+
+    local target="${BB_WORKSPACE}"
+    [[ "$scope" != "workspace" ]] && target="${BB_WORKSPACE}/${repo}"
+    [[ "$scope" == "deployment" ]] && target="${target} [env: ${environment}]"
+    echo "Deleted ${scope} variable ${key} from ${target}"
+}
+
 # =========================================================================
 #  OPEN IN BROWSER
 # =========================================================================
@@ -2597,6 +2721,9 @@ REPOSITORY
                                           opts: --secured, and exactly one of
                                           --value V | --value-file F | --value-env E
                                           (use --value-file/--value-env for secrets)
+  bb vars delete [scope] [repo] <KEY>   Delete a pipeline variable (destructive)
+                                          scope: --workspace | --deployment <env>
+                                          (default: repo)
 
 UTILITIES
   bb whoami                             Show resolved config + git context
@@ -2701,11 +2828,14 @@ case "$command" in
     environment-create|env-create)  cmd_environment_create "$@" ;;
     environment-delete|env-delete)  cmd_environment_delete "$@" ;;
     vars)
-        # `vars set ...` is the create-or-update subcommand; bare `vars`
-        # (or `vars <repo>`) lists. Peek at the first arg to route.
+        # `vars set ...` create-or-updates; `vars delete ...` removes;
+        # bare `vars` (or `vars <repo>`) lists. Peek at the first arg.
         if [[ "${1:-}" == "set" ]]; then
             shift
             cmd_vars_set "$@"
+        elif [[ "${1:-}" == "delete" || "${1:-}" == "rm" ]]; then
+            shift
+            cmd_vars_delete "$@"
         else
             cmd_vars "$@"
         fi

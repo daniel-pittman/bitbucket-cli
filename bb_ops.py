@@ -1498,6 +1498,64 @@ def vars_set(
     return client.post(base, json_body=payload)
 
 
+def vars_delete(
+    client: BBClient,
+    workspace: str,
+    repo: str | None,
+    key: str,
+    *,
+    scope: str = "repo",
+    environment: str | None = None,
+) -> dict[str, Any]:
+    """Delete a pipeline configuration variable by key.
+
+    Resolves the variable by `key` to its UUID (walking all pages, same
+    as `vars_set` — so "not on page 1" is never mistaken for "absent"),
+    then DELETEs `.../variables/{uuid}`. Works identically across the
+    repo / workspace / deployment scopes; only the base path differs (see
+    `_variables_base`).
+
+    Raises `BBOpNotFound` if no variable with that key exists at the scope,
+    BEFORE issuing any DELETE — so a typo'd key is a clean not-found, not a
+    silent no-op or a spurious network write.
+
+    Requires `admin:pipeline:bitbucket` scope on the token (same as
+    `vars_set` — they're the same pipeline-config resource);
+    `write:pipeline:bitbucket` alone returns 403, whose body names the
+    missing scope under `error.detail.required`.
+
+    Returns `{"key", "scope", "environment", "uuid"}` so the caller can
+    confirm exactly what was removed. The MCP/bash layers add
+    `action: "deleted"`.
+    """
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(
+            f"key must be a non-empty, non-whitespace string, got {key!r}"
+        )
+    key = key.strip()
+
+    base = _variables_base(
+        client, workspace, repo, scope=scope, environment=environment
+    )
+    existing = _find_var_by_key_at(client, base, key)
+    if existing is None:
+        raise BBOpNotFound(
+            f"no variable named {key!r} at the {scope} scope"
+            + (f" (environment {environment!r})" if environment else "")
+        )
+    uuid = existing.get("uuid")
+    if not uuid:
+        # An entry with no uuid can't be addressed for DELETE — surface it
+        # rather than building a `.../variables/` (collection) DELETE that
+        # would 405 or, worse, do something unexpected.
+        raise BBOpNotFound(
+            f"variable {key!r} found but has no uuid; cannot delete"
+        )
+    encoded_uuid = quote(uuid, safe="")
+    client.delete(f"{base}{encoded_uuid}")
+    return {"key": key, "scope": scope, "environment": environment, "uuid": uuid}
+
+
 # --- Downloads (release artifacts) ---
 
 
