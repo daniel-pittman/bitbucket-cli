@@ -1666,6 +1666,64 @@ def vars_set(
 
 
 @mcp.tool()
+def vars_delete(
+    key: str,
+    repo: str = "",
+    scope: str = "repo",
+    environment: str = "",
+) -> dict[str, Any]:
+    """Delete a pipeline configuration variable by key (DESTRUCTIVE).
+
+    Resolves the variable by `key` to its UUID (walking all pages), then
+    deletes it. A key that doesn't exist at the scope returns a clean
+    not-found error in the envelope (`ok: false`) with NO delete issued,
+    so a typo can't silently no-op.
+
+    This is a destructive, hard-to-reverse operation (a secured value
+    can't be recovered after deletion). Treat it as PROPOSE-FIRST when
+    invoked ad hoc: surface the key + scope and confirm before calling,
+    the same way `pr_merge` is handled.
+
+    Args:
+        key: Variable name to delete (e.g. "AWS_ACCESS_KEY_ID").
+        repo: Repo slug, "workspace/slug", or "" to auto-detect. Ignored
+            for scope="workspace".
+        scope: "repo" (default), "workspace", or "deployment".
+        environment: Deployment environment NAME or slug. Required when
+            scope="deployment"; resolved to its UUID. Rejected otherwise.
+
+    Requires `admin:pipeline:bitbucket` scope on the token (same as
+    vars_set); `write:pipeline:bitbucket` alone returns 403, whose body
+    names the missing scope under `error.detail.required`.
+
+    Returns `{ok, workspace, repo, scope, environment, key, action:
+    "deleted"}` on success.
+    """
+    try:
+        scope_norm = (scope or "repo").strip() or "repo"
+        client, workspace, repo_slug, env = _resolve_vars_scope(
+            repo, scope, environment
+        )
+        bb_ops.vars_delete(
+            client, workspace, repo_slug,
+            key, scope=scope_norm, environment=env,
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "scope": scope_norm,
+            "environment": env,
+            "key": key.strip() if isinstance(key, str) else key,
+            "action": "deleted",
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(
+            e, key=key.strip() if isinstance(key, str) else key
+        )
+
+
+@mcp.tool()
 def downloads_list(repo: str = "", count: int = 25) -> dict[str, Any]:
     """List repository download artifacts."""
     try:

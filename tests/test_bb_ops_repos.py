@@ -789,6 +789,95 @@ class TestVarsSet:
 
 
 # ===========================================================================
+# vars_delete (repo scope)
+# ===========================================================================
+
+
+class TestVarsDelete:
+    def test_resolves_key_then_deletes(self) -> None:
+        # First: list (find by key). Second: DELETE to .../variables/{uuid}.
+        opener = _CaptureOpener(
+            [
+                {"values": [{"key": "AWS_ACCESS_KEY_ID", "uuid": "{abc-123}"}]},
+                None,  # DELETE → 204 / no body
+            ]
+        )
+        result = bb_ops.vars_delete(
+            _client(opener), "acme", "widget-service", "AWS_ACCESS_KEY_ID"
+        )
+        assert result == {
+            "key": "AWS_ACCESS_KEY_ID",
+            "scope": "repo",
+            "environment": None,
+            "uuid": "{abc-123}",
+        }
+        # Lookup is a GET to the variables list.
+        assert opener.calls[0]["method"] == "GET"
+        assert opener.calls[0]["url"].startswith(_vars_url() + "?")
+        # Delete is a DELETE to the uuid path (braces URL-encoded).
+        delete = opener.calls[1]
+        assert delete["method"] == "DELETE"
+        assert delete["url"] == _vars_url() + "%7Babc-123%7D"
+        # No body on a DELETE.
+        assert delete["body"] is None
+
+    def test_find_walks_all_pages_before_delete(self) -> None:
+        # The match is on page 2. vars_delete must follow `next` and find
+        # it, not stop at page 1 and report not-found.
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [{"key": "OTHER", "uuid": "{x}"}],
+                    "next": _vars_url() + "?page=2",
+                },
+                {"values": [{"key": "TARGET", "uuid": "{target-uuid}"}]},
+                None,  # DELETE
+            ]
+        )
+        bb_ops.vars_delete(_client(opener), "acme", "widget-service", "TARGET")
+        assert [c["method"] for c in opener.calls] == ["GET", "GET", "DELETE"]
+        assert opener.calls[2]["url"] == _vars_url() + "%7Btarget-uuid%7D"
+
+    def test_not_found_raises_before_any_delete(self) -> None:
+        # The key isn't present → BBOpNotFound, and NO DELETE fires (only
+        # the lookup GET happened). A typo can't silently no-op or write.
+        opener = _CaptureOpener([{"values": [{"key": "OTHER", "uuid": "{x}"}]}])
+        with pytest.raises(bb_ops.BBOpNotFound, match="MISSING"):
+            bb_ops.vars_delete(
+                _client(opener), "acme", "widget-service", "MISSING"
+            )
+        assert [c["method"] for c in opener.calls] == ["GET"]
+
+    def test_matched_but_no_uuid_raises_before_delete(self) -> None:
+        # An entry that matches by key but has no uuid can't be addressed
+        # for DELETE — raise rather than build a collection-path DELETE.
+        opener = _CaptureOpener([{"values": [{"key": "WEIRD", "uuid": None}]}])
+        with pytest.raises(bb_ops.BBOpNotFound, match="no uuid"):
+            bb_ops.vars_delete(
+                _client(opener), "acme", "widget-service", "WEIRD"
+            )
+        assert [c["method"] for c in opener.calls] == ["GET"]
+
+    def test_key_stripped_before_lookup(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"key": "AWS_REGION", "uuid": "{u}"}]}, None]
+        )
+        bb_ops.vars_delete(
+            _client(opener), "acme", "widget-service", "  AWS_REGION  "
+        )
+        # The DELETE happened, meaning the stripped key matched the stored
+        # "AWS_REGION" (an unstripped key would have been not-found).
+        assert opener.calls[1]["method"] == "DELETE"
+
+    @pytest.mark.parametrize("bad_key", ["", "   ", "\n"])
+    def test_rejects_empty_key_no_network(self, bad_key: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="key"):
+            bb_ops.vars_delete(_client(opener), "acme", "widget-service", bad_key)
+        assert opener.calls == []
+
+
+# ===========================================================================
 # Variable SCOPES: workspace + deployment (env-UUID resolution)
 # ===========================================================================
 
@@ -1003,6 +1092,57 @@ class TestVarsSetDeploymentScope:
                 scope="deployment", environment="Nonexistent",
             )
         # Only the env-list GET happened; no variable lookup, no write.
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "GET"
+
+
+class TestVarsDeleteWorkspaceScope:
+    def test_deletes_at_workspace_hyphen_endpoint(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"key": "SHARED", "uuid": "{ws-uuid}"}]}, None]
+        )
+        result = bb_ops.vars_delete(
+            _client(opener), "acme", None, "SHARED", scope="workspace"
+        )
+        assert result["scope"] == "workspace"
+        # Lookup + DELETE both hit the workspace HYPHEN endpoint, no repo.
+        assert opener.calls[0]["url"].startswith(_ws_vars_url() + "?")
+        assert opener.calls[1]["method"] == "DELETE"
+        assert opener.calls[1]["url"] == _ws_vars_url() + "%7Bws-uuid%7D"
+
+
+class TestVarsDeleteDeploymentScope:
+    def test_resolves_env_then_deletes(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Production", "slug": "production", "uuid": "{env-prod}"}]},
+                {"values": [{"key": "DEPLOY_VAR", "uuid": "{v-uuid}"}]},
+                None,  # DELETE
+            ]
+        )
+        bb_ops.vars_delete(
+            _client(opener), "acme", "widget-service", "DEPLOY_VAR",
+            scope="deployment", environment="Production",
+        )
+        # env list (resolve name→uuid), var lookup, then DELETE to the
+        # deployment collection's uuid path.
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[1]["url"].startswith(
+            _dep_vars_url("%7Benv-prod%7D") + "?"
+        )
+        assert opener.calls[2]["method"] == "DELETE"
+        assert opener.calls[2]["url"] == _dep_vars_url("%7Benv-prod%7D") + "%7Bv-uuid%7D"
+
+    def test_unknown_env_raises_before_any_lookup_or_delete(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Development", "slug": "development", "uuid": "{d}"}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound):
+            bb_ops.vars_delete(
+                _client(opener), "acme", "widget-service", "K",
+                scope="deployment", environment="Nonexistent",
+            )
+        # Only the env-list GET happened; no var lookup, no DELETE.
         assert len(opener.calls) == 1
         assert opener.calls[0]["method"] == "GET"
 

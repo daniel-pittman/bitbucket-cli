@@ -112,6 +112,7 @@ EXPECTED_TOOLS = {
     "branch_show",
     "vars_list",
     "vars_set",
+    "vars_delete",
     "downloads_list",
     "commits_list",
     "environments_list",
@@ -141,11 +142,11 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 40 = 8 pipelines
+    regression that drops a registration is visible. 41 = 8 pipelines
     (incl. pipelines_config show/set) + 11 PRs + 2 workspaces/projects
-    + 13 repos/metadata (incl. environments list/create/delete) + 5 git
-    context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 40
+    + 14 repos/metadata (incl. vars_delete + environments
+    list/create/delete) + 5 git context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 41
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1093,95 @@ class TestRepoTools:
         )
         assert out["ok"] is False
         assert "environment" in out["message"]
+
+    # --- vars_delete ---
+
+    def test_vars_delete_passes_key_and_reports_deleted(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        deleter = _recorder(
+            {"key": "AWS_ACCESS_KEY_ID", "scope": "repo",
+             "environment": None, "uuid": "{u}"}
+        )
+        with patch.object(bb_ops, "vars_delete", deleter):
+            out = mcp_server.vars_delete(
+                key="AWS_ACCESS_KEY_ID", repo="my-repo"
+            )
+        args, kwargs = deleter.calls[0]
+        # (client, workspace, repo_slug, key) positionally; repo resolves
+        # to config workspace "acme" + slug "my-repo".
+        assert args[1] == "acme"
+        assert args[2] == "my-repo"
+        assert args[3] == "AWS_ACCESS_KEY_ID"
+        assert kwargs["scope"] == "repo"
+        assert kwargs["environment"] is None
+        assert out["ok"] is True
+        assert out["action"] == "deleted"
+        assert out["key"] == "AWS_ACCESS_KEY_ID"
+
+    def test_vars_delete_workspace_scope_passes_none_repo(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        deleter = _recorder({"key": "SHARED", "scope": "workspace",
+                             "environment": None, "uuid": "{u}"})
+        with patch.object(bb_ops, "vars_delete", deleter):
+            out = mcp_server.vars_delete(key="SHARED", scope="workspace")
+        # Workspace scope: repo_slug threaded through is None.
+        assert deleter.calls[0][0][2] is None
+        assert deleter.calls[0][1]["scope"] == "workspace"
+        assert out["ok"] is True
+
+    def test_vars_delete_workspace_scope_borrows_workspace_from_hint(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # Parity with vars_set: a "otherws/x" repo hint at workspace scope
+        # borrows the alternate workspace via _resolve_vars_scope while
+        # still threading repo_slug=None (workspace vars have no repo).
+        deleter = _recorder({"key": "SHARED", "scope": "workspace",
+                             "environment": None, "uuid": "{u}"})
+        with patch.object(bb_ops, "vars_delete", deleter):
+            out = mcp_server.vars_delete(
+                key="SHARED", repo="otherws/x", scope="workspace"
+            )
+        assert deleter.calls[0][0][1] == "otherws"   # workspace from hint
+        assert deleter.calls[0][0][2] is None         # no repo at ws scope
+        assert out["ok"] is True
+        assert out["workspace"] == "otherws"
+
+    def test_vars_delete_deployment_passes_environment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        deleter = _recorder({"key": "DEPLOY_VAR", "scope": "deployment",
+                             "environment": "Production", "uuid": "{u}"})
+        with patch.object(bb_ops, "vars_delete", deleter):
+            out = mcp_server.vars_delete(
+                key="DEPLOY_VAR", repo="my-repo",
+                scope="deployment", environment="Production",
+            )
+        assert deleter.calls[0][1]["environment"] == "Production"
+        assert out["environment"] == "Production"
+
+    def test_vars_delete_deployment_requires_environment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # No stub: _resolve_vars_scope rejects deployment scope with no env
+        # before bb_ops.vars_delete is reached, landing in the error envelope.
+        out = mcp_server.vars_delete(
+            key="K", repo="my-repo", scope="deployment"
+        )
+        assert out["ok"] is False
+        assert "environment" in out["message"]
+
+    def test_vars_delete_not_found_surfaces_error(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        def raise_not_found(*a: Any, **k: Any) -> Any:
+            raise bb_ops.BBOpNotFound("no variable named 'MISSING' at the repo scope")
+
+        with patch.object(bb_ops, "vars_delete", raise_not_found):
+            out = mcp_server.vars_delete(key="MISSING", repo="my-repo")
+        assert out["ok"] is False
+        assert out["key"] == "MISSING"
 
     def test_branch_show_passes_name(self, stub_client: bb_api.BBClient) -> None:
         recorder = _recorder({"name": "feat/widget"})
