@@ -809,7 +809,7 @@ class TestRepoTools:
     ) -> None:
         find = _recorder(None)  # not found → "created"
         setter = _recorder({"key": "AWS_REGION", "uuid": "{u}"})
-        with patch.object(bb_ops, "_find_var_by_key", find), \
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
              patch.object(bb_ops, "vars_set", setter):
             out = mcp_server.vars_set(
                 key="AWS_REGION", repo="my-repo", value="us-east-1"
@@ -829,7 +829,7 @@ class TestRepoTools:
     ) -> None:
         find = _recorder({"key": "AWS_REGION", "uuid": "{u}"})  # found
         setter = _recorder({"key": "AWS_REGION", "uuid": "{u}"})
-        with patch.object(bb_ops, "_find_var_by_key", find), \
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
              patch.object(bb_ops, "vars_set", setter):
             out = mcp_server.vars_set(
                 key="AWS_REGION", repo="my-repo", value="us-west-2"
@@ -846,7 +846,7 @@ class TestRepoTools:
         f.write_text("file-value\n")  # trailing newline must be stripped
         find = _recorder(None)
         setter = _recorder({"key": "K", "uuid": "{u}"})
-        with patch.object(bb_ops, "_find_var_by_key", find), \
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
              patch.object(bb_ops, "vars_set", setter):
             mcp_server.vars_set(
                 key="K", repo="my-repo", value_file=str(f), secured=True
@@ -860,7 +860,7 @@ class TestRepoTools:
         monkeypatch.setenv("MY_SECRET_VAR", "env-value")
         find = _recorder(None)
         setter = _recorder({"key": "K", "uuid": "{u}"})
-        with patch.object(bb_ops, "_find_var_by_key", find), \
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
              patch.object(bb_ops, "vars_set", setter):
             mcp_server.vars_set(key="K", repo="my-repo", value_env="MY_SECRET_VAR")
         assert setter.calls[0][0][4] == "env-value"
@@ -890,7 +890,7 @@ class TestRepoTools:
         a supplied value, not "no source"."""
         find = _recorder(None)
         setter = _recorder({"key": "FLAG", "uuid": "{u}"})
-        with patch.object(bb_ops, "_find_var_by_key", find), \
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
              patch.object(bb_ops, "vars_set", setter):
             out = mcp_server.vars_set(key="FLAG", repo="my-repo", value="")
         assert out["ok"] is True
@@ -917,6 +917,98 @@ class TestRepoTools:
         )
         assert out["ok"] is False
         assert "ABSENT_VAR" in out["message"]
+
+    def test_vars_list_workspace_scope_no_repo(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Workspace scope needs no repo; it threads scope='workspace' and
+        repo=None into bb_ops.vars_list, borrowing the config workspace."""
+        recorder = _recorder([])
+        with patch.object(bb_ops, "vars_list", recorder):
+            out = mcp_server.vars_list(scope="workspace")
+        args, kwargs = recorder.calls[0]
+        assert args[1] == "acme"  # workspace from config
+        assert args[2] is None    # no repo
+        assert kwargs["scope"] == "workspace"
+        assert out["scope"] == "workspace"
+
+    def test_vars_list_deployment_requires_environment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_list(repo="my-repo", scope="deployment")
+        assert out["ok"] is False
+        assert "environment" in out["message"]
+
+    def test_vars_list_environment_rejected_off_deployment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_list(repo="my-repo", scope="repo", environment="Dev")
+        assert out["ok"] is False
+        assert "environment" in out["message"]
+
+    def test_vars_set_deployment_scope_resolves_base_once(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # The deployment scope resolves an env NAME->UUID inside
+        # _variables_base. The tool must build the base ONCE and reuse it
+        # for both the existence check (_find_var_by_key_at) and the write
+        # (vars_set, via base=), so the environment list is not fetched
+        # twice. Patch _variables_base and assert it's called once and the
+        # SAME base is threaded into find + set.
+        base_recorder = _recorder(
+            "/repositories/acme/my-repo/deployments_config/"
+            "environments/%7Benv-uuid%7D/variables/"
+        )
+        find = _recorder(None)
+        setter = _recorder({"key": "DEPLOY_VAR", "uuid": "{u}"})
+        with patch.object(bb_ops, "_variables_base", base_recorder), \
+             patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="DEPLOY_VAR", repo="my-repo", value="v",
+                scope="deployment", environment="Production",
+            )
+        # Resolved exactly once (no double env lookup).
+        assert len(base_recorder.calls) == 1
+        assert base_recorder.calls[0][1]["scope"] == "deployment"
+        assert base_recorder.calls[0][1]["environment"] == "Production"
+        # The same base is passed to the find (positional) and the set (base=).
+        the_base = base_recorder.calls[0]  # call happened; value is returned
+        assert find.calls[0][0][1].endswith("/variables/")
+        assert setter.calls[0][1]["base"] == (
+            "/repositories/acme/my-repo/deployments_config/"
+            "environments/%7Benv-uuid%7D/variables/"
+        )
+        assert setter.calls[0][1]["scope"] == "deployment"
+        assert setter.calls[0][1]["environment"] == "Production"
+        assert out["scope"] == "deployment"
+        assert out["environment"] == "Production"
+        assert out["value"] == "***"
+
+    def test_vars_set_workspace_scope_no_repo(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        find = _recorder(None)
+        setter = _recorder({"key": "GLOBAL", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="GLOBAL", value="v", scope="workspace"
+            )
+        # repo resolves to None at the workspace scope; workspace from config.
+        assert setter.calls[0][0][1] == "acme"
+        assert setter.calls[0][0][2] is None
+        assert setter.calls[0][1]["scope"] == "workspace"
+        assert out["ok"] is True
+
+    def test_vars_set_deployment_requires_environment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value="v", scope="deployment"
+        )
+        assert out["ok"] is False
+        assert "environment" in out["message"]
 
     def test_branch_show_passes_name(self, stub_client: bb_api.BBClient) -> None:
         recorder = _recorder({"name": "feat/widget"})

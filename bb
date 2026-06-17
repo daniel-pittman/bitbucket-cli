@@ -1492,16 +1492,166 @@ cmd_downloads() {
 # =========================================================================
 #  ENVIRONMENT / DEPLOY VARIABLES
 # =========================================================================
+#
+# Pipeline variables live at THREE scopes, each on a differently-named
+# endpoint (verified against the live API):
+#   repo        $(repo_path)/pipelines_config/variables/        (underscore)
+#   workspace   /workspaces/{ws}/pipelines-config/variables/    (HYPHEN)
+#   deployment  $(repo_path)/deployments_config/environments/{env_uuid}/variables/
+# The workspace scope uses a hyphen where the repo scope uses an
+# underscore; the underscore form 404s at the workspace scope. The
+# deployment scope is keyed by an environment UUID, which we resolve from
+# a human-supplied environment NAME via _resolve_env_uuid.
+
+# Resolve a deployment-environment NAME (or slug) to its brace-wrapped
+# UUID. Matches case-insensitively on name then slug. Sets BB_WORKSPACE
+# is already done by the caller; this only reads. Echoes the uuid on
+# success; exits with a labelled error on no-match or lookup failure.
+_resolve_env_uuid() {
+    local repo="$1" env_name="$2"
+    # Walk ALL pages of environments, not just the first. The Python side
+    # (_resolve_environment_uuid uses client.paginate) walks every page, so
+    # a single-page read here would be a parity divergence: an environment
+    # past page 1 would resolve via the MCP tool but 404-equivalent via the
+    # bash CLI. The duplicate-key find-loop in cmd_vars_set follows `next`
+    # for the same reason; mirror it here.
+    local page_url uuid="" available=""
+    page_url="$(repo_path "$repo")/environments/?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        local page rc=0
+        page=$(bb_get "$page_url") || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            echo "Error: could not list environments for ${BB_WORKSPACE}/${repo} (exit $rc)." >&2
+            # This runs inside `$(...)`; a bare `exit` would only terminate
+            # the subshell and the caller would proceed with an empty uuid.
+            # Kill the parent script (same pattern as repo_path).
+            kill -TERM $$
+        fi
+        # Case-insensitive match on name OR slug; `first` keeps it out of a
+        # SIGPIPE-prone head pipeline and emits at most one uuid.
+        uuid=$(echo "$page" | jq -r --arg n "$env_name" '
+            ($n | ascii_downcase) as $t
+            | first(.values[]
+                | select((.name // "" | ascii_downcase) == $t
+                      or (.slug // "" | ascii_downcase) == $t)
+                | .uuid) // empty')
+        if [[ -n "$uuid" ]]; then
+            printf '%s' "$uuid"
+            return
+        fi
+        # Accumulate available names across pages for the not-found message.
+        local page_names
+        page_names=$(echo "$page" | jq -r '[.values[].name] | join(", ")')
+        if [[ -n "$page_names" ]]; then
+            [[ -n "$available" ]] && available="${available}, "
+            available="${available}${page_names}"
+        fi
+        # Follow the `next` link (a full URL); strip the API base to a path.
+        local next
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
+    echo "Error: no deployment environment named '$env_name' in ${BB_WORKSPACE}/${repo}." >&2
+    echo "  Available: ${available:-none}" >&2
+    kill -TERM $$
+}
+
+# Build the variables collection base PATH for the requested scope.
+# Args: <scope> <repo> [<env_name>]. Echoes the path (no query string).
+# For the deployment scope this resolves the env name to a UUID (one
+# extra GET). repo_path validates workspace + slug at the boundary.
+_vars_base_path() {
+    local scope="$1" repo="$2" env_name="${3:-}"
+    case "$scope" in
+        repo)
+            printf '%s' "$(repo_path "$repo")/pipelines_config/variables/" ;;
+        workspace)
+            # HYPHEN form, verified live; underscore 404s here. The
+            # workspace is validated the same way repo_path validates it.
+            if [[ -z "${BB_WORKSPACE:-}" || "$BB_WORKSPACE" == */* \
+                  || "$BB_WORKSPACE" == "." || "$BB_WORKSPACE" == ".." ]]; then
+                echo "Error: invalid workspace for workspace-scope variables: '${BB_WORKSPACE:-}'." >&2
+                # Inside `$(...)`; kill the parent, not just the subshell.
+                kill -TERM $$
+            fi
+            printf '%s' "/workspaces/${BB_WORKSPACE}/pipelines-config/variables/" ;;
+        deployment)
+            local env_uuid encoded
+            env_uuid=$(_resolve_env_uuid "$repo" "$env_name")
+            encoded=$(_url_encode_segment "$env_uuid")
+            printf '%s' "$(repo_path "$repo")/deployments_config/environments/${encoded}/variables/" ;;
+        *)
+            echo "Error: unknown variables scope: $scope" >&2
+            kill -TERM $$ ;;
+    esac
+}
+
+# A human label for the scope, used in list/set output banners.
+_vars_scope_label() {
+    case "$1" in
+        repo)       printf 'Repository' ;;
+        workspace)  printf 'Workspace' ;;
+        deployment) printf 'Deployment-environment' ;;
+    esac
+}
 
 cmd_vars() {
-    local repo
-    resolve_repo "${1:-}"
+    # bb vars [--workspace | --deployment <env>] [repo]
+    local scope="repo" environment="" repo_arg=""
+    local positionals=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --workspace)      scope="workspace"; shift ;;
+            --deployment)     _require_flag_value "$@"; scope="deployment"; environment="$2"; shift 2 ;;
+            --deployment=*)   scope="deployment"; environment="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for vars: $1" >&2
+                exit 1 ;;
+            *)
+                positionals+=("$1"); shift ;;
+        esac
+    done
+    case "${#positionals[@]}" in
+        0) ;;
+        1) repo_arg="${positionals[0]}" ;;
+        *)
+            echo "Usage: bb vars [--workspace | --deployment <env>] [repo]" >&2
+            exit 1 ;;
+    esac
+    if [[ "$scope" == "deployment" && -z "$environment" ]]; then
+        echo "Error: --deployment requires an environment name." >&2
+        exit 1
+    fi
 
-    echo "Repository variables for ${BB_WORKSPACE}/${repo}:"
+    local repo=""
+    if [[ "$scope" == "workspace" ]]; then
+        # No repo for workspace scope; borrow a workspace from a repo
+        # hint if given, else resolve the workspace from -w / origin /
+        # BB_WORKSPACE.
+        if [[ -n "$repo_arg" ]]; then
+            resolve_repo "$repo_arg"
+        else
+            resolve_workspace
+        fi
+    else
+        resolve_repo "$repo_arg"
+    fi
+
+    local base
+    base=$(_vars_base_path "$scope" "$repo" "$environment")
+
+    local target="${BB_WORKSPACE}"
+    [[ "$scope" != "workspace" ]] && target="${BB_WORKSPACE}/${repo}"
+    [[ "$scope" == "deployment" ]] && target="${target} [env: ${environment}]"
+    echo "$(_vars_scope_label "$scope") variables for ${target}:"
     echo ""
 
     local response
-    response=$(bb_get "$(repo_path "$repo")/pipelines_config/variables/?pagelen=100")
+    response=$(bb_get "${base}?pagelen=100")
 
     printf "  %-30s %-8s %s\n" "KEY" "SECURED" "VALUE"
     printf "  %-30s %-8s %s\n" "---" "-------" "-----"
@@ -1519,26 +1669,33 @@ cmd_vars() {
 }
 
 cmd_vars_set() {
-    # bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)
+    # bb vars set [--workspace | --deployment <env>] [repo] <KEY> [--secured]
+    #             (--value V | --value-file F | --value-env E)
     #
-    # Create-or-update a repository pipeline variable. The value is read
-    # from a literal flag, a file, or an environment variable. For SECRET
-    # values prefer --value-file or --value-env so the secret never lands
-    # in argv / the process list / shell history. A secured value is
-    # NEVER echoed back by this command.
+    # Create-or-update a pipeline variable at the chosen scope (repo by
+    # default, --workspace, or --deployment <env>). The value is read from
+    # a literal flag, a file, or an environment variable. For SECRET values
+    # prefer --value-file or --value-env so the secret never lands in argv /
+    # the process list / shell history. A secured value is NEVER echoed back.
     #
     # `set` is consumed by the dispatcher before this function is called;
     # the remaining args are [repo] KEY and the flags. The first non-flag
     # positional may be a repo (slug or ws/slug); KEY is the positional
     # that follows. To disambiguate, we collect positionals: 1 → it's the
-    # KEY (repo auto-detected); 2 → first is repo, second is KEY.
+    # KEY (repo auto-detected); 2 → first is repo, second is KEY. For the
+    # workspace scope there is no repo, so a single positional is the KEY
+    # and a second positional is treated as a workspace-bearing repo hint.
     local secured="false"
     local value_set="" value="" value_file="" value_env=""
+    local scope="repo" environment=""
     local positionals=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --secured)        secured="true"; shift ;;
+            --workspace)      scope="workspace"; shift ;;
+            --deployment)     _require_flag_value "$@"; scope="deployment"; environment="$2"; shift 2 ;;
+            --deployment=*)   scope="deployment"; environment="${1#*=}"; shift ;;
             --value)          _require_flag_value "$@"; value="$2"; value_set="1"; shift 2 ;;
             --value=*)        value="${1#*=}"; value_set="1"; shift ;;
             --value-file)     _require_flag_value "$@"; value_file="$2"; shift 2 ;;
@@ -1552,6 +1709,11 @@ cmd_vars_set() {
                 positionals+=("$1"); shift ;;
         esac
     done
+
+    if [[ "$scope" == "deployment" && -z "$environment" ]]; then
+        echo "Error: --deployment requires an environment name." >&2
+        exit 1
+    fi
 
     local repo_arg="" key=""
     case "${#positionals[@]}" in
@@ -1625,10 +1787,20 @@ cmd_vars_set() {
         resolved_value="${!value_env}"
     fi
 
-    local repo
-    resolve_repo "$repo_arg"
+    local repo=""
+    if [[ "$scope" == "workspace" ]]; then
+        # No repo for workspace scope; borrow a workspace from a repo
+        # hint if given, else resolve from -w / origin / BB_WORKSPACE.
+        if [[ -n "$repo_arg" ]]; then
+            resolve_repo "$repo_arg"
+        else
+            resolve_workspace
+        fi
+    else
+        resolve_repo "$repo_arg"
+    fi
     local base
-    base="$(repo_path "$repo")/pipelines_config/variables/"
+    base=$(_vars_base_path "$scope" "$repo" "$environment")
 
     # Find an existing variable by key (walk all pages). Bitbucket allows
     # duplicate keys via the API, so a POST when a PUT was needed creates
@@ -1698,13 +1870,17 @@ cmd_vars_set() {
 
     if [[ "$rc" -ne 0 ]]; then
         echo "vars-set request failed (exit $rc)." >&2
-        echo "  Common causes: token lacks pipeline:write / repository:admin" >&2
-        echo "  scope, or the repo has no pipelines configuration yet." >&2
+        echo "  Common causes: token lacks admin:pipeline:bitbucket scope" >&2
+        echo "  (write:pipeline alone is not enough for any variable scope)," >&2
+        echo "  or the repo has no pipelines configuration yet." >&2
         exit "$rc"
     fi
 
-    # NEVER echo the value. Report key + secured flag + action only.
-    echo "${action} variable ${key} on ${BB_WORKSPACE}/${repo} (secured: ${secured})"
+    # NEVER echo the value. Report key + scope + secured flag + action only.
+    local target="${BB_WORKSPACE}"
+    [[ "$scope" != "workspace" ]] && target="${BB_WORKSPACE}/${repo}"
+    [[ "$scope" == "deployment" ]] && target="${target} [env: ${environment}]"
+    echo "${action} ${scope} variable ${key} on ${target} (secured: ${secured})"
 }
 
 # =========================================================================
@@ -1849,8 +2025,11 @@ REPOSITORY
                                           opts: --public | --private,
                                           --project KEY, --description TEXT
   bb downloads [repo]                   List repo downloads
-  bb vars [repo]                        List pipeline variables
-  bb vars set [repo] <KEY> [opts]       Create or update a pipeline variable
+  bb vars [scope] [repo]                List pipeline variables
+                                          scope: --workspace | --deployment <env>
+                                          (default: repo)
+  bb vars set [scope] [repo] <KEY> [opts]  Create or update a pipeline variable
+                                          scope: --workspace | --deployment <env>
                                           opts: --secured, and exactly one of
                                           --value V | --value-file F | --value-env E
                                           (use --value-file/--value-env for secrets)

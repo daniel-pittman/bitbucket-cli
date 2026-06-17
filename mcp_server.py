@@ -1167,14 +1167,90 @@ def branch_show(name: str, repo: str = "") -> dict[str, Any]:
         return _error_dict(e)
 
 
+def _resolve_vars_scope(
+    repo: str, scope: str, environment: str
+) -> tuple[bb_api.BBClient, str, str | None, str | None]:
+    """Resolve (client, workspace, repo_or_None, environment_or_None) for a
+    variables operation at the given scope.
+
+    - repo / deployment scopes need a repo, so they go through
+      `_resolve_repo` (auto-detect or explicit ws/slug).
+    - workspace scope has no repo. If `repo` carries a "ws/slug" or bare
+      workspace hint we honour its workspace; otherwise we use the
+      configured BB_WORKSPACE. A bare slug's workspace is the config
+      workspace too, so passing a repo at the workspace scope just
+      borrows its workspace and drops the slug.
+    - the deployment scope requires a non-empty environment; the others
+      reject it.
+    """
+    scope = (scope or "repo").strip() or "repo"
+    if scope not in bb_ops._VARS_SCOPES:
+        raise ValueError(
+            f"scope must be one of {bb_ops._VARS_SCOPES}, got {scope!r}"
+        )
+    env = _opt_str(environment)
+
+    if scope == "deployment" and env is None:
+        raise ValueError("environment is required for the deployment scope")
+    if scope != "deployment" and env is not None:
+        raise ValueError("environment is only valid for the deployment scope")
+
+    if scope == "workspace":
+        # No repo for workspace scope. Borrow the workspace from a repo
+        # hint if given, else use the configured default.
+        if (repo or "").strip():
+            client, workspace, _slug = _resolve_repo(repo)
+        else:
+            client = _get_client()
+            workspace = client.config.workspace
+            if not workspace:
+                raise ValueError(
+                    "no workspace for workspace-scope variables: set "
+                    "BB_WORKSPACE or pass repo='workspace/anything' to "
+                    "supply one."
+                )
+        return client, workspace, None, None
+
+    client, workspace, repo_slug = _resolve_repo(repo)
+    return client, workspace, repo_slug, env
+
+
 @mcp.tool()
-def vars_list(repo: str = "", count: int = 100) -> dict[str, Any]:
-    """List pipeline configuration variables. Secured values come back
-    as null from Bitbucket; the `secured` flag distinguishes that case."""
+def vars_list(
+    repo: str = "",
+    count: int = 100,
+    scope: str = "repo",
+    environment: str = "",
+) -> dict[str, Any]:
+    """List pipeline configuration variables at a chosen scope.
+
+    Args:
+        repo: Repo slug, "workspace/slug", or "" to auto-detect. Ignored
+            for scope="workspace" (which has no repo) except as a way to
+            borrow a workspace.
+        count: Maximum number of variables to return.
+        scope: "repo" (default), "workspace", or "deployment".
+        environment: Deployment environment NAME or slug. Required when
+            scope="deployment"; resolved to its UUID. Rejected otherwise.
+
+    Secured values come back as null from Bitbucket; the `secured` flag
+    distinguishes that case."""
     try:
-        client, workspace, repo_slug = _resolve_repo(repo)
-        variables = bb_ops.vars_list(client, workspace, repo_slug, count=count)
-        return {"ok": True, "workspace": workspace, "repo": repo_slug, "variables": variables}
+        client, workspace, repo_slug, env = _resolve_vars_scope(
+            repo, scope, environment
+        )
+        variables = bb_ops.vars_list(
+            client, workspace, repo_slug,
+            count=count, scope=scope.strip() or "repo", environment=env,
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "scope": scope.strip() or "repo",
+            "environment": env,
+            "variables": variables,
+        }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict(e)
 
@@ -1196,8 +1272,10 @@ def vars_set(
     value_file: str = "",
     value_env: str = "",
     secured: bool = False,
+    scope: str = "repo",
+    environment: str = "",
 ) -> dict[str, Any]:
-    """Create or update a repository pipeline variable (create-or-update).
+    """Create or update a pipeline variable at a chosen scope (create-or-update).
 
     Provide the value via EXACTLY ONE of `value`, `value_file`, or
     `value_env`. For SECRET values prefer `value_file` (read from a file
@@ -1207,21 +1285,28 @@ def vars_set(
 
     Args:
         key: Variable name (e.g. "AWS_SECRET").
-        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        repo: Repo slug, "workspace/slug", or "" to auto-detect. Ignored
+            for scope="workspace".
         value: Literal value. Use only for NON-secret values.
-        value_file: Path to a file whose contents (trailing newline
+        value_file: Path to a file whose contents (one trailing newline
             stripped) become the value. Preferred for secrets.
         value_env: Name of an environment variable whose value is used.
             Preferred for secrets.
         secured: When True, mark the variable secured (Bitbucket masks it
             and never echoes it back). Default False.
+        scope: "repo" (default), "workspace", or "deployment".
+        environment: Deployment environment NAME or slug. Required when
+            scope="deployment"; resolved to its UUID. Rejected otherwise.
 
     Secret hygiene: the value is NEVER echoed in the response. The
     response reports the key, secured flag, and whether the operation
     created or updated the variable — but masks the value as "***".
     """
     try:
-        client, workspace, repo_slug = _resolve_repo(repo)
+        client, workspace, repo_slug, env = _resolve_vars_scope(
+            repo, scope, environment
+        )
+        scope_norm = scope.strip() or "repo"
 
         # Exactly-one-source check. Count the supplied sources so an
         # ambiguous call (two sources) or an empty call (no source) is
@@ -1266,18 +1351,29 @@ def vars_set(
                 )
             resolved_value = os.environ[env_name]
 
-        existing = bb_ops._find_var_by_key(client, workspace, repo_slug, key.strip())
+        # Build the collection base ONCE (the deployment scope resolves an
+        # environment NAME->UUID here via a GET). Reuse it for both the
+        # existence check and the write so the deployment path doesn't
+        # list environments twice — matches the bash CLI's single
+        # resolution into `$base`.
+        base = bb_ops._variables_base(
+            client, workspace, repo_slug, scope=scope_norm, environment=env
+        )
+        existing = bb_ops._find_var_by_key_at(client, base, key.strip())
         action = "updated" if existing is not None else "created"
 
         result = bb_ops.vars_set(
             client, workspace, repo_slug, key, resolved_value,
-            secured=secured, existing=existing,
+            secured=secured, scope=scope_norm, environment=env, base=base,
+            existing=existing,
         )
         # NEVER surface the value. Report the key + secured flag + action.
         return {
             "ok": True,
             "workspace": workspace,
             "repo": repo_slug,
+            "scope": scope_norm,
+            "environment": env,
             "key": key.strip(),
             "secured": bool(secured),
             "action": action,

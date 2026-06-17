@@ -526,6 +526,213 @@ class TestVarsSet:
 
 
 # ===========================================================================
+# Variable SCOPES: workspace + deployment (env-UUID resolution)
+# ===========================================================================
+
+
+def _ws_vars_url() -> str:
+    # HYPHEN form, verified against the live API.
+    return DEFAULT_API_BASE + "/workspaces/acme/pipelines-config/variables/"
+
+
+def _env_list_url() -> str:
+    return _repo_url() + "/environments/"
+
+
+def _dep_vars_url(enc_uuid: str) -> str:
+    return _repo_url() + f"/deployments_config/environments/{enc_uuid}/variables/"
+
+
+class TestVariablesBaseRouting:
+    def test_repo_scope_path(self) -> None:
+        opener = _CaptureOpener([])
+        base = bb_ops._variables_base(
+            _client(opener), "acme", "widget-service", scope="repo"
+        )
+        assert base == "/repositories/acme/widget-service/pipelines_config/variables/"
+        # Pure path construction; no network.
+        assert opener.calls == []
+
+    def test_workspace_scope_path_uses_hyphen(self) -> None:
+        opener = _CaptureOpener([])
+        base = bb_ops._variables_base(
+            _client(opener), "acme", None, scope="workspace"
+        )
+        # HYPHEN, not underscore (underscore 404s at the workspace scope).
+        assert base == "/workspaces/acme/pipelines-config/variables/"
+        assert "pipelines-config" in base and "pipelines_config" not in base
+        assert opener.calls == []
+
+    def test_bad_scope_rejected(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="scope"):
+            bb_ops._variables_base(_client(opener), "acme", "r", scope="nope")
+        assert opener.calls == []
+
+    def test_repo_scope_rejects_environment(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops._variables_base(
+                _client(opener), "acme", "r", scope="repo", environment="Dev"
+            )
+        assert opener.calls == []
+
+    def test_deployment_scope_requires_environment(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops._variables_base(
+                _client(opener), "acme", "r", scope="deployment"
+            )
+        assert opener.calls == []
+
+    def test_deployment_scope_requires_repo(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="repo"):
+            bb_ops._variables_base(
+                _client(opener), "acme", None, scope="deployment", environment="Dev"
+            )
+        assert opener.calls == []
+
+
+class TestResolveEnvironmentUuid:
+    _ENVS = {
+        "values": [
+            {"name": "Development", "slug": "development", "uuid": "{env-dev}"},
+            {"name": "Production", "slug": "production", "uuid": "{env-prod}"},
+        ]
+    }
+
+    def test_matches_by_name_case_insensitive(self) -> None:
+        opener = _CaptureOpener([self._ENVS])
+        uuid = bb_ops._resolve_environment_uuid(
+            _client(opener), "acme", "widget-service", "development"
+        )
+        assert uuid == "{env-dev}"
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+
+    def test_matches_by_slug(self) -> None:
+        opener = _CaptureOpener([self._ENVS])
+        uuid = bb_ops._resolve_environment_uuid(
+            _client(opener), "acme", "widget-service", "production"
+        )
+        assert uuid == "{env-prod}"
+
+    def test_no_match_raises_with_available_list(self) -> None:
+        opener = _CaptureOpener([self._ENVS])
+        with pytest.raises(bb_ops.BBOpNotFound, match="Staging"):
+            bb_ops._resolve_environment_uuid(
+                _client(opener), "acme", "widget-service", "Staging"
+            )
+
+    @pytest.mark.parametrize("bad", ["", "   ", "\n"])
+    def test_rejects_empty_env_name_no_network(self, bad: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops._resolve_environment_uuid(
+                _client(opener), "acme", "widget-service", bad
+            )
+        assert opener.calls == []
+
+
+class TestVarsListWorkspaceScope:
+    def test_lists_at_workspace_scope(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"key": "GLOBAL_VAR", "secured": False, "value": "x"}]}]
+        )
+        result = bb_ops.vars_list(
+            _client(opener), "acme", None, scope="workspace"
+        )
+        assert result[0]["key"] == "GLOBAL_VAR"
+        assert opener.calls[0]["url"].startswith(_ws_vars_url() + "?")
+        assert "pagelen=100" in opener.calls[0]["url"]
+
+
+class TestVarsListDeploymentScope:
+    def test_resolves_env_then_lists(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Development", "slug": "development", "uuid": "{env-dev}"}]},
+                {"values": [{"key": "DEPLOY_ONLY", "secured": True, "value": None}]},
+            ]
+        )
+        result = bb_ops.vars_list(
+            _client(opener), "acme", "widget-service",
+            scope="deployment", environment="Development",
+        )
+        assert result[0]["key"] == "DEPLOY_ONLY"
+        # First call: env list. Second: the deployment variables collection
+        # keyed by the URL-encoded env uuid.
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[1]["url"].startswith(_dep_vars_url("%7Benv-dev%7D") + "?")
+
+
+class TestVarsSetWorkspaceScope:
+    def test_create_posts_to_workspace_collection(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": []}, {"key": "GLOBAL_VAR", "uuid": "{u}"}]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", None, "GLOBAL_VAR", "v", scope="workspace"
+        )
+        # Lookup GET then POST, both at the workspace (hyphen) collection.
+        assert opener.calls[0]["url"].startswith(_ws_vars_url() + "?")
+        assert opener.calls[1]["method"] == "POST"
+        assert opener.calls[1]["url"] == _ws_vars_url()
+        assert opener.calls[1]["body"] == {
+            "key": "GLOBAL_VAR", "value": "v", "secured": False,
+        }
+
+    def test_update_puts_to_workspace_uuid(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"key": "GLOBAL_VAR", "uuid": "{ws-uuid}"}]},
+                {"key": "GLOBAL_VAR", "uuid": "{ws-uuid}"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", None, "GLOBAL_VAR", "v2", scope="workspace"
+        )
+        assert opener.calls[1]["method"] == "PUT"
+        assert opener.calls[1]["url"] == _ws_vars_url() + "%7Bws-uuid%7D"
+
+
+class TestVarsSetDeploymentScope:
+    def test_create_resolves_env_then_posts(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Production", "slug": "production", "uuid": "{env-prod}"}]},
+                {"values": []},
+                {"key": "DEPLOY_VAR", "uuid": "{u}"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "DEPLOY_VAR", "v",
+            scope="deployment", environment="Production", secured=True,
+        )
+        # env list, lookup GET, then POST to the deployment collection.
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[1]["url"].startswith(
+            _dep_vars_url("%7Benv-prod%7D") + "?"
+        )
+        assert opener.calls[2]["method"] == "POST"
+        assert opener.calls[2]["url"] == _dep_vars_url("%7Benv-prod%7D")
+        assert opener.calls[2]["body"]["secured"] is True
+
+    def test_unknown_env_raises_before_any_write(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Development", "slug": "development", "uuid": "{d}"}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "K", "v",
+                scope="deployment", environment="Nonexistent",
+            )
+        # Only the env-list GET happened; no variable lookup, no write.
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "GET"
+
+
+# ===========================================================================
 # branches_list + branch_show
 # ===========================================================================
 

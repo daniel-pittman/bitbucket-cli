@@ -941,17 +941,141 @@ def branch_show(
 
 
 # --- Variables (pipeline configuration) ---
+#
+# Bitbucket exposes pipeline variables at THREE scopes, each on a
+# different (and inconsistently-named) endpoint. The base paths are
+# verified against the live API:
+#
+#   repo        /repositories/{ws}/{slug}/pipelines_config/variables/
+#   workspace   /workspaces/{ws}/pipelines-config/variables/      (HYPHEN)
+#   deployment  /repositories/{ws}/{slug}/deployments_config/
+#                   environments/{env_uuid}/variables/
+#
+# Note the workspace scope uses `pipelines-config` (hyphen) where the
+# repo scope uses `pipelines_config` (underscore); the underscore form
+# 404s at the workspace scope. The deployment scope keys off an
+# environment UUID, which the caller supplies by NAME — _resolve_environment_uuid
+# maps it. All three share the same body shape ({key, value, secured})
+# and the same create-or-update semantics, so the list / find / set
+# helpers take a pre-built `base` path and are scope-agnostic.
+
+_VARS_SCOPES = ("repo", "workspace", "deployment")
+
+
+def _resolve_environment_uuid(
+    client: BBClient, workspace: str, repo: str, environment: str
+) -> str:
+    """Resolve a deployment-environment NAME (or slug) to its UUID.
+
+    The deployment-variable endpoint is keyed by environment UUID, but
+    humans refer to environments by name ("Development", "Production").
+    GET the environment list and match case-insensitively on `name`
+    first, then `slug`. Raise BBOpNotFound if no environment matches so
+    the caller surfaces a clear "no such environment" instead of building
+    a URL with an empty UUID.
+
+    Returns the brace-wrapped UUID exactly as Bitbucket returns it (the
+    `set`/`list` helpers URL-encode it for the path).
+    """
+    if not isinstance(environment, str) or not environment.strip():
+        raise ValueError(
+            f"environment must be a non-empty, non-whitespace string, "
+            f"got {environment!r}"
+        )
+    target = environment.strip().casefold()
+    base = f"{repo_path(workspace, repo)}/environments/"
+    names: list[str] = []
+    for env in client.paginate(base, query={"pagelen": _BITBUCKET_MAX_PAGELEN}):
+        name = env.get("name")
+        slug = env.get("slug")
+        if name:
+            names.append(name)
+        if (isinstance(name, str) and name.casefold() == target) or (
+            isinstance(slug, str) and slug.casefold() == target
+        ):
+            uuid = env.get("uuid")
+            if not uuid:
+                raise BBOpNotFound(
+                    f"environment {environment!r} found but has no uuid"
+                )
+            return uuid
+    raise BBOpNotFound(
+        f"no deployment environment named {environment!r} in "
+        f"{workspace}/{repo} (available: {names or 'none'})"
+    )
+
+
+def _variables_base(
+    client: BBClient,
+    workspace: str,
+    repo: str | None,
+    *,
+    scope: str = "repo",
+    environment: str | None = None,
+) -> str:
+    """Build the variables collection base path for the requested scope.
+
+    `repo` is required for the repo and deployment scopes; ignored for
+    the workspace scope. `environment` is required for the deployment
+    scope (resolved to a UUID here) and rejected for the others.
+    """
+    if scope not in _VARS_SCOPES:
+        raise ValueError(
+            f"scope must be one of {_VARS_SCOPES}, got {scope!r}"
+        )
+
+    if scope == "workspace":
+        if environment is not None:
+            raise ValueError("environment is only valid for the deployment scope")
+        # Validate the workspace the same way repo_path validates its
+        # segments (empty / whitespace / '/' / '.' / '..').
+        if not workspace or not workspace.strip():
+            raise ValueError(
+                f"workspace must be a non-empty, non-whitespace string, "
+                f"got {workspace!r}"
+            )
+        if "/" in workspace:
+            raise ValueError(f"workspace must not contain '/', got {workspace!r}")
+        if workspace in (".", ".."):
+            raise ValueError(f"workspace must not be '.' or '..', got {workspace!r}")
+        # HYPHEN form — verified against the live API; the underscore
+        # form 404s at the workspace scope.
+        return f"/workspaces/{workspace}/pipelines-config/variables/"
+
+    if repo is None:
+        raise ValueError(f"repo is required for the {scope} scope")
+
+    if scope == "repo":
+        if environment is not None:
+            raise ValueError("environment is only valid for the deployment scope")
+        return f"{repo_path(workspace, repo)}/pipelines_config/variables/"
+
+    # scope == "deployment"
+    if environment is None:
+        raise ValueError("environment is required for the deployment scope")
+    env_uuid = _resolve_environment_uuid(client, workspace, repo, environment)
+    encoded = quote(env_uuid, safe="")
+    return (
+        f"{repo_path(workspace, repo)}/deployments_config/"
+        f"environments/{encoded}/variables/"
+    )
 
 
 def vars_list(
     client: BBClient,
     workspace: str,
-    repo: str,
+    repo: str | None = None,
     *,
     count: int = 100,
+    scope: str = "repo",
+    environment: str | None = None,
 ) -> list[dict[str, Any]]:
     """List pipeline configuration variables (key/value pairs, with a
     `secured` flag that masks values for sensitive variables).
+
+    `scope` selects repo (default), workspace, or deployment. The
+    deployment scope requires `environment` (an env name/slug, resolved
+    to a UUID). See `_variables_base` for the endpoint per scope.
 
     Bash truncates secured values to `********` in its display layer;
     Python returns the raw dicts (which include `"value": null` for
@@ -961,52 +1085,69 @@ def vars_list(
     """
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
+    base = _variables_base(
+        client, workspace, repo, scope=scope, environment=environment
+    )
     pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
     out: list[dict[str, Any]] = []
-    for v in client.paginate(
-        f"{repo_path(workspace, repo)}/pipelines_config/variables/",
-        query={"pagelen": pagelen},
-    ):
+    for v in client.paginate(base, query={"pagelen": pagelen}):
         out.append(v)
         if len(out) >= count:
             break
     return out
 
 
-def _find_var_by_key(
-    client: BBClient, workspace: str, repo: str, key: str
+def _find_var_by_key_at(
+    client: BBClient, base: str, key: str
 ) -> dict[str, Any] | None:
-    """Return the existing pipeline variable dict whose `key` matches, or
-    None if no variable with that key exists.
-
-    Walks the full variable list (no count cap) so a create-or-update
+    """Return the existing variable dict at `base` whose `key` matches,
+    or None. Walks the full list (no count cap) so a create-or-update
     never mistakes "not on page 1" for "doesn't exist" and POSTs a
-    duplicate. Bitbucket allows duplicate keys via the API, so an
-    accidental POST-when-PUT-was-needed creates a second variable with
-    the same key — the exact bug this lookup prevents.
-    """
-    base = f"{repo_path(workspace, repo)}/pipelines_config/variables/"
+    duplicate (Bitbucket allows duplicate keys via the API)."""
     for v in client.paginate(base, query={"pagelen": _BITBUCKET_MAX_PAGELEN}):
         if v.get("key") == key:
             return v
     return None
 
 
+def _find_var_by_key(
+    client: BBClient,
+    workspace: str,
+    repo: str | None,
+    key: str,
+    *,
+    scope: str = "repo",
+    environment: str | None = None,
+) -> dict[str, Any] | None:
+    """Scope-aware find-by-key. Builds the base path for the requested
+    scope, then walks it. Kept as the public lookup the MCP layer calls
+    to report created-vs-updated without a second pagination."""
+    base = _variables_base(
+        client, workspace, repo, scope=scope, environment=environment
+    )
+    return _find_var_by_key_at(client, base, key)
+
+
 def vars_set(
     client: BBClient,
     workspace: str,
-    repo: str,
+    repo: str | None,
     key: str,
     value: str,
     *,
     secured: bool = False,
+    scope: str = "repo",
+    environment: str | None = None,
     existing: dict[str, Any] | None = None,
+    base: str | None = None,
 ) -> dict[str, Any]:
-    """Create or update a repository pipeline variable.
+    """Create or update a pipeline variable at the requested scope.
 
     Finds an existing variable by `key`. If present, PUTs to
     `.../variables/{uuid}` (update); otherwise POSTs to
     `.../variables/` (create). Body is `{"key", "value", "secured"}`.
+    Works identically across the repo / workspace / deployment scopes —
+    only the base path differs (see `_variables_base`).
 
     Secret hygiene: this function NEVER logs or echoes `value`. Bitbucket
     does not echo a secured variable's value back on write either (the
@@ -1023,6 +1164,13 @@ def vars_set(
     to report "created" vs "updated") pass the lookup result in so the
     full variable list isn't paginated twice. Pass `None` (the default)
     to look it up here.
+
+    `base` lets a caller that already built the collection path (via
+    `_variables_base`) pass it in so the deployment scope doesn't resolve
+    the environment NAME->UUID twice (once in the caller's find-by-key,
+    once here). When `None` the base is built from scope/environment.
+    This keeps the deployment path to a single environment lookup,
+    matching the bash CLI (which resolves the env once into `$base`).
     """
     if not isinstance(key, str) or not key.strip():
         raise ValueError(
@@ -1034,7 +1182,10 @@ def vars_set(
         )
     key = key.strip()
 
-    base = f"{repo_path(workspace, repo)}/pipelines_config/variables/"
+    if base is None:
+        base = _variables_base(
+            client, workspace, repo, scope=scope, environment=environment
+        )
     payload: dict[str, Any] = {
         "key": key,
         "value": value,
@@ -1042,7 +1193,7 @@ def vars_set(
     }
 
     if existing is None:
-        existing = _find_var_by_key(client, workspace, repo, key)
+        existing = _find_var_by_key_at(client, base, key)
     if existing is not None:
         uuid = existing.get("uuid")
         if not uuid:
