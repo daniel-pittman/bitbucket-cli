@@ -1353,6 +1353,118 @@ cmd_repo() {
     '
 }
 
+# Guard a value-taking flag against a missing argument BEFORE consuming
+# $2. Under `set -u`, a bare `value="$2"` when $2 is unset (the flag was
+# the last token) aborts with a raw "$2: unbound variable" bash error
+# instead of a curated message. Call as `_require_flag_value "$@"` from
+# inside the case arm — $1 is the flag, $2 is its value if present, so a
+# count below 2 means the value is missing.
+#
+# Also reject the case where $2 is ANOTHER flag (starts with `--`): for
+# `bb vars set KEY --value --secured`, $# is 2 so a length-only check
+# would pass and then assign the literal "--secured" as the value (silent
+# data corruption, the wrong string gets uploaded). A `--`-prefixed next
+# token almost always means the user forgot the value, so treat it as
+# missing. A value that legitimately starts with `--` can still be passed
+# via the `--flag=value` form (handled by the separate `--flag=*` arms).
+_require_flag_value() {
+    if [[ "$#" -lt 2 ]]; then
+        echo "Error: $1 requires a value." >&2
+        exit 1
+    fi
+    if [[ "$2" == --* ]]; then
+        echo "Error: $1 requires a value, but got the flag '$2'." >&2
+        echo "  If the value really starts with '--', use $1=<value>." >&2
+        exit 1
+    fi
+}
+
+cmd_repo_create() {
+    # bb repo-create <name> [--private] [--public] [--project KEY] [--description TEXT]
+    #
+    # Creates a new repo via POST to /repositories/{ws}/{slug} — the same
+    # path `bb repo` GETs. The slug is in the URL; the body carries the
+    # settings. Workspace resolves from -w / BB_WORKSPACE / git origin.
+    #
+    # Default is PRIVATE so a forgotten flag never publishes a repo by
+    # accident. --public flips it; --private is accepted as an explicit
+    # no-op for callers who want to be explicit.
+    local name="" is_private="true" project="" description=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --private)        is_private="true"; shift ;;
+            --public)         is_private="false"; shift ;;
+            --project)        _require_flag_value "$@"; project="$2"; shift 2 ;;
+            --project=*)      project="${1#*=}"; shift ;;
+            --description)    _require_flag_value "$@"; description="$2"; shift 2 ;;
+            --description=*)  description="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for repo-create: $1" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Usage: bb repo-create <name> [--private|--public] [--project KEY] [--description TEXT]" >&2
+        echo "" >&2
+        echo "  Creates a repo in the resolved workspace (default: PRIVATE)." >&2
+        echo "  Workspace resolves from -w / BB_WORKSPACE / git origin." >&2
+        exit 1
+    fi
+
+    # Resolve the workspace (this command takes a bare name, not a
+    # repo arg, so use the workspace resolver). The slug is `name`.
+    resolve_workspace
+
+    # repo_path validates both the workspace and the slug at the boundary
+    # (empty / whitespace / embedded '/' / '.' / '..') — same contract as
+    # every other repo command. It also builds the POST path.
+    local path
+    path=$(repo_path "$name")
+
+    # Build the JSON body with jq so values are escaped. Always send scm
+    # and is_private; add project / description only when supplied so the
+    # body matches the Python omit-when-empty contract (bb_ops.repo_create).
+    local payload
+    payload=$(jq -n \
+        --argjson priv "$is_private" \
+        '{scm: "git", is_private: $priv}')
+    if [[ -n "$project" ]]; then
+        payload=$(echo "$payload" | jq --arg k "$project" '. + {project: {key: $k}}')
+    fi
+    if [[ -n "$description" ]]; then
+        payload=$(echo "$payload" | jq --arg d "$description" '. + {description: $d}')
+    fi
+
+    echo "Creating repository ${BB_WORKSPACE}/${name} (private: ${is_private})..."
+
+    local response rc=0
+    response=$(bb_post "$path" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Repo-create request failed (exit $rc)." >&2
+        echo "  Common causes: a repo with this slug already exists, the" >&2
+        echo "  workspace requires a --project KEY, or the token lacks" >&2
+        echo "  repository:admin scope." >&2
+        exit "$rc"
+    fi
+
+    local full_name clone_https
+    full_name=$(echo "$response" | jq -r '.full_name // "(unknown)"')
+    clone_https=$(echo "$response" | jq -r '[.links.clone[]? | select(.name == "https") | .href] | first // "n/a"')
+
+    echo "Created ${full_name}"
+    echo "  Clone (HTTPS): ${clone_https}"
+}
+
 # =========================================================================
 #  DOWNLOADS (deployment artifacts)
 # =========================================================================
@@ -1393,16 +1505,198 @@ cmd_downloads() {
 # =========================================================================
 #  ENVIRONMENT / DEPLOY VARIABLES
 # =========================================================================
+#
+# Pipeline variables live at THREE scopes, each on a differently-named
+# endpoint (verified against the live API):
+#   repo        $(repo_path)/pipelines_config/variables/        (underscore)
+#   workspace   /workspaces/{ws}/pipelines-config/variables/    (HYPHEN)
+#   deployment  $(repo_path)/deployments_config/environments/{env_uuid}/variables/
+# The workspace scope uses a hyphen where the repo scope uses an
+# underscore; the underscore form 404s at the workspace scope. The
+# deployment scope is keyed by an environment UUID, which we resolve from
+# a human-supplied environment NAME via _resolve_env_uuid.
+
+# Resolve a deployment-environment NAME (or slug) to its brace-wrapped
+# UUID. Matches case-insensitively on name then slug. Sets BB_WORKSPACE
+# is already done by the caller; this only reads. Echoes the uuid on
+# success; exits with a labelled error on no-match or lookup failure.
+_resolve_env_uuid() {
+    local repo="$1" env_name="$2"
+    # Walk ALL pages of environments, not just the first. The Python side
+    # (_resolve_environment_uuid uses client.paginate) walks every page, so
+    # a single-page read here would be a parity divergence: an environment
+    # past page 1 would resolve via the MCP tool but 404-equivalent via the
+    # bash CLI. The duplicate-key find-loop in cmd_vars_set follows `next`
+    # for the same reason; mirror it here.
+    local page_url uuid="" available=""
+    page_url="$(repo_path "$repo")/environments/?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        local page rc=0
+        page=$(bb_get "$page_url") || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            echo "Error: could not list environments for ${BB_WORKSPACE}/${repo} (exit $rc)." >&2
+            # This runs inside `$(...)`; a bare `exit` would only terminate
+            # the subshell and the caller would proceed with an empty uuid.
+            # Kill the parent script (same pattern as repo_path).
+            kill -TERM $$
+        fi
+        # Case-insensitive match on name OR slug; `first` keeps it out of a
+        # SIGPIPE-prone head pipeline and emits at most one match. Select
+        # the matching ENTRY (not its .uuid) so a matched-but-null-uuid env
+        # is distinguished from no-match: `.uuid // empty` alone would
+        # collapse a matched env with uuid:null to "" and produce the
+        # misleading "no environment named X" error even though X matched.
+        # Python (_resolve_environment_uuid) raises "found but has no uuid"
+        # for this shape; mirror it (parity).
+        local matched uuid_val
+        matched=$(echo "$page" | jq -c --arg n "$env_name" '
+            ($n | ascii_downcase) as $t
+            | first(.values[]
+                | select((.name // "" | ascii_downcase) == $t
+                      or (.slug // "" | ascii_downcase) == $t)) // empty')
+        if [[ -n "$matched" ]]; then
+            uuid_val=$(printf '%s' "$matched" | jq -r '.uuid // empty')
+            if [[ -z "$uuid_val" ]]; then
+                echo "Error: deployment environment '$env_name' found but has no uuid." >&2
+                kill -TERM $$
+            fi
+            printf '%s' "$uuid_val"
+            return
+        fi
+        # Accumulate available names across pages for the not-found message.
+        local page_names
+        page_names=$(echo "$page" | jq -r '[.values[].name] | join(", ")')
+        if [[ -n "$page_names" ]]; then
+            [[ -n "$available" ]] && available="${available}, "
+            available="${available}${page_names}"
+        fi
+        # Follow the `next` link (a full URL); strip the API base to a path.
+        local next
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
+    echo "Error: no deployment environment named '$env_name' in ${BB_WORKSPACE}/${repo}." >&2
+    echo "  Available: ${available:-none}" >&2
+    kill -TERM $$
+}
+
+# Build the variables collection base PATH for the requested scope.
+# Args: <scope> <repo> [<env_name>]. Echoes the path (no query string).
+# For the deployment scope this resolves the env name to a UUID (one
+# extra GET). repo_path validates workspace + slug at the boundary.
+_vars_base_path() {
+    local scope="$1" repo="$2" env_name="${3:-}"
+    case "$scope" in
+        repo)
+            printf '%s' "$(repo_path "$repo")/pipelines_config/variables/" ;;
+        workspace)
+            # HYPHEN form, verified live; underscore 404s here. The
+            # workspace is validated the same way repo_path validates it,
+            # INCLUDING the whitespace-only check (a bare `-z` test passes
+            # for "   ", which would build `/workspaces/   /...` and 404
+            # with no curated error). `tr -d '[:space:]'` matches repo_path
+            # and Python's `.strip()` emptiness check (parity).
+            local _ws_stripped
+            _ws_stripped="$(printf '%s' "${BB_WORKSPACE:-}" | tr -d '[:space:]')"
+            if [[ -z "$_ws_stripped" || "$BB_WORKSPACE" == */* \
+                  || "$BB_WORKSPACE" == "." || "$BB_WORKSPACE" == ".." ]]; then
+                echo "Error: invalid workspace for workspace-scope variables: '${BB_WORKSPACE:-}'." >&2
+                # Inside `$(...)`; kill the parent, not just the subshell.
+                kill -TERM $$
+            fi
+            printf '%s' "/workspaces/${BB_WORKSPACE}/pipelines-config/variables/" ;;
+        deployment)
+            local env_uuid encoded
+            env_uuid=$(_resolve_env_uuid "$repo" "$env_name")
+            encoded=$(_url_encode_segment "$env_uuid")
+            printf '%s' "$(repo_path "$repo")/deployments_config/environments/${encoded}/variables/" ;;
+        *)
+            echo "Error: unknown variables scope: $scope" >&2
+            kill -TERM $$ ;;
+    esac
+}
+
+# A human label for the scope, used in list/set output banners.
+_vars_scope_label() {
+    case "$1" in
+        repo)       printf 'Repository' ;;
+        workspace)  printf 'Workspace' ;;
+        deployment) printf 'Deployment-environment' ;;
+    esac
+}
 
 cmd_vars() {
-    local repo
-    resolve_repo "${1:-}"
+    # bb vars [--workspace | --deployment <env>] [repo]
+    local scope="repo" environment="" repo_arg=""
+    local positionals=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --workspace)      scope="workspace"; shift ;;
+            --deployment)     _require_flag_value "$@"; scope="deployment"; environment="$2"; shift 2 ;;
+            --deployment=*)   scope="deployment"; environment="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for vars: $1" >&2
+                exit 1 ;;
+            *)
+                positionals+=("$1"); shift ;;
+        esac
+    done
+    case "${#positionals[@]}" in
+        0) ;;
+        1) repo_arg="${positionals[0]}" ;;
+        *)
+            echo "Usage: bb vars [--workspace | --deployment <env>] [repo]" >&2
+            exit 1 ;;
+    esac
+    if [[ "$scope" == "deployment" && -z "$environment" ]]; then
+        echo "Error: --deployment requires an environment name." >&2
+        exit 1
+    fi
+    # Reject a stale --deployment env left over when a later --workspace
+    # (or default repo scope) won the last-flag-wins race. Mirrors the
+    # Python boundary ("environment is only valid for the deployment
+    # scope") so both surfaces reject the contradictory combination.
+    if [[ "$scope" != "deployment" && -n "$environment" ]]; then
+        echo "Error: --deployment <env> conflicts with --workspace / repo scope." >&2
+        exit 1
+    fi
 
-    echo "Repository variables for ${BB_WORKSPACE}/${repo}:"
+    local repo=""
+    if [[ "$scope" == "workspace" ]]; then
+        # No repo for workspace scope; borrow a workspace from a repo
+        # hint if given, else resolve the workspace from -w / origin /
+        # BB_WORKSPACE.
+        if [[ -n "$repo_arg" ]]; then
+            resolve_repo "$repo_arg"
+        else
+            resolve_workspace
+        fi
+    else
+        resolve_repo "$repo_arg"
+    fi
+
+    local base
+    base=$(_vars_base_path "$scope" "$repo" "$environment")
+
+    local target="${BB_WORKSPACE}"
+    [[ "$scope" != "workspace" ]] && target="${BB_WORKSPACE}/${repo}"
+    [[ "$scope" == "deployment" ]] && target="${target} [env: ${environment}]"
+    echo "$(_vars_scope_label "$scope") variables for ${target}:"
     echo ""
 
-    local response
-    response=$(bb_get "$(repo_path "$repo")/pipelines_config/variables/?pagelen=100")
+    # rc-capture so a 5xx / expired-token on the list surfaces a curated
+    # error instead of `set -e` aborting with only curl's stderr (parity
+    # with cmd_vars_set's lookup-failure handling).
+    local response rc=0
+    response=$(bb_get "${base}?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "vars list failed (exit $rc). Check token scope / connectivity." >&2
+        exit "$rc"
+    fi
 
     printf "  %-30s %-8s %s\n" "KEY" "SECURED" "VALUE"
     printf "  %-30s %-8s %s\n" "---" "-------" "-----"
@@ -1417,6 +1711,242 @@ cmd_vars() {
     ' | while IFS=$'\t' read -r key secured value; do
         printf "  %-30s %-8s %s\n" "$key" "$secured" "$value"
     done
+}
+
+cmd_vars_set() {
+    # bb vars set [--workspace | --deployment <env>] [repo] <KEY> [--secured]
+    #             (--value V | --value-file F | --value-env E)
+    #
+    # Create-or-update a pipeline variable at the chosen scope (repo by
+    # default, --workspace, or --deployment <env>). The value is read from
+    # a literal flag, a file, or an environment variable. For SECRET values
+    # prefer --value-file or --value-env so the secret never lands in argv /
+    # the process list / shell history. A secured value is NEVER echoed back.
+    #
+    # `set` is consumed by the dispatcher before this function is called;
+    # the remaining args are [repo] KEY and the flags. The first non-flag
+    # positional may be a repo (slug or ws/slug); KEY is the positional
+    # that follows. To disambiguate, we collect positionals: 1 → it's the
+    # KEY (repo auto-detected); 2 → first is repo, second is KEY. For the
+    # workspace scope there is no repo, so a single positional is the KEY
+    # and a second positional is treated as a workspace-bearing repo hint.
+    local secured="false"
+    local value_set="" value="" value_file="" value_env=""
+    local scope="repo" environment=""
+    local positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --secured)        secured="true"; shift ;;
+            --workspace)      scope="workspace"; shift ;;
+            --deployment)     _require_flag_value "$@"; scope="deployment"; environment="$2"; shift 2 ;;
+            --deployment=*)   scope="deployment"; environment="${1#*=}"; shift ;;
+            --value)          _require_flag_value "$@"; value="$2"; value_set="1"; shift 2 ;;
+            --value=*)        value="${1#*=}"; value_set="1"; shift ;;
+            --value-file)     _require_flag_value "$@"; value_file="$2"; shift 2 ;;
+            --value-file=*)   value_file="${1#*=}"; shift ;;
+            --value-env)      _require_flag_value "$@"; value_env="$2"; shift 2 ;;
+            --value-env=*)    value_env="${1#*=}"; shift ;;
+            -*)
+                echo "Error: unknown flag for vars set: $1" >&2
+                exit 1 ;;
+            *)
+                positionals+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$scope" == "deployment" && -z "$environment" ]]; then
+        echo "Error: --deployment requires an environment name." >&2
+        exit 1
+    fi
+    # Reject a stale --deployment env when --workspace / repo scope won the
+    # last-flag-wins race (parity with the Python boundary).
+    if [[ "$scope" != "deployment" && -n "$environment" ]]; then
+        echo "Error: --deployment <env> conflicts with --workspace / repo scope." >&2
+        exit 1
+    fi
+
+    local repo_arg="" key=""
+    case "${#positionals[@]}" in
+        1) key="${positionals[0]}" ;;
+        2) repo_arg="${positionals[0]}"; key="${positionals[1]}" ;;
+        *)
+            echo "Usage: bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)" >&2
+            exit 1 ;;
+    esac
+
+    if [[ -z "$key" ]]; then
+        echo "Usage: bb vars set [repo] <KEY> [--secured] (--value V | --value-file F | --value-env E)" >&2
+        exit 1
+    fi
+
+    # Strip surrounding whitespace from the key — parity with the Python
+    # side (bb_ops.vars_set does `key = key.strip()`). Without this, a
+    # copy-paste key like ` AWS_REGION ` would (a) not match the stored
+    # `AWS_REGION` in the find step and (b) POST a duplicate variable
+    # keyed with the stray spaces, breaking the never-duplicate contract
+    # across the two surfaces. Reject a whitespace-only key here too.
+    # Trim leading/trailing whitespace only (matches Python's .strip(),
+    # which does NOT collapse internal whitespace). `extglob` is not
+    # assumed; use two parameter expansions with a [:space:] class.
+    key="${key#"${key%%[![:space:]]*}"}"  # strip leading whitespace
+    key="${key%"${key##*[![:space:]]}"}"  # strip trailing whitespace
+    if [[ -z "$key" ]]; then
+        echo "Error: KEY must be a non-empty, non-whitespace string." >&2
+        exit 1
+    fi
+
+    # Exactly one value source. Count the supplied sources so an
+    # ambiguous (two) or empty (none) call is rejected before any value
+    # is read or any request is sent.
+    local source_count=0
+    [[ -n "$value_set" ]] && source_count=$((source_count + 1))
+    [[ -n "$value_file" ]] && source_count=$((source_count + 1))
+    [[ -n "$value_env" ]] && source_count=$((source_count + 1))
+    if [[ "$source_count" -ne 1 ]]; then
+        echo "Error: provide exactly one of --value, --value-file, or --value-env." >&2
+        exit 1
+    fi
+
+    # Resolve the value WITHOUT echoing it.
+    local resolved_value=""
+    if [[ -n "$value_set" ]]; then
+        resolved_value="$value"
+    elif [[ -n "$value_file" ]]; then
+        if [[ ! -r "$value_file" ]]; then
+            echo "Error: cannot read --value-file '$value_file'." >&2
+            exit 1
+        fi
+        # Strip EXACTLY ONE trailing newline (so `echo secret > f` doesn't
+        # carry the newline into Bitbucket), matching the Python side
+        # (`if resolved_value.endswith("\n"): resolved_value[:-1]`). A
+        # bare `$(cat ...)` strips ALL trailing newlines, which would
+        # diverge from Python for a file ending in a blank line — read
+        # the raw bytes and drop just one '\n' if present.
+        resolved_value="$(cat "$value_file"; printf 'x')"
+        resolved_value="${resolved_value%x}"   # undo the sentinel that protected trailing newlines
+        resolved_value="${resolved_value%$'\n'}"  # strip exactly one trailing newline
+    else
+        # --value-env: read the named variable. `${!name}` is bash
+        # indirect expansion. Guard "set but empty" vs "unset" via the
+        # ${var+x} test so an unset var is a clear error, not a silent
+        # empty value.
+        if [[ -z "${!value_env+x}" ]]; then
+            echo "Error: --value-env '$value_env' is not set in the environment." >&2
+            exit 1
+        fi
+        resolved_value="${!value_env}"
+    fi
+
+    local repo=""
+    if [[ "$scope" == "workspace" ]]; then
+        # No repo for workspace scope; borrow a workspace from a repo
+        # hint if given, else resolve from -w / origin / BB_WORKSPACE.
+        if [[ -n "$repo_arg" ]]; then
+            resolve_repo "$repo_arg"
+        else
+            resolve_workspace
+        fi
+    else
+        resolve_repo "$repo_arg"
+    fi
+    local base
+    base=$(_vars_base_path "$scope" "$repo" "$environment")
+
+    # Find an existing variable by key (walk all pages). Bitbucket allows
+    # duplicate keys via the API, so a POST when a PUT was needed creates
+    # a second variable with the same key — find-first prevents that.
+    local existing_uuid="" page_url="${base}?pagelen=100"
+    while [[ -n "$page_url" ]]; do
+        # Declare and assign on separate lines: a `local page=$(...)`
+        # one-liner masks the command substitution's exit status behind
+        # the `local` builtin's own (always 0), so a failed lookup GET
+        # would slip past `set -e` and leave `page` empty — which the jq
+        # below reads as "key not found", then we'd POST a duplicate. The
+        # rc-capture surfaces the auth/network failure instead.
+        local page rc=0
+        page=$(bb_get "$page_url") || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            echo "vars-set lookup failed (exit $rc) while checking for an" >&2
+            echo "  existing '${key}'. Aborting before any write to avoid" >&2
+            echo "  creating a duplicate. Check token scope / connectivity." >&2
+            exit "$rc"
+        fi
+        # Use jq's `first(...)` to emit at most one match rather than
+        # piping into `head -n1`: with duplicate-keyed variables (the
+        # case this find defends against), `jq ... | head -n1` makes head
+        # close the pipe early, jq dies on SIGPIPE, and `pipefail` turns
+        # a routine update into a hard abort. `first` keeps it all in jq.
+        #
+        # Select the first matching ENTRY (not its .uuid) so we can tell
+        # "no match" from "matched but uuid is null/missing". Emitting just
+        # `.uuid // empty` would collapse a matched-but-null-uuid entry to
+        # "" and fall through to a CREATE, silently POSTing a duplicate of
+        # a key that already exists. Bitbucket has returned uuid:null on
+        # partially-provisioned entries; Python (bb_ops.vars_set) raises
+        # BBOpNotFound for this exact shape, so mirror it here (parity).
+        local matched uuid_val
+        matched=$(echo "$page" | jq -c --arg k "$key" \
+            'first(.values[] | select(.key == $k)) // empty')
+        if [[ -n "$matched" ]]; then
+            uuid_val=$(printf '%s' "$matched" | jq -r '.uuid // empty')
+            if [[ -z "$uuid_val" ]]; then
+                echo "Error: variable '${key}' exists but has no uuid; cannot update." >&2
+                echo "  Refusing to create a duplicate. Inspect it in the Bitbucket UI." >&2
+                exit 1
+            fi
+            existing_uuid="$uuid_val"
+            break
+        fi
+        # Follow the `next` link if present. bb_get takes a path, but the
+        # API's `next` is a full URL; strip the API base to re-derive the
+        # path. If there's no next link, stop.
+        local next
+        next=$(echo "$page" | jq -r '.next // ""')
+        if [[ -z "$next" ]]; then
+            page_url=""
+        else
+            page_url="${next#"${BB_API}"}"
+        fi
+    done
+
+    # Build the body with jq so the value is JSON-escaped regardless of
+    # content. --arg keeps it a string; never interpolated into a shell
+    # word, so a value with quotes / newlines / shell metacharacters is
+    # safe and never appears in a command line.
+    local payload
+    payload=$(jq -n \
+        --arg key "$key" \
+        --arg value "$resolved_value" \
+        --argjson secured "$secured" \
+        '{key: $key, value: $value, secured: $secured}')
+
+    local action response rc=0
+    if [[ -n "$existing_uuid" ]]; then
+        action="Updated"
+        # The uuid comes back brace-wrapped (`{...}`); URL-encode it for
+        # the path segment so the braces don't break the URL.
+        local encoded_uuid
+        encoded_uuid=$(_url_encode_segment "$existing_uuid")
+        response=$(bb_put "${base}${encoded_uuid}" "$payload") || rc=$?
+    else
+        action="Created"
+        response=$(bb_post "$base" "$payload") || rc=$?
+    fi
+
+    if [[ "$rc" -ne 0 ]]; then
+        echo "vars-set request failed (exit $rc)." >&2
+        echo "  Common causes: token lacks admin:pipeline:bitbucket scope" >&2
+        echo "  (write:pipeline alone is not enough for any variable scope)," >&2
+        echo "  or the repo has no pipelines configuration yet." >&2
+        exit "$rc"
+    fi
+
+    # NEVER echo the value. Report key + scope + secured flag + action only.
+    local target="${BB_WORKSPACE}"
+    [[ "$scope" != "workspace" ]] && target="${BB_WORKSPACE}/${repo}"
+    [[ "$scope" == "deployment" ]] && target="${target} [env: ${environment}]"
+    echo "${action} ${scope} variable ${key} on ${target} (secured: ${secured})"
 }
 
 # =========================================================================
@@ -1557,8 +2087,18 @@ REPOSITORY
   bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
+  bb repo-create <name> [opts]          Create a repo (default PRIVATE)
+                                          opts: --public | --private,
+                                          --project KEY, --description TEXT
   bb downloads [repo]                   List repo downloads
-  bb vars [repo]                        List pipeline variables
+  bb vars [scope] [repo]                List pipeline variables
+                                          scope: --workspace | --deployment <env>
+                                          (default: repo)
+  bb vars set [scope] [repo] <KEY> [opts]  Create or update a pipeline variable
+                                          scope: --workspace | --deployment <env>
+                                          opts: --secured, and exactly one of
+                                          --value V | --value-file F | --value-env E
+                                          (use --value-file/--value-env for secrets)
 
 UTILITIES
   bb whoami                             Show resolved config + git context
@@ -1652,8 +2192,18 @@ case "$command" in
     workspaces|ws)        cmd_workspaces "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
+    repo-create|rc)       cmd_repo_create "$@" ;;
     downloads|dl)         cmd_downloads "$@" ;;
-    vars)                 cmd_vars "$@" ;;
+    vars)
+        # `vars set ...` is the create-or-update subcommand; bare `vars`
+        # (or `vars <repo>`) lists. Peek at the first arg to route.
+        if [[ "${1:-}" == "set" ]]; then
+            shift
+            cmd_vars_set "$@"
+        else
+            cmd_vars "$@"
+        fi
+        ;;
     # Utilities
     whoami)               cmd_whoami ;;
     open|o)               cmd_open "$@" ;;

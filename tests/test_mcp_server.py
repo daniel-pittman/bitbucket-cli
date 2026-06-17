@@ -103,9 +103,11 @@ EXPECTED_TOOLS = {
     # Repos / branches / metadata
     "repos_list",
     "repo_show",
+    "repo_create",
     "branches_list",
     "branch_show",
     "vars_list",
+    "vars_set",
     "downloads_list",
     "commits_list",
     # Git context
@@ -132,9 +134,9 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 31 = 6 pipelines
-    + 11 PRs + 1 workspaces + 7 repos/metadata + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 31
+    regression that drops a registration is visible. 33 = 6 pipelines
+    + 11 PRs + 1 workspaces + 9 repos/metadata + 5 git context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 33
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +759,288 @@ class TestRepoTools:
         with patch.object(bb_ops, "repos_list", recorder):
             mcp_server.repos_list(workspace="   ")
         assert recorder.calls[0][1]["workspace"] == "acme"  # from config
+
+    def test_repo_create_passes_args_and_surfaces_clone_url(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        info = {
+            "full_name": "acme/widget-service",
+            "links": {
+                "clone": [
+                    {"name": "https", "href": "https://x@bitbucket.org/acme/widget-service.git"},
+                    {"name": "ssh", "href": "git@bitbucket.org:acme/widget-service.git"},
+                ]
+            },
+        }
+        recorder = _recorder(info)
+        with patch.object(bb_ops, "repo_create", recorder):
+            out = mcp_server.repo_create(
+                name="widget-service", project="WID", description="desc"
+            )
+        # workspace defaults to config ("acme"), slug is the name.
+        args, kwargs = recorder.calls[0]
+        assert args[1] == "acme"
+        assert args[2] == "widget-service"
+        assert kwargs["is_private"] is True
+        assert kwargs["project_key"] == "WID"
+        assert kwargs["description"] == "desc"
+        # The https clone URL is surfaced.
+        assert out["ok"] is True
+        assert out["clone_https"] == "https://x@bitbucket.org/acme/widget-service.git"
+
+    def test_repo_create_explicit_workspace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"full_name": "other/repo", "links": {"clone": []}})
+        with patch.object(bb_ops, "repo_create", recorder):
+            mcp_server.repo_create(name="repo", workspace="other")
+        assert recorder.calls[0][0][1] == "other"
+
+    def test_repo_create_public_passes_false(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"links": {"clone": []}})
+        with patch.object(bb_ops, "repo_create", recorder):
+            mcp_server.repo_create(name="repo", is_private=False)
+        assert recorder.calls[0][1]["is_private"] is False
+
+    def test_vars_set_value_inline_creates(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        find = _recorder(None)  # not found → "created"
+        setter = _recorder({"key": "AWS_REGION", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="AWS_REGION", repo="my-repo", value="us-east-1"
+            )
+        # The resolved value is passed positionally to vars_set.
+        args, kwargs = setter.calls[0]
+        assert args[3] == "AWS_REGION"
+        assert args[4] == "us-east-1"
+        assert kwargs["secured"] is False
+        # The pre-fetched lookup happens exactly ONCE (the create path must
+        # not re-paginate; vars_set gets existing=None to skip its own
+        # lookup). Regression guard for the double-pagination finding.
+        assert len(find.calls) == 1
+        assert kwargs["existing"] is None
+        # Action reported as created; value NEVER echoed.
+        assert out["action"] == "created"
+        assert out["value"] == "***"
+        assert out["secured"] is False
+
+    def test_vars_set_existing_reports_updated(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        find = _recorder({"key": "AWS_REGION", "uuid": "{u}"})  # found
+        setter = _recorder({"key": "AWS_REGION", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="AWS_REGION", repo="my-repo", value="us-west-2"
+            )
+        assert out["action"] == "updated"
+        # The pre-fetched existing dict is threaded through to skip a
+        # second lookup.
+        assert setter.calls[0][1]["existing"] == {"key": "AWS_REGION", "uuid": "{u}"}
+
+    def test_vars_set_value_file(
+        self, stub_client: bb_api.BBClient, tmp_path: Any
+    ) -> None:
+        f = tmp_path / "secret.txt"
+        f.write_text("file-value\n")  # trailing newline must be stripped
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(
+                key="K", repo="my-repo", value_file=str(f), secured=True
+            )
+        assert setter.calls[0][0][4] == "file-value"
+        assert setter.calls[0][1]["secured"] is True
+
+    def test_vars_set_value_file_no_trailing_newline(
+        self, stub_client: bb_api.BBClient, tmp_path: Any
+    ) -> None:
+        # No trailing newline: value passes through unchanged.
+        f = tmp_path / "secret.txt"
+        f.write_bytes(b"file-value")  # no newline
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(key="K", repo="my-repo", value_file=str(f))
+        assert setter.calls[0][0][4] == "file-value"
+
+    def test_vars_set_value_file_strips_only_one_newline(
+        self, stub_client: bb_api.BBClient, tmp_path: Any
+    ) -> None:
+        # Two trailing newlines: only ONE is stripped (the contract the
+        # bash side also honours), so the value keeps the inner newline.
+        f = tmp_path / "secret.txt"
+        f.write_bytes(b"file-value\n\n")
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(key="K", repo="my-repo", value_file=str(f))
+        assert setter.calls[0][0][4] == "file-value\n"
+
+    def test_vars_set_value_env(
+        self, stub_client: bb_api.BBClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MY_SECRET_VAR", "env-value")
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(key="K", repo="my-repo", value_env="MY_SECRET_VAR")
+        assert setter.calls[0][0][4] == "env-value"
+
+    def test_vars_set_rejects_two_sources(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value="a", value_env="X"
+        )
+        assert out["ok"] is False
+        assert "exactly one" in out["message"]
+
+    def test_vars_set_rejects_no_source(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_set(key="K", repo="my-repo")
+        assert out["ok"] is False
+        assert "exactly one" in out["message"]
+
+    def test_vars_set_empty_string_value_is_settable(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """An explicit empty-string value is LEGAL (e.g. clearing a flag)
+        and must be settable via MCP — parity with bash `--value ""`.
+        The sentinel default is the real "not supplied" marker, so "" is
+        a supplied value, not "no source"."""
+        find = _recorder(None)
+        setter = _recorder({"key": "FLAG", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(key="FLAG", repo="my-repo", value="")
+        assert out["ok"] is True
+        # The empty string was forwarded as the value.
+        assert setter.calls[0][0][4] == ""
+
+    def test_vars_set_empty_value_plus_other_source_still_rejected(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # An explicit "" counts as a supplied source, so combining it with
+        # value_env is still ambiguous and must be rejected.
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value="", value_env="X"
+        )
+        assert out["ok"] is False
+        assert "exactly one" in out["message"]
+
+    def test_vars_set_missing_env_var_errors(
+        self, stub_client: bb_api.BBClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ABSENT_VAR", raising=False)
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value_env="ABSENT_VAR"
+        )
+        assert out["ok"] is False
+        assert "ABSENT_VAR" in out["message"]
+
+    def test_vars_list_workspace_scope_no_repo(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Workspace scope needs no repo; it threads scope='workspace' and
+        repo=None into bb_ops.vars_list, borrowing the config workspace."""
+        recorder = _recorder([])
+        with patch.object(bb_ops, "vars_list", recorder):
+            out = mcp_server.vars_list(scope="workspace")
+        args, kwargs = recorder.calls[0]
+        assert args[1] == "acme"  # workspace from config
+        assert args[2] is None    # no repo
+        assert kwargs["scope"] == "workspace"
+        assert out["scope"] == "workspace"
+
+    def test_vars_list_deployment_requires_environment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_list(repo="my-repo", scope="deployment")
+        assert out["ok"] is False
+        assert "environment" in out["message"]
+
+    def test_vars_list_environment_rejected_off_deployment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_list(repo="my-repo", scope="repo", environment="Dev")
+        assert out["ok"] is False
+        assert "environment" in out["message"]
+
+    def test_vars_set_deployment_scope_resolves_base_once(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # The deployment scope resolves an env NAME->UUID inside
+        # _variables_base. The tool must build the base ONCE and reuse it
+        # for both the existence check (_find_var_by_key_at) and the write
+        # (vars_set, via base=), so the environment list is not fetched
+        # twice. Patch _variables_base and assert it's called once and the
+        # SAME base is threaded into find + set.
+        base_recorder = _recorder(
+            "/repositories/acme/my-repo/deployments_config/"
+            "environments/%7Benv-uuid%7D/variables/"
+        )
+        find = _recorder(None)
+        setter = _recorder({"key": "DEPLOY_VAR", "uuid": "{u}"})
+        with patch.object(bb_ops, "_variables_base", base_recorder), \
+             patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="DEPLOY_VAR", repo="my-repo", value="v",
+                scope="deployment", environment="Production",
+            )
+        # Resolved exactly once (no double env lookup).
+        assert len(base_recorder.calls) == 1
+        assert base_recorder.calls[0][1]["scope"] == "deployment"
+        assert base_recorder.calls[0][1]["environment"] == "Production"
+        # The same base is passed to the find (positional) and the set (base=).
+        the_base = base_recorder.calls[0]  # call happened; value is returned
+        assert find.calls[0][0][1].endswith("/variables/")
+        assert setter.calls[0][1]["base"] == (
+            "/repositories/acme/my-repo/deployments_config/"
+            "environments/%7Benv-uuid%7D/variables/"
+        )
+        assert setter.calls[0][1]["scope"] == "deployment"
+        assert setter.calls[0][1]["environment"] == "Production"
+        assert out["scope"] == "deployment"
+        assert out["environment"] == "Production"
+        assert out["value"] == "***"
+
+    def test_vars_set_workspace_scope_no_repo(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        find = _recorder(None)
+        setter = _recorder({"key": "GLOBAL", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            out = mcp_server.vars_set(
+                key="GLOBAL", value="v", scope="workspace"
+            )
+        # repo resolves to None at the workspace scope; workspace from config.
+        assert setter.calls[0][0][1] == "acme"
+        assert setter.calls[0][0][2] is None
+        assert setter.calls[0][1]["scope"] == "workspace"
+        assert out["ok"] is True
+
+    def test_vars_set_deployment_requires_environment(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        out = mcp_server.vars_set(
+            key="K", repo="my-repo", value="v", scope="deployment"
+        )
+        assert out["ok"] is False
+        assert "environment" in out["message"]
 
     def test_branch_show_passes_name(self, stub_client: bb_api.BBClient) -> None:
         recorder = _recorder({"name": "feat/widget"})

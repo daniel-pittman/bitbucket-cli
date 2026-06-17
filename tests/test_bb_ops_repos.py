@@ -325,6 +325,473 @@ class TestRepoShow:
 
 
 # ===========================================================================
+# repo_create
+# ===========================================================================
+
+
+class TestRepoCreate:
+    def test_posts_to_repo_path_with_default_private_git(self) -> None:
+        opener = _CaptureOpener(
+            [{"full_name": "acme/widget-service", "is_private": True}]
+        )
+        result = bb_ops.repo_create(
+            _client(opener), "acme", "widget-service"
+        )
+        assert result["full_name"] == "acme/widget-service"
+        call = opener.calls[0]
+        # POST to the SAME path repo_show GETs.
+        assert call["url"] == _repo_url()
+        assert call["method"] == "POST"
+        # Default body: scm git, private true, no project / description.
+        assert call["body"] == {"scm": "git", "is_private": True}
+
+    def test_public_flag(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener), "acme", "widget-service", is_private=False
+        )
+        assert opener.calls[0]["body"]["is_private"] is False
+
+    def test_project_key_in_body(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener), "acme", "widget-service", project_key="WID"
+        )
+        assert opener.calls[0]["body"]["project"] == {"key": "WID"}
+
+    def test_description_in_body(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener),
+            "acme",
+            "widget-service",
+            description="A service for widgets",
+        )
+        assert opener.calls[0]["body"]["description"] == "A service for widgets"
+
+    def test_omits_project_and_description_when_none(self) -> None:
+        # Parity with the bash omit-when-empty body. The keys must be
+        # ABSENT, not present-with-null — Bitbucket treats a null project
+        # differently from a missing one.
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(_client(opener), "acme", "widget-service")
+        body = opener.calls[0]["body"]
+        assert "project" not in body
+        assert "description" not in body
+
+    def test_project_strips_whitespace(self) -> None:
+        opener = _CaptureOpener([{"full_name": "acme/widget-service"}])
+        bb_ops.repo_create(
+            _client(opener), "acme", "widget-service", project_key="  WID  "
+        )
+        assert opener.calls[0]["body"]["project"] == {"key": "WID"}
+
+    @pytest.mark.parametrize("bad_slug", ["", "   ", "a/b", ".", ".."])
+    def test_rejects_bad_slug_no_network(self, bad_slug: str) -> None:
+        # repo_path enforces the slug contract at the boundary; no POST
+        # may fire on a malformed slug.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.repo_create(_client(opener), "acme", bad_slug)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_project", ["", "   "])
+    def test_rejects_empty_project_when_provided(self, bad_project: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="project_key"):
+            bb_ops.repo_create(
+                _client(opener), "acme", "widget-service", project_key=bad_project
+            )
+        assert opener.calls == []
+
+
+# ===========================================================================
+# vars_set (create-or-update)
+# ===========================================================================
+
+
+def _vars_url() -> str:
+    return _repo_url() + "/pipelines_config/variables/"
+
+
+class TestVarsSet:
+    def test_creates_when_not_found_posts(self) -> None:
+        # First call: list (empty) → not found. Second call: POST create.
+        opener = _CaptureOpener(
+            [
+                {"values": []},
+                {"key": "AWS_REGION", "uuid": "{new-uuid}", "value": "us-east-1"},
+            ]
+        )
+        result = bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "AWS_REGION", "us-east-1"
+        )
+        assert result["key"] == "AWS_REGION"
+        # Lookup is a GET to the variables list.
+        assert opener.calls[0]["method"] == "GET"
+        assert opener.calls[0]["url"].startswith(_vars_url() + "?")
+        # Create is a POST to the collection (trailing slash, no uuid).
+        create = opener.calls[1]
+        assert create["method"] == "POST"
+        assert create["url"] == _vars_url()
+        assert create["body"] == {
+            "key": "AWS_REGION",
+            "value": "us-east-1",
+            "secured": False,
+        }
+
+    def test_updates_when_found_puts_to_uuid(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"key": "AWS_REGION", "uuid": "{abc-123}"}]},
+                {"key": "AWS_REGION", "uuid": "{abc-123}", "value": "us-west-2"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "AWS_REGION", "us-west-2"
+        )
+        update = opener.calls[1]
+        assert update["method"] == "PUT"
+        # uuid is URL-encoded into the path; braces become %7B / %7D.
+        assert update["url"] == _vars_url() + "%7Babc-123%7D"
+        assert update["body"]["value"] == "us-west-2"
+
+    def test_secured_flag_in_body(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": []}, {"key": "AWS_SECRET", "uuid": "{u}", "value": None}]
+        )
+        bb_ops.vars_set(
+            _client(opener),
+            "acme",
+            "widget-service",
+            "AWS_SECRET",
+            "super-secret",
+            secured=True,
+        )
+        assert opener.calls[1]["body"]["secured"] is True
+
+    def test_existing_passed_in_skips_lookup(self) -> None:
+        # When the caller pre-fetches the existing var, vars_set must NOT
+        # paginate the list again — only the PUT fires.
+        opener = _CaptureOpener(
+            [{"key": "AWS_REGION", "uuid": "{abc-123}", "value": "us-west-2"}]
+        )
+        bb_ops.vars_set(
+            _client(opener),
+            "acme",
+            "widget-service",
+            "AWS_REGION",
+            "us-west-2",
+            existing={"key": "AWS_REGION", "uuid": "{abc-123}"},
+        )
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "PUT"
+
+    def test_find_walks_all_pages_before_create(self) -> None:
+        # The match is on page 2. vars_set must follow `next` and find it
+        # (PUT), not stop at page 1 and POST a duplicate.
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [{"key": "OTHER", "uuid": "{x}"}],
+                    "next": _vars_url() + "?page=2",
+                },
+                {"values": [{"key": "TARGET", "uuid": "{target-uuid}"}]},
+                {"key": "TARGET", "uuid": "{target-uuid}"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "TARGET", "v"
+        )
+        # 2 GETs (page 1 + page 2) then a PUT.
+        assert [c["method"] for c in opener.calls] == ["GET", "GET", "PUT"]
+        assert opener.calls[2]["url"] == _vars_url() + "%7Btarget-uuid%7D"
+
+    @pytest.mark.parametrize("bad_key", ["", "   ", "\n"])
+    def test_rejects_empty_key_no_network(self, bad_key: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="key"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", bad_key, "v"
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_string_value_no_network(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="value"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "KEY", 123  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    def test_matched_key_with_null_uuid_raises_not_create(self) -> None:
+        # A matched entry whose uuid is null/missing must raise rather than
+        # fall through to POST (which would create a duplicate of a key that
+        # already exists). Pin BBOpNotFound and assert no POST fired.
+        opener = _CaptureOpener(
+            [{"values": [{"key": "AWS_REGION", "uuid": None}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound, match="no uuid"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "AWS_REGION", "v"
+            )
+        # Only the lookup GET happened; no POST / PUT.
+        assert [c["method"] for c in opener.calls] == ["GET"]
+
+    def test_prefetched_none_skips_second_lookup_on_create(self) -> None:
+        # When the caller pre-fetched and found the key ABSENT (existing=None),
+        # vars_set must go straight to POST without re-paginating. Only ONE
+        # call (the POST) should fire.
+        opener = _CaptureOpener([{"key": "NEW", "uuid": "{u}"}])
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "NEW", "v",
+            existing=None,
+        )
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "POST"
+
+    def test_omitted_existing_does_lookup_then_create(self) -> None:
+        # Default (existing omitted = _NOT_PREFETCHED): vars_set looks up
+        # (GET, empty) then creates (POST).
+        opener = _CaptureOpener([{"values": []}, {"key": "NEW", "uuid": "{u}"}])
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "NEW", "v"
+        )
+        assert [c["method"] for c in opener.calls] == ["GET", "POST"]
+
+    def test_base_with_inconsistent_scope_rejected_no_network(self) -> None:
+        # Passing base= must not bypass scope/environment validation: a
+        # deployment scope with no environment is rejected even with base.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "K", "v",
+                scope="deployment", environment=None,
+                base="/some/base/variables/",
+            )
+        assert opener.calls == []
+
+
+# ===========================================================================
+# Variable SCOPES: workspace + deployment (env-UUID resolution)
+# ===========================================================================
+
+
+def _ws_vars_url() -> str:
+    # HYPHEN form, verified against the live API.
+    return DEFAULT_API_BASE + "/workspaces/acme/pipelines-config/variables/"
+
+
+def _env_list_url() -> str:
+    return _repo_url() + "/environments/"
+
+
+def _dep_vars_url(enc_uuid: str) -> str:
+    return _repo_url() + f"/deployments_config/environments/{enc_uuid}/variables/"
+
+
+class TestVariablesBaseRouting:
+    def test_repo_scope_path(self) -> None:
+        opener = _CaptureOpener([])
+        base = bb_ops._variables_base(
+            _client(opener), "acme", "widget-service", scope="repo"
+        )
+        assert base == "/repositories/acme/widget-service/pipelines_config/variables/"
+        # Pure path construction; no network.
+        assert opener.calls == []
+
+    def test_workspace_scope_path_uses_hyphen(self) -> None:
+        opener = _CaptureOpener([])
+        base = bb_ops._variables_base(
+            _client(opener), "acme", None, scope="workspace"
+        )
+        # HYPHEN, not underscore (underscore 404s at the workspace scope).
+        assert base == "/workspaces/acme/pipelines-config/variables/"
+        assert "pipelines-config" in base and "pipelines_config" not in base
+        assert opener.calls == []
+
+    def test_bad_scope_rejected(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="scope"):
+            bb_ops._variables_base(_client(opener), "acme", "r", scope="nope")
+        assert opener.calls == []
+
+    def test_repo_scope_rejects_environment(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops._variables_base(
+                _client(opener), "acme", "r", scope="repo", environment="Dev"
+            )
+        assert opener.calls == []
+
+    def test_deployment_scope_requires_environment(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops._variables_base(
+                _client(opener), "acme", "r", scope="deployment"
+            )
+        assert opener.calls == []
+
+    def test_deployment_scope_requires_repo(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="repo"):
+            bb_ops._variables_base(
+                _client(opener), "acme", None, scope="deployment", environment="Dev"
+            )
+        assert opener.calls == []
+
+
+class TestResolveEnvironmentUuid:
+    _ENVS = {
+        "values": [
+            {"name": "Development", "slug": "development", "uuid": "{env-dev}"},
+            {"name": "Production", "slug": "production", "uuid": "{env-prod}"},
+        ]
+    }
+
+    def test_matches_by_name_case_insensitive(self) -> None:
+        opener = _CaptureOpener([self._ENVS])
+        uuid = bb_ops._resolve_environment_uuid(
+            _client(opener), "acme", "widget-service", "development"
+        )
+        assert uuid == "{env-dev}"
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+
+    def test_matches_by_slug(self) -> None:
+        opener = _CaptureOpener([self._ENVS])
+        uuid = bb_ops._resolve_environment_uuid(
+            _client(opener), "acme", "widget-service", "production"
+        )
+        assert uuid == "{env-prod}"
+
+    def test_no_match_raises_with_available_list(self) -> None:
+        opener = _CaptureOpener([self._ENVS])
+        with pytest.raises(bb_ops.BBOpNotFound, match="Staging"):
+            bb_ops._resolve_environment_uuid(
+                _client(opener), "acme", "widget-service", "Staging"
+            )
+
+    @pytest.mark.parametrize("bad", ["", "   ", "\n"])
+    def test_rejects_empty_env_name_no_network(self, bad: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops._resolve_environment_uuid(
+                _client(opener), "acme", "widget-service", bad
+            )
+        assert opener.calls == []
+
+    def test_matched_env_with_null_uuid_raises_distinct_error(self) -> None:
+        # A matched env whose uuid is null must raise "found but has no uuid",
+        # NOT the misleading "no environment named X" (which would imply the
+        # name didn't match at all).
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Production", "slug": "production", "uuid": None}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound, match="no uuid"):
+            bb_ops._resolve_environment_uuid(
+                _client(opener), "acme", "widget-service", "Production"
+            )
+
+
+class TestVarsListWorkspaceScope:
+    def test_lists_at_workspace_scope(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"key": "GLOBAL_VAR", "secured": False, "value": "x"}]}]
+        )
+        result = bb_ops.vars_list(
+            _client(opener), "acme", None, scope="workspace"
+        )
+        assert result[0]["key"] == "GLOBAL_VAR"
+        assert opener.calls[0]["url"].startswith(_ws_vars_url() + "?")
+        assert "pagelen=100" in opener.calls[0]["url"]
+
+
+class TestVarsListDeploymentScope:
+    def test_resolves_env_then_lists(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Development", "slug": "development", "uuid": "{env-dev}"}]},
+                {"values": [{"key": "DEPLOY_ONLY", "secured": True, "value": None}]},
+            ]
+        )
+        result = bb_ops.vars_list(
+            _client(opener), "acme", "widget-service",
+            scope="deployment", environment="Development",
+        )
+        assert result[0]["key"] == "DEPLOY_ONLY"
+        # First call: env list. Second: the deployment variables collection
+        # keyed by the URL-encoded env uuid.
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[1]["url"].startswith(_dep_vars_url("%7Benv-dev%7D") + "?")
+
+
+class TestVarsSetWorkspaceScope:
+    def test_create_posts_to_workspace_collection(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": []}, {"key": "GLOBAL_VAR", "uuid": "{u}"}]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", None, "GLOBAL_VAR", "v", scope="workspace"
+        )
+        # Lookup GET then POST, both at the workspace (hyphen) collection.
+        assert opener.calls[0]["url"].startswith(_ws_vars_url() + "?")
+        assert opener.calls[1]["method"] == "POST"
+        assert opener.calls[1]["url"] == _ws_vars_url()
+        assert opener.calls[1]["body"] == {
+            "key": "GLOBAL_VAR", "value": "v", "secured": False,
+        }
+
+    def test_update_puts_to_workspace_uuid(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"key": "GLOBAL_VAR", "uuid": "{ws-uuid}"}]},
+                {"key": "GLOBAL_VAR", "uuid": "{ws-uuid}"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", None, "GLOBAL_VAR", "v2", scope="workspace"
+        )
+        assert opener.calls[1]["method"] == "PUT"
+        assert opener.calls[1]["url"] == _ws_vars_url() + "%7Bws-uuid%7D"
+
+
+class TestVarsSetDeploymentScope:
+    def test_create_resolves_env_then_posts(self) -> None:
+        opener = _CaptureOpener(
+            [
+                {"values": [{"name": "Production", "slug": "production", "uuid": "{env-prod}"}]},
+                {"values": []},
+                {"key": "DEPLOY_VAR", "uuid": "{u}"},
+            ]
+        )
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "DEPLOY_VAR", "v",
+            scope="deployment", environment="Production", secured=True,
+        )
+        # env list, lookup GET, then POST to the deployment collection.
+        assert opener.calls[0]["url"].startswith(_env_list_url() + "?")
+        assert opener.calls[1]["url"].startswith(
+            _dep_vars_url("%7Benv-prod%7D") + "?"
+        )
+        assert opener.calls[2]["method"] == "POST"
+        assert opener.calls[2]["url"] == _dep_vars_url("%7Benv-prod%7D")
+        assert opener.calls[2]["body"]["secured"] is True
+
+    def test_unknown_env_raises_before_any_write(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Development", "slug": "development", "uuid": "{d}"}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "K", "v",
+                scope="deployment", environment="Nonexistent",
+            )
+        # Only the env-list GET happened; no variable lookup, no write.
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "GET"
+
+
+# ===========================================================================
 # branches_list + branch_show
 # ===========================================================================
 

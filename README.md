@@ -137,8 +137,12 @@ Your Bitbucket account needs these workspace permissions:
 | Trigger/stop pipelines | **Read + Write** access to Pipelines (`read:pipeline:bitbucket`, `write:pipeline:bitbucket`) |
 | Create/approve/merge PRs | **Read + Write** access to Pull Requests (`read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`) |
 | List workspaces (`bb workspaces`) | `read:workspace:bitbucket` (new in v1.2.0 — Atlassian API token scope, opt-in when creating the token) |
+| Create a repository (`bb repo-create`) | **Admin** access to repositories (`admin:repository:bitbucket`). `write:repository:bitbucket` alone is not sufficient. |
+| Set pipeline variables, any scope (`bb vars set`, `bb vars set --workspace`, `bb vars set --deployment <env>`) | **Admin** access to Pipelines (`admin:pipeline:bitbucket`). `write:pipeline:bitbucket` alone is not sufficient. This one scope covers all three variable scopes (repo, workspace, deployment-environment); verified against the live 403 envelope for each. |
 
 Note: Atlassian API tokens inherit your account's workspace permissions. If you can perform an action in the Bitbucket UI, the CLI can do it too — provided the token carries the scope. The cross-workspace listing endpoints (`/2.0/workspaces`, `/2.0/repositories?role=member`) were removed under Atlassian's [CHANGE-2770](https://developer.atlassian.com/cloud/bitbucket/changelog/) on 2026-04-14; `bb workspaces` uses the replacement `/2.0/user/workspaces` endpoint (CHANGE-3022) which requires the `read:workspace:bitbucket` scope. Rotating the token to add it leaves existing tokens unchanged.
+
+The `bb repo-create` and `bb vars set` admin scopes are the most common to be missing, because most day-to-day tokens are scoped read + write only. A token's scopes are fixed at creation: adding a scope does not apply to an already-issued token. To use these two commands you must create a new token (or rotate the existing one) with the admin scope included. A token without the scope returns a 403 whose body names the exact missing scope under `error.detail.required`, so the failure is self-diagnosing.
 
 ### Environment Variables
 
@@ -187,9 +191,48 @@ bb pr-comments [repo] <id>            # Show PR comments
 bb branches [repo]                    # List branches
 bb repos                              # List workspace repos
 bb repo [repo]                        # Show repo details
+bb repo-create <name> [opts]          # Create a repo (default PRIVATE)
 bb downloads [repo]                   # List repo downloads
-bb vars [repo]                        # List pipeline variables
+bb vars [scope] [repo]                # List pipeline variables (repo|workspace|deployment)
+bb vars set [scope] [repo] <KEY> [opts]  # Create or update a pipeline variable
 ```
+
+`bb repo-create` defaults to a **private** repo so a forgotten flag never publishes one. Flags: `--public` / `--private`, `--project KEY` (required on workspaces that use projects), `--description TEXT`.
+
+```bash
+bb repo-create widget-service                          # private, default project
+bb repo-create widget-service --project WID            # private, in project WID
+bb repo-create docs-site --public --description "Docs" # public
+```
+
+This needs `admin:repository:bitbucket` scope on the token. A read/write-only token must be rotated to add it (adding a scope does not apply to an already-issued token). See [Required Bitbucket Permissions](#required-bitbucket-permissions).
+
+`bb vars` and `bb vars set` operate at three scopes, selected by a flag (default is repo):
+
+- repo (default): no flag.
+- workspace: `--workspace` (no repo argument; variables are shared across the workspace).
+- deployment-environment: `--deployment <env>`. `<env>` is the environment NAME or slug (for example `Development` or `production`), which the command resolves to its environment UUID by listing the repo's environments first. An unknown name fails with the list of available environments and writes nothing.
+
+The scope endpoints are `pipelines_config` (repo, underscore), `pipelines-config` (workspace, hyphen), and `deployments_config/environments/{uuid}` (deployment); the hyphen-vs-underscore difference is a Bitbucket API quirk, handled for you.
+
+`bb vars set` creates the variable if its key is new at that scope, or updates the existing one. Provide the value via **exactly one** of `--value`, `--value-file`, or `--value-env`. For secrets prefer `--value-file` or `--value-env` so the secret never appears in `argv` / the process list / shell history, and pass `--secured` so Bitbucket masks it. The command never echoes a value back, at any scope.
+
+```bash
+# Repo scope (default)
+bb vars set widget-service AWS_REGION --value us-east-1            # non-secret
+bb vars set widget-service AWS_SECRET --secured --value-file ./secret.txt
+bb vars set widget-service AWS_KEY --secured --value-env AWS_KEY   # read from env
+
+# Workspace scope (shared across the workspace; no repo argument)
+bb vars --workspace
+bb vars set --workspace DOCKERHUB_TOKEN --secured --value-env DOCKERHUB_TOKEN
+
+# Deployment-environment scope (env name resolves to its UUID)
+bb vars --deployment Production widget-service
+bb vars set --deployment Production widget-service DB_URL --secured --value-file ./db_url.txt
+```
+
+All three scopes need `admin:pipeline:bitbucket` scope on the token (`write:pipeline:bitbucket` alone is not enough). A read/write-only token must be rotated to add it. See [Required Bitbucket Permissions](#required-bitbucket-permissions).
 
 ### Utilities
 
@@ -236,7 +279,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 
 ### What it exposes
 
-31 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
+33 tools covering pipelines, pull requests, workspaces, repos, branches, commits, pipeline variables, and git-context helpers:
 
 | Category | Tools |
 |---|---|
@@ -245,7 +288,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
 | Workspaces | `workspaces_list` (needs `read:workspace:bitbucket` scope — see [Required Bitbucket Permissions](#required-bitbucket-permissions)) |
-| Repos / metadata | `repos_list`, `repo_show`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `downloads_list` |
+| Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `downloads_list` |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |
 | Meta | `whoami` (see note below) |
 
