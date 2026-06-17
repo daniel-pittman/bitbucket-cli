@@ -1359,9 +1359,22 @@ cmd_repo() {
 # instead of a curated message. Call as `_require_flag_value "$@"` from
 # inside the case arm — $1 is the flag, $2 is its value if present, so a
 # count below 2 means the value is missing.
+#
+# Also reject the case where $2 is ANOTHER flag (starts with `--`): for
+# `bb vars set KEY --value --secured`, $# is 2 so a length-only check
+# would pass and then assign the literal "--secured" as the value (silent
+# data corruption, the wrong string gets uploaded). A `--`-prefixed next
+# token almost always means the user forgot the value, so treat it as
+# missing. A value that legitimately starts with `--` can still be passed
+# via the `--flag=value` form (handled by the separate `--flag=*` arms).
 _require_flag_value() {
     if [[ "$#" -lt 2 ]]; then
         echo "Error: $1 requires a value." >&2
+        exit 1
+    fi
+    if [[ "$2" == --* ]]; then
+        echo "Error: $1 requires a value, but got the flag '$2'." >&2
+        echo "  If the value really starts with '--', use $1=<value>." >&2
         exit 1
     fi
 }
@@ -1528,15 +1541,26 @@ _resolve_env_uuid() {
             kill -TERM $$
         fi
         # Case-insensitive match on name OR slug; `first` keeps it out of a
-        # SIGPIPE-prone head pipeline and emits at most one uuid.
-        uuid=$(echo "$page" | jq -r --arg n "$env_name" '
+        # SIGPIPE-prone head pipeline and emits at most one match. Select
+        # the matching ENTRY (not its .uuid) so a matched-but-null-uuid env
+        # is distinguished from no-match: `.uuid // empty` alone would
+        # collapse a matched env with uuid:null to "" and produce the
+        # misleading "no environment named X" error even though X matched.
+        # Python (_resolve_environment_uuid) raises "found but has no uuid"
+        # for this shape; mirror it (parity).
+        local matched uuid_val
+        matched=$(echo "$page" | jq -c --arg n "$env_name" '
             ($n | ascii_downcase) as $t
             | first(.values[]
                 | select((.name // "" | ascii_downcase) == $t
-                      or (.slug // "" | ascii_downcase) == $t)
-                | .uuid) // empty')
-        if [[ -n "$uuid" ]]; then
-            printf '%s' "$uuid"
+                      or (.slug // "" | ascii_downcase) == $t)) // empty')
+        if [[ -n "$matched" ]]; then
+            uuid_val=$(printf '%s' "$matched" | jq -r '.uuid // empty')
+            if [[ -z "$uuid_val" ]]; then
+                echo "Error: deployment environment '$env_name' found but has no uuid." >&2
+                kill -TERM $$
+            fi
+            printf '%s' "$uuid_val"
             return
         fi
         # Accumulate available names across pages for the not-found message.
@@ -1571,8 +1595,14 @@ _vars_base_path() {
             printf '%s' "$(repo_path "$repo")/pipelines_config/variables/" ;;
         workspace)
             # HYPHEN form, verified live; underscore 404s here. The
-            # workspace is validated the same way repo_path validates it.
-            if [[ -z "${BB_WORKSPACE:-}" || "$BB_WORKSPACE" == */* \
+            # workspace is validated the same way repo_path validates it,
+            # INCLUDING the whitespace-only check (a bare `-z` test passes
+            # for "   ", which would build `/workspaces/   /...` and 404
+            # with no curated error). `tr -d '[:space:]'` matches repo_path
+            # and Python's `.strip()` emptiness check (parity).
+            local _ws_stripped
+            _ws_stripped="$(printf '%s' "${BB_WORKSPACE:-}" | tr -d '[:space:]')"
+            if [[ -z "$_ws_stripped" || "$BB_WORKSPACE" == */* \
                   || "$BB_WORKSPACE" == "." || "$BB_WORKSPACE" == ".." ]]; then
                 echo "Error: invalid workspace for workspace-scope variables: '${BB_WORKSPACE:-}'." >&2
                 # Inside `$(...)`; kill the parent, not just the subshell.
@@ -1626,6 +1656,14 @@ cmd_vars() {
         echo "Error: --deployment requires an environment name." >&2
         exit 1
     fi
+    # Reject a stale --deployment env left over when a later --workspace
+    # (or default repo scope) won the last-flag-wins race. Mirrors the
+    # Python boundary ("environment is only valid for the deployment
+    # scope") so both surfaces reject the contradictory combination.
+    if [[ "$scope" != "deployment" && -n "$environment" ]]; then
+        echo "Error: --deployment <env> conflicts with --workspace / repo scope." >&2
+        exit 1
+    fi
 
     local repo=""
     if [[ "$scope" == "workspace" ]]; then
@@ -1650,8 +1688,15 @@ cmd_vars() {
     echo "$(_vars_scope_label "$scope") variables for ${target}:"
     echo ""
 
-    local response
-    response=$(bb_get "${base}?pagelen=100")
+    # rc-capture so a 5xx / expired-token on the list surfaces a curated
+    # error instead of `set -e` aborting with only curl's stderr (parity
+    # with cmd_vars_set's lookup-failure handling).
+    local response rc=0
+    response=$(bb_get "${base}?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "vars list failed (exit $rc). Check token scope / connectivity." >&2
+        exit "$rc"
+    fi
 
     printf "  %-30s %-8s %s\n" "KEY" "SECURED" "VALUE"
     printf "  %-30s %-8s %s\n" "---" "-------" "-----"
@@ -1712,6 +1757,12 @@ cmd_vars_set() {
 
     if [[ "$scope" == "deployment" && -z "$environment" ]]; then
         echo "Error: --deployment requires an environment name." >&2
+        exit 1
+    fi
+    # Reject a stale --deployment env when --workspace / repo scope won the
+    # last-flag-wins race (parity with the Python boundary).
+    if [[ "$scope" != "deployment" && -n "$environment" ]]; then
+        echo "Error: --deployment <env> conflicts with --workspace / repo scope." >&2
         exit 1
     fi
 
@@ -1826,10 +1877,25 @@ cmd_vars_set() {
         # case this find defends against), `jq ... | head -n1` makes head
         # close the pipe early, jq dies on SIGPIPE, and `pipefail` turns
         # a routine update into a hard abort. `first` keeps it all in jq.
-        # `// empty` yields "" when there's no match.
-        existing_uuid=$(echo "$page" | jq -r --arg k "$key" \
-            'first(.values[] | select(.key == $k) | .uuid) // empty')
-        if [[ -n "$existing_uuid" ]]; then
+        #
+        # Select the first matching ENTRY (not its .uuid) so we can tell
+        # "no match" from "matched but uuid is null/missing". Emitting just
+        # `.uuid // empty` would collapse a matched-but-null-uuid entry to
+        # "" and fall through to a CREATE, silently POSTing a duplicate of
+        # a key that already exists. Bitbucket has returned uuid:null on
+        # partially-provisioned entries; Python (bb_ops.vars_set) raises
+        # BBOpNotFound for this exact shape, so mirror it here (parity).
+        local matched uuid_val
+        matched=$(echo "$page" | jq -c --arg k "$key" \
+            'first(.values[] | select(.key == $k)) // empty')
+        if [[ -n "$matched" ]]; then
+            uuid_val=$(printf '%s' "$matched" | jq -r '.uuid // empty')
+            if [[ -z "$uuid_val" ]]; then
+                echo "Error: variable '${key}' exists but has no uuid; cannot update." >&2
+                echo "  Refusing to create a duplicate. Inspect it in the Bitbucket UI." >&2
+                exit 1
+            fi
+            existing_uuid="$uuid_val"
             break
         fi
         # Follow the `next` link if present. bb_get takes a path, but the

@@ -961,6 +961,15 @@ def branch_show(
 
 _VARS_SCOPES = ("repo", "workspace", "deployment")
 
+# Sentinel for vars_set's `existing` param. `None` is a MEANINGFUL value
+# there: it's what a caller passes after looking the key up and finding it
+# ABSENT (so vars_set should go straight to create, no second lookup).
+# This sentinel is the real "caller did not pre-fetch" marker, so vars_set
+# only re-runs the lookup when nothing was passed. Without it, a caller
+# that pre-fetched and got None would trigger a redundant second
+# pagination on every create.
+_NOT_PREFETCHED: Any = object()
+
 
 def _resolve_environment_uuid(
     client: BBClient, workspace: str, repo: str, environment: str
@@ -1110,24 +1119,6 @@ def _find_var_by_key_at(
     return None
 
 
-def _find_var_by_key(
-    client: BBClient,
-    workspace: str,
-    repo: str | None,
-    key: str,
-    *,
-    scope: str = "repo",
-    environment: str | None = None,
-) -> dict[str, Any] | None:
-    """Scope-aware find-by-key. Builds the base path for the requested
-    scope, then walks it. Kept as the public lookup the MCP layer calls
-    to report created-vs-updated without a second pagination."""
-    base = _variables_base(
-        client, workspace, repo, scope=scope, environment=environment
-    )
-    return _find_var_by_key_at(client, base, key)
-
-
 def vars_set(
     client: BBClient,
     workspace: str,
@@ -1138,7 +1129,7 @@ def vars_set(
     secured: bool = False,
     scope: str = "repo",
     environment: str | None = None,
-    existing: dict[str, Any] | None = None,
+    existing: dict[str, Any] | None = _NOT_PREFETCHED,
     base: str | None = None,
 ) -> dict[str, Any]:
     """Create or update a pipeline variable at the requested scope.
@@ -1162,8 +1153,12 @@ def vars_set(
 
     `existing` lets a caller that already looked the variable up (e.g.
     to report "created" vs "updated") pass the lookup result in so the
-    full variable list isn't paginated twice. Pass `None` (the default)
-    to look it up here.
+    full variable list isn't paginated twice. Pass the looked-up dict to
+    update it, or `None` to signal "looked it up, it's absent" (go
+    straight to create with no second pagination). Omit the argument
+    entirely (the `_NOT_PREFETCHED` default) to have this function do the
+    lookup. The distinction matters: `None` is "pre-fetched and absent",
+    NOT "not pre-fetched"; conflating them re-paginated on every create.
 
     `base` lets a caller that already built the collection path (via
     `_variables_base`) pass it in so the deployment scope doesn't resolve
@@ -1186,13 +1181,31 @@ def vars_set(
         base = _variables_base(
             client, workspace, repo, scope=scope, environment=environment
         )
+    else:
+        # Validate scope/environment consistency even when `base` is
+        # supplied, so a caller passing a base that contradicts
+        # scope/environment can't bypass the "environment required for the
+        # deployment scope" / "environment only valid for deployment"
+        # guards. These checks are pure (no network) for all scopes.
+        if scope not in _VARS_SCOPES:
+            raise ValueError(
+                f"scope must be one of {_VARS_SCOPES}, got {scope!r}"
+            )
+        if scope == "deployment" and environment is None:
+            raise ValueError("environment is required for the deployment scope")
+        if scope != "deployment" and environment is not None:
+            raise ValueError("environment is only valid for the deployment scope")
+
     payload: dict[str, Any] = {
         "key": key,
         "value": value,
         "secured": bool(secured),
     }
 
-    if existing is None:
+    # `_NOT_PREFETCHED` means the caller didn't look it up, so do it here.
+    # A literal `None` means the caller looked it up and it's absent, so
+    # skip straight to create (no redundant second pagination).
+    if existing is _NOT_PREFETCHED:
         existing = _find_var_by_key_at(client, base, key)
     if existing is not None:
         uuid = existing.get("uuid")

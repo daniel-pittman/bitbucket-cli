@@ -1196,19 +1196,32 @@ def _resolve_vars_scope(
         raise ValueError("environment is only valid for the deployment scope")
 
     if scope == "workspace":
-        # No repo for workspace scope. Borrow the workspace from a repo
-        # hint if given, else use the configured default.
+        # No repo for workspace scope. Resolve the workspace the same way
+        # the bash `resolve_workspace` does: a repo hint wins, else the git
+        # origin of the working dir, else the configured BB_WORKSPACE. The
+        # git-origin step matters for parity: `bb vars --workspace` inside
+        # an `acme/widget` checkout with no BB_WORKSPACE set resolves to
+        # `acme`, so the MCP tool must too rather than erroring.
         if (repo or "").strip():
             client, workspace, _slug = _resolve_repo(repo)
-        else:
-            client = _get_client()
+            return client, workspace, None, None
+        client = _get_client()
+        # Try the git origin of the default repo path (mirrors _resolve_repo's
+        # auto-detect arm). A non-git dir / no-origin raises GitOpError,
+        # which we swallow to fall back to the configured workspace.
+        workspace = ""
+        try:
+            workspace, _slug = git_ops.git_remote_repo(path=_default_repo_path())
+        except _TOOL_EXPECTED_EXCEPTIONS:
+            workspace = ""
+        if not workspace:
             workspace = client.config.workspace
-            if not workspace:
-                raise ValueError(
-                    "no workspace for workspace-scope variables: set "
-                    "BB_WORKSPACE or pass repo='workspace/anything' to "
-                    "supply one."
-                )
+        if not workspace:
+            raise ValueError(
+                "no workspace for workspace-scope variables: set "
+                "BB_WORKSPACE, run inside a Bitbucket git checkout, or pass "
+                "repo='workspace/anything' to supply one."
+            )
         return client, workspace, None, None
 
     client, workspace, repo_slug = _resolve_repo(repo)
@@ -1255,20 +1268,23 @@ def vars_list(
         return _error_dict(e)
 
 
-# Sentinel for vars_set's `value` param. An empty string is a LEGAL
+# `value` not-supplied marker for vars_set. An empty string is a LEGAL
 # pipeline-variable value (e.g. clearing a feature flag), so "" can't
-# double as "value not supplied" — that would make an empty value
-# unsettable via MCP while the bash CLI accepts `--value ""` (a parity
-# break). This sentinel is the real "not supplied" marker; any string a
-# caller actually passes (including "") is treated as a supplied value.
-_VALUE_UNSET = "\x00__bb_value_unset__"
+# double as "value not supplied" (that would make an empty value
+# unsettable via MCP while the bash CLI accepts `--value ""`). We use
+# `None` (JSON `null`) as the not-supplied marker rather than a magic
+# string default: a string sentinel gets serialized into the tool's JSON
+# inputSchema as a default, and a NUL-bearing or otherwise-odd literal
+# can be normalized away by a strict MCP client, silently collapsing the
+# empty-vs-unset distinction. `None` is a first-class JSON value with no
+# such hazard, and an explicit "" is still distinct from it.
 
 
 @mcp.tool()
 def vars_set(
     key: str,
     repo: str = "",
-    value: str = _VALUE_UNSET,
+    value: str | None = None,
     value_file: str = "",
     value_env: str = "",
     secured: bool = False,
@@ -1303,18 +1319,17 @@ def vars_set(
     created or updated the variable — but masks the value as "***".
     """
     try:
-        client, workspace, repo_slug, env = _resolve_vars_scope(
-            repo, scope, environment
-        )
-        scope_norm = scope.strip() or "repo"
+        scope_norm = (scope or "repo").strip() or "repo"
 
-        # Exactly-one-source check. Count the supplied sources so an
-        # ambiguous call (two sources) or an empty call (no source) is
-        # rejected before any value is read or any request is sent.
-        # `value` is "supplied" iff it differs from the sentinel — so an
-        # explicit empty string counts as supplied (parity with bash
-        # `--value ""`), while the default does not.
-        value_supplied = value != _VALUE_UNSET
+        # Validate the value source BEFORE resolving the repo. _resolve_repo
+        # can shell out to git (auto-detect path); an obviously invalid call
+        # (no source, two sources) should error without paying that cost,
+        # matching the bash CLI which checks sources first.
+        #
+        # `value` is "supplied" iff it's not None (the not-supplied marker),
+        # so an explicit empty string counts as supplied (parity with bash
+        # `--value ""`).
+        value_supplied = value is not None
         sources = [
             ("value", value_supplied),
             ("value_file", (value_file or "").strip() != ""),
@@ -1351,6 +1366,12 @@ def vars_set(
                 )
             resolved_value = os.environ[env_name]
 
+        # Sources are valid; now resolve the repo/workspace/scope (may shell
+        # out to git for the auto-detect path).
+        client, workspace, repo_slug, env = _resolve_vars_scope(
+            repo, scope, environment
+        )
+
         # Build the collection base ONCE (the deployment scope resolves an
         # environment NAME->UUID here via a GET). Reuse it for both the
         # existence check and the write so the deployment path doesn't
@@ -1381,7 +1402,12 @@ def vars_set(
             "uuid": result.get("uuid") if isinstance(result, dict) else None,
         }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
-        return _error_dict_with(e, key=key)
+        # Report the stripped key so error and success envelopes agree (an
+        # agent correlating retries by key string sees the same value on
+        # both paths). key may not be a str on a malformed call, so guard.
+        return _error_dict_with(
+            e, key=key.strip() if isinstance(key, str) else key
+        )
 
 
 @mcp.tool()

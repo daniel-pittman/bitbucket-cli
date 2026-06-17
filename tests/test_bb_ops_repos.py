@@ -524,6 +524,53 @@ class TestVarsSet:
             )
         assert opener.calls == []
 
+    def test_matched_key_with_null_uuid_raises_not_create(self) -> None:
+        # A matched entry whose uuid is null/missing must raise rather than
+        # fall through to POST (which would create a duplicate of a key that
+        # already exists). Pin BBOpNotFound and assert no POST fired.
+        opener = _CaptureOpener(
+            [{"values": [{"key": "AWS_REGION", "uuid": None}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound, match="no uuid"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "AWS_REGION", "v"
+            )
+        # Only the lookup GET happened; no POST / PUT.
+        assert [c["method"] for c in opener.calls] == ["GET"]
+
+    def test_prefetched_none_skips_second_lookup_on_create(self) -> None:
+        # When the caller pre-fetched and found the key ABSENT (existing=None),
+        # vars_set must go straight to POST without re-paginating. Only ONE
+        # call (the POST) should fire.
+        opener = _CaptureOpener([{"key": "NEW", "uuid": "{u}"}])
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "NEW", "v",
+            existing=None,
+        )
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "POST"
+
+    def test_omitted_existing_does_lookup_then_create(self) -> None:
+        # Default (existing omitted = _NOT_PREFETCHED): vars_set looks up
+        # (GET, empty) then creates (POST).
+        opener = _CaptureOpener([{"values": []}, {"key": "NEW", "uuid": "{u}"}])
+        bb_ops.vars_set(
+            _client(opener), "acme", "widget-service", "NEW", "v"
+        )
+        assert [c["method"] for c in opener.calls] == ["GET", "POST"]
+
+    def test_base_with_inconsistent_scope_rejected_no_network(self) -> None:
+        # Passing base= must not bypass scope/environment validation: a
+        # deployment scope with no environment is rejected even with base.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="environment"):
+            bb_ops.vars_set(
+                _client(opener), "acme", "widget-service", "K", "v",
+                scope="deployment", environment=None,
+                base="/some/base/variables/",
+            )
+        assert opener.calls == []
+
 
 # ===========================================================================
 # Variable SCOPES: workspace + deployment (env-UUID resolution)
@@ -632,6 +679,18 @@ class TestResolveEnvironmentUuid:
                 _client(opener), "acme", "widget-service", bad
             )
         assert opener.calls == []
+
+    def test_matched_env_with_null_uuid_raises_distinct_error(self) -> None:
+        # A matched env whose uuid is null must raise "found but has no uuid",
+        # NOT the misleading "no environment named X" (which would imply the
+        # name didn't match at all).
+        opener = _CaptureOpener(
+            [{"values": [{"name": "Production", "slug": "production", "uuid": None}]}]
+        )
+        with pytest.raises(bb_ops.BBOpNotFound, match="no uuid"):
+            bb_ops._resolve_environment_uuid(
+                _client(opener), "acme", "widget-service", "Production"
+            )
 
 
 class TestVarsListWorkspaceScope:

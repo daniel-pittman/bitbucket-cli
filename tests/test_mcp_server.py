@@ -819,6 +819,11 @@ class TestRepoTools:
         assert args[3] == "AWS_REGION"
         assert args[4] == "us-east-1"
         assert kwargs["secured"] is False
+        # The pre-fetched lookup happens exactly ONCE (the create path must
+        # not re-paginate; vars_set gets existing=None to skip its own
+        # lookup). Regression guard for the double-pagination finding.
+        assert len(find.calls) == 1
+        assert kwargs["existing"] is None
         # Action reported as created; value NEVER echoed.
         assert out["action"] == "created"
         assert out["value"] == "***"
@@ -853,6 +858,33 @@ class TestRepoTools:
             )
         assert setter.calls[0][0][4] == "file-value"
         assert setter.calls[0][1]["secured"] is True
+
+    def test_vars_set_value_file_no_trailing_newline(
+        self, stub_client: bb_api.BBClient, tmp_path: Any
+    ) -> None:
+        # No trailing newline: value passes through unchanged.
+        f = tmp_path / "secret.txt"
+        f.write_bytes(b"file-value")  # no newline
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(key="K", repo="my-repo", value_file=str(f))
+        assert setter.calls[0][0][4] == "file-value"
+
+    def test_vars_set_value_file_strips_only_one_newline(
+        self, stub_client: bb_api.BBClient, tmp_path: Any
+    ) -> None:
+        # Two trailing newlines: only ONE is stripped (the contract the
+        # bash side also honours), so the value keeps the inner newline.
+        f = tmp_path / "secret.txt"
+        f.write_bytes(b"file-value\n\n")
+        find = _recorder(None)
+        setter = _recorder({"key": "K", "uuid": "{u}"})
+        with patch.object(bb_ops, "_find_var_by_key_at", find), \
+             patch.object(bb_ops, "vars_set", setter):
+            mcp_server.vars_set(key="K", repo="my-repo", value_file=str(f))
+        assert setter.calls[0][0][4] == "file-value\n"
 
     def test_vars_set_value_env(
         self, stub_client: bb_api.BBClient, monkeypatch: pytest.MonkeyPatch
