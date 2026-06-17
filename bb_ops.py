@@ -261,7 +261,17 @@ def pipeline_trigger(
     if not branch or not isinstance(branch, str):
         raise ValueError(f"branch is required and must be a string, got {branch!r}")
 
-    target: dict[str, Any] = {"ref_name": branch, "ref_type": "branch"}
+    # `type: "pipeline_ref_target"` is REQUIRED on the target. Without it
+    # Bitbucket can't classify the reference and 400s with "Unsupported
+    # reference target provided 'pipeline_unknown_target'". This bites the
+    # custom-pattern path hardest (verified live); the default-branch path
+    # happened to be accepted without it, but the field is correct for
+    # both, so send it unconditionally for one consistent shape.
+    target: dict[str, Any] = {
+        "type": "pipeline_ref_target",
+        "ref_type": "branch",
+        "ref_name": branch,
+    }
     if pattern is not None:
         if not isinstance(pattern, str) or not pattern:
             raise ValueError(f"pattern must be a non-empty string, got {pattern!r}")

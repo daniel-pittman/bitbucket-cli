@@ -643,6 +643,12 @@ cmd_pipeline_trigger() {
     # WITHOUT the variables field, silently dropping any VAR=value args
     # the user passed. Build the payload incrementally so variables always
     # land in the request when provided, regardless of pattern.
+    #
+    # The target MUST carry `type: "pipeline_ref_target"`. Without it
+    # Bitbucket 400s with "Unsupported reference target provided
+    # 'pipeline_unknown_target'" — fatal on the custom-pattern path
+    # (verified live), and the field is correct for the default-branch path
+    # too, so it's sent unconditionally for parity with bb_ops.
     local payload
     if [[ "$variables" != "[]" ]]; then
         if [[ -n "$pattern" ]]; then
@@ -650,12 +656,12 @@ cmd_pipeline_trigger() {
                 --arg ref "$branch" \
                 --arg pat "$pattern" \
                 --argjson vars "$variables" \
-                '{target: {ref_name: $ref, ref_type: "branch", selector: {type: "custom", pattern: $pat}}, variables: $vars}')
+                '{target: {type: "pipeline_ref_target", ref_type: "branch", ref_name: $ref, selector: {type: "custom", pattern: $pat}}, variables: $vars}')
         else
             payload=$(jq -n \
                 --arg ref "$branch" \
                 --argjson vars "$variables" \
-                '{target: {ref_name: $ref, ref_type: "branch"}, variables: $vars}')
+                '{target: {type: "pipeline_ref_target", ref_type: "branch", ref_name: $ref}, variables: $vars}')
         fi
     else
         # No variables → omit the key entirely (matches Python's
@@ -664,9 +670,9 @@ cmd_pipeline_trigger() {
             payload=$(jq -n \
                 --arg ref "$branch" \
                 --arg pat "$pattern" \
-                '{target: {ref_name: $ref, ref_type: "branch", selector: {type: "custom", pattern: $pat}}}')
+                '{target: {type: "pipeline_ref_target", ref_type: "branch", ref_name: $ref, selector: {type: "custom", pattern: $pat}}}')
         else
-            payload=$(jq -n --arg ref "$branch" '{target: {ref_name: $ref, ref_type: "branch"}}')
+            payload=$(jq -n --arg ref "$branch" '{target: {type: "pipeline_ref_target", ref_type: "branch", ref_name: $ref}}')
         fi
     fi
 
