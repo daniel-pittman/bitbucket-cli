@@ -1161,7 +1161,7 @@ def repo_create(
 def repo_update(
     repo: str = "",
     project: str = "",
-    description: str = "",
+    description: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing repository (move its project, change description).
 
@@ -1179,8 +1179,13 @@ def repo_update(
         repo: "", "slug", or "workspace/slug" (auto-detect when empty).
         project: Target project KEY to move the repo into. Empty = leave
             the project unchanged.
-        description: New repository description. Empty = leave it
-            unchanged.
+        description: New repository description. `null` (omit) = leave it
+            unchanged; `""` (empty string) = intentionally CLEAR the
+            description; any other string = set it. This three-way
+            distinction matches the bash surface (`bb repo-update
+            --description ""` clears), so the two surfaces have the same
+            capability — a plain `_opt_str` collapse would silently turn a
+            clear into a no-op.
 
     Returns the updated repo record under `info`, plus the resolved
     `project` key for convenience.
@@ -1192,7 +1197,10 @@ def repo_update(
             workspace,
             repo_slug,
             project_key=_opt_str(project),
-            description=_opt_str(description),
+            # description is passed through as-is (no _opt_str): None means
+            # "no change", "" means "clear" — both are meaningful and must
+            # reach bb_ops.repo_update distinctly.
+            description=description,
         )
         return {
             "ok": True,

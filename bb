@@ -289,6 +289,33 @@ _require_build_number() {
     fi
 }
 
+# Validate a resolved workspace slug at the boundary before it's
+# interpolated into a workspace-level request URL (e.g.
+# /workspaces/{ws}/projects). Mirrors the inline contract in
+# bb_ops.projects_list / repos_list: reject empty / whitespace, embedded
+# '/', and '.' / '..'. The repo-level commands get this for free via
+# repo_path, but the workspace-only commands (cmd_projects) don't route
+# through it, so the check is centralised here instead of duplicated.
+# Whitespace check is true parity with Python's `.strip()`: reject if the
+# stripped form differs (catches ` acme `) or is empty.
+_require_workspace() {
+    local ws="$1"
+    local stripped
+    stripped="$(printf '%s' "$ws" | tr -d '[:space:]')"
+    if [[ -z "$stripped" || "$stripped" != "$ws" ]]; then
+        echo "Error: workspace must be a non-empty, non-whitespace string (got '$ws')." >&2
+        exit 1
+    fi
+    if [[ "$ws" == */* ]]; then
+        echo "Error: workspace must not contain '/' (got '$ws')." >&2
+        exit 1
+    fi
+    if [[ "$ws" == "." || "$ws" == ".." ]]; then
+        echo "Error: workspace must not be '.' or '..' (got '$ws')." >&2
+        exit 1
+    fi
+}
+
 # Allowlist the PR state before it's interpolated into the request URL.
 # Mirrors the Python _KNOWN_PR_STATES boundary check (bb_ops.py) — both
 # surfaces reject anything outside the four valid states. Also closes a
@@ -1323,22 +1350,24 @@ cmd_projects() {
     # token without it returns 403; bb_get (`curl -sf`) exits non-zero
     # WITHOUT printing the body, so we name the scope on the error path
     # so the user knows the fix regardless.
+    # Precedence: a -w flag (BB_WORKSPACE_OVERRIDE) is the most explicit
+    # signal and wins; otherwise an explicit positional [workspace] wins
+    # over the git-origin / BB_WORKSPACE default. resolve_workspace owns
+    # the -w / git-origin / config logic, so set BB_WORKSPACE from the
+    # positional ONLY when no -w override is present, then let
+    # resolve_workspace fill in any remaining case — keeping the
+    # precedence logic in one place.
     local ws_arg="${1:-}"
-    if [[ "$ws_arg" == */* ]]; then
-        echo "Error: workspace must not contain '/', got '$ws_arg'." >&2
-        exit 1
-    fi
-    if [[ -n "$ws_arg" ]]; then
-        # Explicit positional workspace wins over the resolver. A -w flag
-        # is the only thing more explicit, so it still takes precedence.
-        if [[ -n "${BB_WORKSPACE_OVERRIDE:-}" ]]; then
-            BB_WORKSPACE="$BB_WORKSPACE_OVERRIDE"
-        else
-            BB_WORKSPACE="$ws_arg"
-        fi
+    if [[ -n "$ws_arg" && -z "${BB_WORKSPACE_OVERRIDE:-}" ]]; then
+        BB_WORKSPACE="$ws_arg"
     else
         resolve_workspace
     fi
+
+    # Validate the resolved workspace at the boundary (empty / whitespace /
+    # embedded '/' / '.' / '..') — parity with bb_ops.projects_list, which
+    # rejects these before any network call.
+    _require_workspace "$BB_WORKSPACE"
 
     echo "Projects in ${BB_WORKSPACE}:"
     echo ""

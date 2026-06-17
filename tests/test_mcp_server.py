@@ -1127,6 +1127,28 @@ class TestRepoTools:
         # project omitted → None (no change).
         assert kwargs["project_key"] is None
 
+    def test_repo_update_empty_description_clears_not_noop(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # Parity with bash `bb repo-update --description ""` (an intentional
+        # clear). An empty string must reach bb_ops as "" (a field to
+        # change), NOT be collapsed to None by _opt_str — otherwise the
+        # MCP surface couldn't clear a description the bash surface can.
+        recorder = _recorder({"full_name": "acme/my-repo"})
+        with patch.object(bb_ops, "repo_update", recorder):
+            mcp_server.repo_update(repo="my-repo", description="")
+        assert recorder.calls[0][1]["description"] == ""
+
+    def test_repo_update_omitted_description_is_none(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        # Omitting description (the default) must mean "no change" → None,
+        # distinct from the empty-string clear above.
+        recorder = _recorder({"full_name": "acme/my-repo"})
+        with patch.object(bb_ops, "repo_update", recorder):
+            mcp_server.repo_update(repo="my-repo", project="WID")
+        assert recorder.calls[0][1]["description"] is None
+
     def test_repo_update_explicit_workspace_slug(
         self, stub_client: bb_api.BBClient
     ) -> None:
