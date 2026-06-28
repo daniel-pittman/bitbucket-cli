@@ -233,6 +233,38 @@ resolve_workspace() {
     fi
 }
 
+# Resolve positional args for PR commands of shape `bb <verb> [repo] <id> [extras...]`.
+# Sets caller-scope:
+#   repo                   -- via resolve_repo (caller must `local repo`)
+#   pr_id                  -- the PR id (caller must `local pr_id`)
+#   pr_args_consumed       -- 1 or 2 (caller `shift $pr_args_consumed` to reach extras)
+#
+# Heuristic: if $1 is purely digits, treat it as the id and auto-detect the
+# repo from git. Otherwise $1 is the [repo] slot and $2 is the id (the
+# existing positional form, unchanged). This makes `bb pr 42` Just Work
+# from inside a checkout instead of treating 42 as a repo slug. Mirrors
+# the state-recognition heuristic in cmd_pr_list (bb prs MERGED).
+#
+# Tradeoff: a repo literally named with pure digits (e.g. slug "42") would
+# be shadowed by the heuristic. Acceptable: Bitbucket slugs by convention
+# are lowercase-hyphenated, pure-digit slugs are vanishingly rare, and the
+# explicit "workspace/42" form remains as a clean escape hatch (the
+# heuristic only triggers on the bare-digits form).
+_resolve_pr_args() {
+    case "${1:-}" in
+        ''|*[!0-9]*)
+            resolve_repo "${1:-}"
+            pr_id="${2:-}"
+            pr_args_consumed=2
+            ;;
+        *)
+            resolve_repo ""
+            pr_id="$1"
+            pr_args_consumed=1
+            ;;
+    esac
+}
+
 repo_path() {
     local repo="$1"
     # Validate inputs at the boundary so a malformed slug doesn't
@@ -935,12 +967,11 @@ cmd_pr_list() {
 }
 
 cmd_pr_view() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
 
     if [[ -z "$pr_id" ]]; then
-        echo "Usage: bb pr-view [repo] <pr-id>" >&2
+        echo "Usage: bb pr-view [repo] <pr-id>   (or: bb pr <id> from inside a checkout)" >&2
         exit 1
     fi
 
@@ -1077,9 +1108,8 @@ cmd_pr_create() {
 }
 
 cmd_pr_approve() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
 
     if [[ -z "$pr_id" ]]; then
         echo "Usage: bb pr-approve [repo] <pr-id>" >&2
@@ -1099,9 +1129,8 @@ cmd_pr_approve() {
 }
 
 cmd_pr_unapprove() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
 
     if [[ -z "$pr_id" ]]; then
         echo "Usage: bb pr-unapprove [repo] <pr-id>" >&2
@@ -1120,10 +1149,10 @@ cmd_pr_unapprove() {
 }
 
 cmd_pr_merge() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
-    local strategy="${3:-merge_commit}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
+    shift $pr_args_consumed
+    local strategy="${1:-merge_commit}"
 
     if [[ -z "$pr_id" ]]; then
         echo "Usage: bb pr-merge [repo] <pr-id> [strategy]" >&2
@@ -1168,9 +1197,8 @@ cmd_pr_merge() {
 }
 
 cmd_pr_decline() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
 
     if [[ -z "$pr_id" ]]; then
         echo "Usage: bb pr-decline [repo] <pr-id>" >&2
@@ -1188,9 +1216,8 @@ cmd_pr_decline() {
 }
 
 cmd_pr_diff() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
 
     if [[ -z "$pr_id" ]]; then
         echo "Usage: bb pr-diff [repo] <pr-id>" >&2
@@ -1207,9 +1234,8 @@ cmd_pr_diff() {
 }
 
 cmd_pr_comments() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
 
     if [[ -z "$pr_id" ]]; then
         echo "Usage: bb pr-comments [repo] <pr-id>" >&2
@@ -1231,10 +1257,10 @@ cmd_pr_comments() {
 }
 
 cmd_pr_comment_add() {
-    local repo
-    resolve_repo "${1:-}"
-    local pr_id="${2:-}"
-    local body="${3:-}"
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "$@"
+    shift $pr_args_consumed
+    local body="${1:-}"
 
     if [[ -z "$pr_id" || -z "$body" ]]; then
         echo "Usage: bb pr-comment [repo] <pr-id> <body>" >&2
@@ -2745,6 +2771,10 @@ GLOBAL FLAGS
 
 NOTES
   [repo] is auto-detected from the current git remote if omitted.
+  For PR-id commands (pr / pr-merge / pr-diff / pr-comments / pr-approve /
+  pr-unapprove / pr-decline / pr-comment), a bare numeric first arg is
+  treated as the PR id and the repo is auto-detected (e.g. `bb pr 42` from
+  inside the checkout). Pass `workspace/slug <id>` for an explicit repo.
   Config: ~/.config/bb/config or env vars BB_USER, BB_TOKEN, BB_WORKSPACE.
 
   Auth uses Atlassian API tokens with HTTP Basic auth.
