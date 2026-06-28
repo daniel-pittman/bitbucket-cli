@@ -1151,14 +1151,18 @@ cmd_pr_unapprove() {
 cmd_pr_merge() {
     local repo pr_id pr_args_consumed
     _resolve_pr_args "$@"
-    shift $pr_args_consumed
-    local strategy="${1:-merge_commit}"
-
+    # Check usage BEFORE `shift $pr_args_consumed`. If the user passed a
+    # single non-numeric arg (e.g. `bb pr-merge myrepo` with no id),
+    # pr_args_consumed=2 but only 1 positional exists, so shift 2 returns
+    # non-zero, which under `set -euo pipefail` aborts the script before
+    # the friendly Usage message can print.
     if [[ -z "$pr_id" ]]; then
-        echo "Usage: bb pr-merge [repo] <pr-id> [strategy]" >&2
+        echo "Usage: bb pr-merge [repo] <pr-id> [strategy]   (or: bb pr-merge <id> [strategy] from inside a checkout)" >&2
         echo "  Strategies: merge_commit (default), squash, fast_forward" >&2
         exit 1
     fi
+    shift $pr_args_consumed
+    local strategy="${1:-merge_commit}"
 
     # Validate strategy against Bitbucket's accepted set so a typo
     # (e.g. "squash_commit") fails locally with a clear message
@@ -1259,15 +1263,23 @@ cmd_pr_comments() {
 cmd_pr_comment_add() {
     local repo pr_id pr_args_consumed
     _resolve_pr_args "$@"
-    shift $pr_args_consumed
-    local body="${1:-}"
-
-    if [[ -z "$pr_id" || -z "$body" ]]; then
-        echo "Usage: bb pr-comment [repo] <pr-id> <body>" >&2
+    # Same ordering rule as cmd_pr_merge: check pr_id BEFORE shift to
+    # avoid `shift 2` aborting under `set -euo pipefail` when the user
+    # passed only one (non-numeric) arg.
+    _usage_pr_comment() {
+        echo "Usage: bb pr-comment [repo] <pr-id> <body>   (or: bb pr-comment <id> <body> from inside a checkout)" >&2
         echo "" >&2
         echo "  Add a top-level comment to PR #<pr-id>." >&2
         echo "  Use single quotes around <body> if it contains spaces or shell metacharacters." >&2
         exit 1
+    }
+    if [[ -z "$pr_id" ]]; then
+        _usage_pr_comment
+    fi
+    shift $pr_args_consumed
+    local body="${1:-}"
+    if [[ -z "$body" ]]; then
+        _usage_pr_comment
     fi
 
     # Bitbucket's contract: POST {"content": {"raw": "<text>"}}.
