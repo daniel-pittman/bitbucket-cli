@@ -1150,7 +1150,13 @@ cmd_pr_merge() {
     # Parity fix: capture exit code so a merge conflict / failing
     # required check / wrong-strategy-for-repo error surfaces as a
     # labelled error instead of silently aborting under set -e.
-    if bb_put "$(repo_path "$repo")/pullrequests/${pr_id}/merge" "$payload" > /dev/null; then
+    # Bitbucket's PR merge endpoint is POST per the REST docs. An earlier
+    # version of this used bb_put (PUT), which Bitbucket rejects with
+    # HTTP 403 + "This endpoint does not support token-based authentication"
+    # (an unhelpful error that actually meant "wrong method here"). Confirmed
+    # against dreamfacesbir/ryan-os PR#2 (2026-06-28) where direct POST with
+    # the same API token merged cleanly. Keep POST; do not "improve" back.
+    if bb_post "$(repo_path "$repo")/pullrequests/${pr_id}/merge" "$payload" > /dev/null; then
         echo "Merged PR #${pr_id} (${strategy})"
     else
         local rc=$?

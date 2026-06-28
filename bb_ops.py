@@ -694,13 +694,15 @@ def pr_merge(
                 f"when provided, got {message!r}"
             )
         payload["message"] = message
-    # Mirror bash's PUT verb (cmd_pr_merge uses bb_put). Bitbucket Cloud
-    # has historically accepted both PUT and POST for this endpoint, and
-    # the bash side is the verified-working contract. Flagged as a 4.7
-    # investigation: verify against current Bitbucket docs and align on
-    # one verb (POST is the modern documented shape per their REST docs
-    # at time of writing).
-    return client.put(
+    # Bitbucket's PR merge endpoint is POST per the REST docs. An earlier
+    # version of this op (and bash cmd_pr_merge) used PUT on the
+    # historical assumption that Bitbucket accepted either; that's no
+    # longer true. PUT now returns HTTP 403 + "This endpoint does not
+    # support token-based authentication" (an unhelpful error that
+    # actually means "wrong method here"). Confirmed against
+    # dreamfacesbir/ryan-os PR#2 (2026-06-28) where direct POST with the
+    # same API token merged cleanly. Keep POST; do not "improve" back.
+    return client.post(
         f"{_prs_root(workspace, repo)}/{pr_id}/merge",
         json_body=payload,
     )
