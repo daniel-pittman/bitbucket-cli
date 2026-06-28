@@ -610,11 +610,12 @@ class TestPrMerge:
         opener = _CaptureOpener([_make_pr(7, state="MERGED")])
         bb_ops.pr_merge(_client(opener), "acme", "widget-service", 7)
         call = opener.calls[0]
-        # Mirror bash's PUT for the merge endpoint. Bitbucket has
-        # historically accepted both verbs and the bash side is the
-        # verified-working contract; aligning on one verb (likely POST,
-        # per current REST docs) is a 4.7 investigation.
-        assert call["method"] == "PUT"
+        # Bitbucket's PR merge endpoint is POST per the REST docs. An
+        # earlier version used PUT and this test pinned that; PUT now
+        # 403s with "endpoint does not support token-based authentication"
+        # (a misleading error that actually meant "wrong method"). See
+        # bb_ops.pr_merge for the full history. Pin POST going forward.
+        assert call["method"] == "POST"
         assert call["url"] == _prs_url() + "/7/merge"
         assert call["body"] == {
             "type": "pullrequest",
