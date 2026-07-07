@@ -60,6 +60,7 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 ### Pull requests (write)
 
 - `pr_create(title, source_branch?, destination_branch?, repo?, description?, close_source_branch?, reviewers?)` — `source_branch` auto-detects from the current git branch when empty; rejects detached-HEAD state. `reviewers` is a list of Bitbucket account UUIDs.
+- `pr_update(pr_id, repo?, title?, description?)` — update an OPEN PR's title and/or description via PUT to the same path `pr_show` GETs (Bitbucket Cloud has no PATCH for pull requests). Only the supplied fields change; the PUT merges them into the existing PR, preserving source/destination branches and reviewers. `title` is two-way: omit (`null`) to leave unchanged, or pass a non-empty string (an empty/whitespace title is INVALID and surfaces as a `ValueError` envelope). `description` is three-way: omit (`null`) to leave unchanged, pass `""` to CLEAR it, or any string to set it (matches the bash `bb pr-update --description ""` clear). At least one of `title` / `description` must be supplied; an empty-body update is rejected at the boundary with no network IO. Requires pull-request write scope on the token.
 - `pr_approve(pr_id, repo?)` / `pr_unapprove(pr_id, repo?)` — toggle approval.
 - `pr_merge(pr_id, repo?, strategy?, close_source_branch?, message?)` — strategies: `merge_commit` (default), `squash`, `fast_forward`.
 - `pr_decline(pr_id, repo?)` — close without merging.

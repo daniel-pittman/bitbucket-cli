@@ -746,6 +746,9 @@ class TestPrDecline:
         (bb_ops.pr_diff, ()),
         (bb_ops.pr_show, ()),
         (bb_ops.pr_activity, ()),
+        # pr_update validates pr_id FIRST (before the empty-payload check),
+        # so a bad id raises "pr_id" even with no title/description supplied.
+        (bb_ops.pr_update, ()),
     ],
 )
 def test_every_pr_op_rejects_bad_pr_id(fn: Any, extra_args: tuple[Any, ...]) -> None:
@@ -905,4 +908,126 @@ class TestPrCommentAdd:
                 42,
                 None,  # type: ignore[arg-type]
             )
+        assert opener.calls == []
+
+
+# ===========================================================================
+# pr_update
+# ===========================================================================
+
+
+class TestPrUpdate:
+    def _url(self, pr_id: int) -> str:
+        return _prs_url() + f"/{pr_id}"
+
+    def test_puts_title_and_description(self) -> None:
+        opener = _CaptureOpener([_make_pr(42)])
+        result = bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            title="New title",
+            description="New body.",
+        )
+        assert result["id"] == 42
+        call = opener.calls[0]
+        # Method is PUT (Bitbucket Cloud has no PATCH for pullrequests),
+        # to the same path pr_show GETs.
+        assert call["method"] == "PUT"
+        assert call["url"] == self._url(42)
+        assert call["body"] == {"title": "New title", "description": "New body."}
+
+    def test_title_only_omits_description(self) -> None:
+        opener = _CaptureOpener([_make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, title="Just the title"
+        )
+        # description omitted (None) → not in body, so the existing PR body
+        # is preserved by Bitbucket's field-merge PUT.
+        assert opener.calls[0]["body"] == {"title": "Just the title"}
+
+    def test_description_only_omits_title(self) -> None:
+        opener = _CaptureOpener([_make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            description="Just the body",
+        )
+        assert opener.calls[0]["body"] == {"description": "Just the body"}
+
+    def test_empty_description_clears_body(self) -> None:
+        """description="" is a DELIBERATE clear (three-way like repo_update),
+        distinct from None (leave unchanged). It must appear in the body."""
+        opener = _CaptureOpener([_make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, description=""
+        )
+        assert opener.calls[0]["body"] == {"description": ""}
+
+    def test_multiline_description_roundtrips_verbatim(self) -> None:
+        opener = _CaptureOpener([_make_pr(42)])
+        body_text = "# Heading\n\n- bullet one\n- bullet two\n\nTrailing para.\n"
+        bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            title="t",
+            description=body_text,
+        )
+        assert opener.calls[0]["body"]["description"] == body_text
+
+    def test_rejects_empty_body_no_fields(self) -> None:
+        """Neither title nor description → a PUT with an empty body would be
+        a no-op round-trip. Reject at the boundary with NO network IO."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="at least one field"):
+            bb_ops.pr_update(_client(opener), "acme", "widget-service", 42)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad_title", ["", "   ", "\n\t"])
+    def test_rejects_empty_or_whitespace_title(self, bad_title: str) -> None:
+        """A supplied title must be non-empty/non-whitespace (a PR needs a
+        title; Bitbucket rejects a blank one). Symmetric with pr_create."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="title"):
+            bb_ops.pr_update(
+                _client(opener), "acme", "widget-service", 42, title=bad_title
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_string_title(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="title"):
+            bb_ops.pr_update(
+                _client(opener),
+                "acme",
+                "widget-service",
+                42,
+                title=123,  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_string_description(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="description"):
+            bb_ops.pr_update(
+                _client(opener),
+                "acme",
+                "widget-service",
+                42,
+                description=123,  # type: ignore[arg-type]
+            )
+        assert opener.calls == []
+
+    def test_pr_id_validated_before_empty_payload_check(self) -> None:
+        """A bad pr_id raises the pr_id error even when no fields are given
+        — identity is validated before content, so the caller gets the most
+        specific error and no network IO happens either way."""
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="pr_id"):
+            bb_ops.pr_update(_client(opener), "acme", "widget-service", 0)
         assert opener.calls == []

@@ -1047,6 +1047,61 @@ def pr_comment_add(pr_id: int, body: str, repo: str = "") -> dict[str, Any]:
         return _error_dict_with(e, pr_id=pr_id)
 
 
+@mcp.tool()
+def pr_update(
+    pr_id: int,
+    repo: str = "",
+    title: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Update an OPEN pull request's title and/or description.
+
+    Bitbucket's PR mutation endpoint is a PUT to the same path pr_show GETs
+    (there is no PATCH for the pullrequests resource in Bitbucket Cloud).
+    Only the supplied fields change — the PUT merges them into the existing
+    PR, preserving the source/destination branches and reviewers. Only open
+    pull requests can be mutated.
+
+    Args:
+        pr_id: Pull request ID.
+        repo: Repo slug, "workspace/slug", or "" to auto-detect.
+        title: New PR title. `null` (omit) = leave the title unchanged; any
+            non-empty, non-whitespace string = set it. An empty/whitespace
+            title is INVALID (a PR must have a title) and surfaces as a
+            ValueError error envelope rather than being sent.
+        description: New PR description. `null` (omit) = leave it unchanged;
+            `""` (empty string) = intentionally CLEAR the body; any other
+            string = set it. This three-way distinction matches repo_update
+            so a deliberate clear isn't collapsed into a no-op.
+
+    At least one of `title` / `description` must be supplied. Returns the
+    updated PR record under `pr`.
+    """
+    try:
+        client, workspace, repo_slug = _resolve_repo(repo)
+        # title / description are passed through as-is (no _opt_str
+        # collapse): None means "no change", while for description "" means
+        # "clear" and must reach bb_ops.pr_update distinctly. Collapsing ""
+        # to None would silently turn a deliberate clear into a no-op.
+        result = bb_ops.pr_update(
+            client,
+            workspace,
+            repo_slug,
+            pr_id,
+            title=title,
+            description=description,
+        )
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "pr_id": pr_id,
+            "pr": result,
+        }
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict_with(e, pr_id=pr_id)
+
+
 # =============================================================================
 #  WORKSPACES TOOL
 # =============================================================================
