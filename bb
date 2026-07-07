@@ -1172,7 +1172,7 @@ cmd_pr_update() {
     # intentional clear (`--description ""`) still counts as a change.
     # Reject BEFORE resolving the repo so the usage error needs no API call.
     if [[ -z "$have_title" && -z "$have_description" ]]; then
-        echo "Usage: bb pr-update [repo] <pr-id> --title TEXT [--description TEXT | --description-file PATH]" >&2
+        echo "Usage: bb pr-update [repo] <pr-id> [--title TEXT] [--description TEXT | --description-file PATH]" >&2
         echo "" >&2
         echo "  Updates an OPEN pull request's title and/or description." >&2
         echo "  At least one of --title / --description / --description-file" >&2
@@ -1200,7 +1200,7 @@ cmd_pr_update() {
     _resolve_pr_args "${positionals[@]+"${positionals[@]}"}"
 
     if [[ -z "$pr_id" ]]; then
-        echo "Usage: bb pr-update [repo] <pr-id> --title TEXT [--description TEXT | --description-file PATH]" >&2
+        echo "Usage: bb pr-update [repo] <pr-id> [--title TEXT] [--description TEXT | --description-file PATH]" >&2
         exit 1
     fi
 
@@ -2857,7 +2857,7 @@ PULL REQUESTS
   bb prs [repo] [state]                 List PRs (default: OPEN)
   bb pr [repo] <id>                     View PR details
   bb pr-create [repo] <title> [dest]    Create PR from current branch
-  bb pr-update [repo] <id> --title T [--description D | --description-file F]
+  bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                         Update a PR title and/or description
   bb pr-approve [repo] <id>             Approve a PR
   bb pr-unapprove [repo] <id>           Remove your approval on a PR

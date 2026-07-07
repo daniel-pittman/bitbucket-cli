@@ -189,7 +189,7 @@ Pipelines must be **enabled** on a repo before pipeline variables, custom pipeli
 bb prs [repo] [state]                 # List PRs (default: OPEN)
 bb pr [repo] <id>                     # View PR details
 bb pr-create [repo] <title> [dest]    # Create PR from current branch
-bb pr-update [repo] <id> --title T [--description D | --description-file F]
+bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                       # Update a PR title and/or description
 bb pr-approve [repo] <id>             # Approve a PR
 bb pr-merge [repo] <id> [strategy]    # Merge a PR (merge_commit|squash|fast_forward)
