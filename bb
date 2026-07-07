@@ -1107,6 +1107,135 @@ cmd_pr_create() {
     echo "  ${pr_url}"
 }
 
+cmd_pr_update() {
+    # bb pr-update [repo] <pr-id> [--title TEXT] [--description TEXT | --description-file PATH]
+    #
+    # Updates an OPEN pull request's title and/or description via PUT to
+    # /repositories/{ws}/{slug}/pullrequests/{id} — the same path `bb pr`
+    # GETs. Only the fields supplied go in the body; the PUT merges them
+    # into the existing PR, preserving source/destination branches and
+    # reviewers (Bitbucket keeps omitted PR fields on this endpoint). The
+    # method is PUT, not PATCH: Bitbucket Cloud has no PATCH for the
+    # pullrequests resource. Parity with bb_ops.pr_update.
+    #
+    # [repo] accepts the same shapes as every other PR command (bare slug,
+    # ws/slug, or omitted for git-origin auto-detect). At least one of
+    # --title / --description / --description-file must be supplied.
+    local title="" description="" desc_file=""
+    local have_title="" have_description="" have_desc_file=""
+    local -a positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)              _require_flag_value "$@"; title="$2"; have_title=1; shift 2 ;;
+            --title=*)            title="${1#*=}"; have_title=1; shift ;;
+            --description)        _require_flag_value "$@"; description="$2"; have_description=1; shift 2 ;;
+            --description=*)      description="${1#*=}"; have_description=1; shift ;;
+            --description-file)   _require_flag_value "$@"; desc_file="$2"; have_desc_file=1; shift 2 ;;
+            --description-file=*) desc_file="${1#*=}"; have_desc_file=1; shift ;;
+            -*)
+                echo "Error: unknown flag for pr-update: $1" >&2
+                exit 1 ;;
+            *)
+                positionals+=("$1"); shift ;;
+        esac
+    done
+
+    # --description and --description-file are two ways to set the same
+    # field; supplying both is ambiguous. Reject rather than silently pick.
+    if [[ -n "$have_description" && -n "$have_desc_file" ]]; then
+        echo "Error: --description and --description-file are mutually exclusive." >&2
+        exit 1
+    fi
+
+    # Resolve the body from a file when requested. Read it verbatim (no
+    # trailing-newline trimming via "$(...)" is acceptable: a PR body's
+    # trailing blank line is not meaningful, and command substitution's
+    # single-trailing-newline strip matches how the body renders). A
+    # missing/unreadable file fails HERE, before any API call.
+    if [[ -n "$have_desc_file" ]]; then
+        if [[ ! -f "$desc_file" ]]; then
+            echo "Error: --description-file not found: $desc_file" >&2
+            exit 1
+        fi
+        local _dfrc=0
+        description="$(cat "$desc_file")" || _dfrc=$?
+        if [[ "$_dfrc" -ne 0 ]]; then
+            echo "Error: failed to read --description-file: $desc_file" >&2
+            exit 1
+        fi
+        have_description=1
+    fi
+
+    # At least one field must change; a PUT with an empty body is a no-op
+    # round-trip. Gate on the have_* flags (not `-n "$value"`) so an
+    # intentional clear (`--description ""`) still counts as a change.
+    # Reject BEFORE resolving the repo so the usage error needs no API call.
+    if [[ -z "$have_title" && -z "$have_description" ]]; then
+        echo "Usage: bb pr-update [repo] <pr-id> --title TEXT [--description TEXT | --description-file PATH]" >&2
+        echo "" >&2
+        echo "  Updates an OPEN pull request's title and/or description." >&2
+        echo "  At least one of --title / --description / --description-file" >&2
+        echo "  is required. [repo] is auto-detected from git origin if omitted." >&2
+        exit 1
+    fi
+
+    # When a title is supplied, it must be non-empty/non-whitespace — a PR
+    # needs a title and Bitbucket rejects a blank one (parity with the
+    # bb_ops.pr_update boundary check). Only checked when --title was given;
+    # omitting --title leaves the existing title untouched.
+    if [[ -n "$have_title" ]]; then
+        local _t_stripped
+        _t_stripped="$(printf '%s' "$title" | tr -d '[:space:]')"
+        if [[ -z "$_t_stripped" ]]; then
+            echo "Error: --title requires a non-empty, non-whitespace value." >&2
+            exit 1
+        fi
+    fi
+
+    # Resolve [repo] <pr-id> from the collected positionals via the same
+    # heuristic every other PR command uses. The `+` expansion keeps this
+    # safe under `set -u` on bash 3.2 when no positionals were given.
+    local repo pr_id pr_args_consumed
+    _resolve_pr_args "${positionals[@]+"${positionals[@]}"}"
+
+    if [[ -z "$pr_id" ]]; then
+        echo "Usage: bb pr-update [repo] <pr-id> --title TEXT [--description TEXT | --description-file PATH]" >&2
+        exit 1
+    fi
+
+    # Build the body with jq so values are escaped. Only the supplied
+    # fields go in — parity with the Python omit-when-absent contract.
+    local payload="{}"
+    if [[ -n "$have_title" ]]; then
+        payload=$(echo "$payload" | jq --arg t "$title" '. + {title: $t}')
+    fi
+    if [[ -n "$have_description" ]]; then
+        payload=$(echo "$payload" | jq --arg d "$description" '. + {description: $d}')
+    fi
+
+    echo "Updating PR #${pr_id}..."
+
+    # rc-capture pattern (same as cmd_pr_create): a 4xx (wrong id, PR not
+    # open, empty title, missing scope) makes bb_put exit non-zero and
+    # `set -e` would silently abort after the banner without this guard.
+    local response rc=0
+    response=$(bb_put "$(repo_path "$repo")/pullrequests/${pr_id}" "$payload") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "PR-update request failed for PR #${pr_id} (exit $rc)." >&2
+        echo "  Common causes: the PR id is wrong or the PR is not open," >&2
+        echo "  the title is empty, or the token lacks pull-request write scope." >&2
+        exit "$rc"
+    fi
+
+    local new_title pr_url
+    new_title=$(echo "$response" | jq -r '.title // "(unknown)"')
+    pr_url=$(echo "$response" | jq -r '.links.html.href // empty')
+
+    echo "Updated PR #${pr_id}: ${new_title}"
+    [[ -n "$pr_url" ]] && echo "  ${pr_url}"
+}
+
 cmd_pr_approve() {
     local repo pr_id pr_args_consumed
     _resolve_pr_args "$@"
@@ -2728,6 +2857,8 @@ PULL REQUESTS
   bb prs [repo] [state]                 List PRs (default: OPEN)
   bb pr [repo] <id>                     View PR details
   bb pr-create [repo] <title> [dest]    Create PR from current branch
+  bb pr-update [repo] <id> --title T [--description D | --description-file F]
+                                        Update a PR title and/or description
   bb pr-approve [repo] <id>             Approve a PR
   bb pr-unapprove [repo] <id>           Remove your approval on a PR
   bb pr-merge [repo] <id> [strategy]    Merge a PR (merge_commit|squash|fast_forward)
@@ -2855,6 +2986,7 @@ case "$command" in
     prs|pr-list)          cmd_pr_list "$@" ;;
     pr|pr-view)           cmd_pr_view "$@" ;;
     pr-create|prc)        cmd_pr_create "$@" ;;
+    pr-update|pr-edit)    cmd_pr_update "$@" ;;
     pr-approve|pra)       cmd_pr_approve "$@" ;;
     pr-unapprove|prua)    cmd_pr_unapprove "$@" ;;
     pr-merge|prm)         cmd_pr_merge "$@" ;;

@@ -93,6 +93,7 @@ EXPECTED_TOOLS = {
     "pr_show",
     "pr_activity",
     "pr_create",
+    "pr_update",
     "pr_approve",
     "pr_unapprove",
     "pr_merge",
@@ -142,11 +143,11 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 41 = 8 pipelines
-    (incl. pipelines_config show/set) + 11 PRs + 2 workspaces/projects
-    + 14 repos/metadata (incl. vars_delete + environments
-    list/create/delete) + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 41
+    regression that drops a registration is visible. 42 = 8 pipelines
+    (incl. pipelines_config show/set) + 12 PRs (incl. pr_update)
+    + 2 workspaces/projects + 14 repos/metadata (incl. vars_delete +
+    environments list/create/delete) + 5 git context + 1 meta."""
+    assert len(mcp_server.mcp._tools) == 42
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +774,61 @@ class TestPullRequestTools:
         with patch.object(bb_ops, "pr_merge", recorder):
             mcp_server.pr_merge(pr_id=42, repo="my-repo", message="")
         assert recorder.calls[0][1]["message"] is None
+
+    def test_pr_update_forwards_title_and_description(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"id": 42, "title": "New title"})
+        with patch.object(bb_ops, "pr_update", recorder):
+            out = mcp_server.pr_update(
+                pr_id=42,
+                repo="my-repo",
+                title="New title",
+                description="New body.",
+            )
+        assert recorder.calls[0][0] == (stub_client, "acme", "my-repo", 42)
+        assert recorder.calls[0][1] == {
+            "title": "New title",
+            "description": "New body.",
+        }
+        assert out["pr"]["title"] == "New title"
+        assert out["pr_id"] == 42
+
+    def test_pr_update_passes_none_through_unchanged(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Omitted (None) title/description must reach bb_ops as None (=
+        leave unchanged), NOT be collapsed. A title-only update forwards
+        description=None."""
+        recorder = _recorder({"id": 42})
+        with patch.object(bb_ops, "pr_update", recorder):
+            mcp_server.pr_update(pr_id=42, repo="my-repo", title="Only title")
+        assert recorder.calls[0][1] == {"title": "Only title", "description": None}
+
+    def test_pr_update_empty_description_not_collapsed_to_none(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """description="" is a deliberate CLEAR (three-way like repo_update),
+        distinct from None. The wrapper must forward "" verbatim, not
+        collapse it to None (which would silently no-op the clear)."""
+        recorder = _recorder({"id": 42})
+        with patch.object(bb_ops, "pr_update", recorder):
+            mcp_server.pr_update(pr_id=42, repo="my-repo", description="")
+        assert recorder.calls[0][1] == {"title": None, "description": ""}
+
+    def test_pr_update_threads_pr_id_on_error(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """On the error path pr_id is threaded into the envelope so
+        parallel pr_update fan-outs can correlate the failure."""
+        def boom(*_a: Any, **_k: Any) -> Any:
+            raise ValueError("pr_update requires at least one field to change")
+
+        with patch.object(bb_ops, "pr_update", boom):
+            out = mcp_server.pr_update(pr_id=42, repo="my-repo")
+        assert out["ok"] is False
+        assert out["kind"] == "ValueError"
+        assert out["pr_id"] == 42
 
 
 class TestRepoTools:

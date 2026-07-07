@@ -623,6 +623,71 @@ def pr_create(
     return client.post(_prs_root(workspace, repo), json_body=payload)
 
 
+def pr_update(
+    client: BBClient,
+    workspace: str,
+    repo: str,
+    pr_id: int,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Update an OPEN pull request's title and/or description.
+
+    Bitbucket's PR mutation endpoint is a PUT to the SAME path pr_show GETs:
+    PUT /repositories/{ws}/{slug}/pullrequests/{id}. Only open pull requests
+    can be mutated. Only the fields present in the body change — the PUT
+    merges them into the existing PR, preserving the source/destination
+    branches and reviewers (Bitbucket keeps omitted PR fields on this
+    endpoint, so a title-only or description-only update is safe).
+
+    Note the HTTP method is PUT, not PATCH: Bitbucket Cloud has no PATCH for
+    the pullrequests resource. This mirrors repo_update, which PUTs the same
+    path repo_show GETs for the analogous repo mutation.
+
+    `title`: None (omit) = leave unchanged; any non-empty, non-whitespace
+    string = set it. An empty/whitespace title is INVALID (a PR must have a
+    title — Bitbucket rejects a blank one and it's meaningless in any PR
+    list view), so it's rejected at the boundary rather than sent.
+
+    `description`: None (omit) = leave unchanged; "" = intentionally CLEAR
+    the body; any other string = set it. This three-way distinction matches
+    repo_update's description contract so a deliberate clear isn't collapsed
+    into a no-op.
+
+    At least one of `title` / `description` must be supplied; a PUT with an
+    empty body would be a no-op round-trip, so it's rejected at the boundary
+    before burning an API call.
+
+    Returns the updated PR record.
+    """
+    _validate_pr_id(pr_id)
+
+    payload: dict[str, Any] = {}
+    if title is not None:
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(
+                f"title must be a non-empty, non-whitespace string when "
+                f"provided, got {title!r}"
+            )
+        payload["title"] = title
+    if description is not None:
+        if not isinstance(description, str):
+            raise ValueError(
+                f"description must be a string when provided, got "
+                f"{type(description).__name__}"
+            )
+        payload["description"] = description
+
+    if not payload:
+        raise ValueError(
+            "pr_update requires at least one field to change "
+            "(title and/or description)"
+        )
+
+    return client.put(f"{_prs_root(workspace, repo)}/{pr_id}", json_body=payload)
+
+
 def pr_approve(
     client: BBClient, workspace: str, repo: str, pr_id: int
 ) -> Any:
