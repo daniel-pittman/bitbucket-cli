@@ -45,7 +45,7 @@ This agent exists because (a) `bb` has a wide tool surface (pipelines, PRs, bran
 
 ### Pipelines (write)
 
-- `pipeline_trigger(branch, repo?, pattern?, variables?)` — run a pipeline. Without `pattern`, the branch's default pipeline runs; with `pattern`, the named custom pipeline. `variables` is a `{name: value}` dict.
+- `pipeline_trigger(branch, repo?, pattern?, pipeline?, variables?)` — run a pipeline. Without a selector, the branch's default pipeline runs; with one, the named custom pipeline. `pipeline` is an explicit ALIAS for `pattern` (FastMCP silently drops unknown arguments, and `pipeline=` is the name callers naturally reach for; without the alias a custom selector passed that way would be dropped and a plain branch build would run); passing both with different values errors loudly. `variables` is a `{name: value}` dict of per-run variables (they need not be declared in the pipeline yml). The success envelope echoes `pattern` (resolved selector or null) and `variable_keys` (key names only, values withheld) so you can VERIFY what was sent: check them after a trigger that must carry a selector/variables.
 - `pipeline_stop(number, repo?)` — stop a running pipeline.
 - `pipelines_config_set(enabled, repo?)` — enable (`enabled=True`) or disable (`enabled=False`) Pipelines on a repo. PUTs `/pipelines_config`. Required before repo variables / custom pipelines / builds will run. Requires `admin:pipeline:bitbucket` scope (same family as `vars_set`); `write:pipeline:bitbucket` alone returns 403, body names the missing scope under `error.detail.required`.
 

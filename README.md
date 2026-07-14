@@ -20,13 +20,13 @@ The bash CLI has no dependencies beyond `curl` and `jq`. The MCP server adds Pyt
 - **Pull Requests**: Create, view, approve, unapprove, merge, decline, diff, comment
 - **Repositories**: List repos, view details, list/show branches, list recent commits
 - **Browser Integration**: Quick-open any resource in your browser
-- **MCP server**: 31 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
+- **MCP server**: 42 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
 
 ## Requirements
 
 - `bash` (3.2+) — works with macOS system bash; bash 4+ also fine
 - `curl` - usually pre-installed on macOS/Linux
-- `jq` - JSON processor ([install instructions](https://jqlang.github.io/jq/download/))
+- `jq` (1.6+) - JSON processor ([install instructions](https://jqlang.github.io/jq/download/)); `bb trigger` builds its variables payload via `$ARGS.positional`, a jq 1.6 feature
 - Python 3.10+ (only required for the MCP server)
 
 ### Installing jq
@@ -173,7 +173,8 @@ bb pipelines [repo] [count]           # List recent pipelines (default: 10)
 bb pipeline [repo] <number>           # Show pipeline details and steps
 bb watch [repo] [number] [interval]   # Poll pipeline until done (default: 15s)
 bb logs [repo] <number> [step]        # Show step logs
-bb trigger [repo] [branch] [pattern]  # Trigger a pipeline run
+bb trigger [repo] [branch] [pattern] [--var KEY=VALUE ...]
+                                      # Trigger a pipeline run
 bb stop [repo] <number>               # Stop a running pipeline
 bb approve [repo] <number>            # Open pipeline in browser (manual steps require UI)
 bb pipelines-status [repo]            # Show whether Pipelines (CI) is enabled
@@ -182,6 +183,12 @@ bb pipelines-disable [repo]           # Disable Pipelines (CI) on a repo
 ```
 
 Pipelines must be **enabled** on a repo before pipeline variables, custom pipelines, or builds work at all. `bb pipelines-status` reports the current state (it reads as "disabled (never configured)" when Pipelines has never been set up, which the API signals with a 404). `bb pipelines-enable` / `bb pipelines-disable` toggle it and need `admin:pipeline:bitbucket` scope.
+
+`bb trigger` runs the branch's default pipeline, or a `custom:` pipeline when `[pattern]` is given. Per-run pipeline variables are passed with the repeatable `--var KEY=VALUE` flag (short form `-v`, or `--var=KEY=VALUE`); trailing positional `KEY=VALUE` pairs after `[pattern]` are also accepted. The variables do not have to be declared in `bitbucket-pipelines.yml`; Bitbucket accepts arbitrary per-run keys. Malformed pairs (no `=`, or a key that isn't letters/digits/underscores starting with a non-digit) fail loudly before any API call, and the confirmation echo masks values as `KEY=***` because they may be secrets:
+
+```bash
+bb trigger ryan-repo develop build-installer --var GOLD_VERSION=v1.0.1
+```
 
 ### Pull Requests
 
@@ -307,8 +314,8 @@ bb prs
 # Create a PR from current branch to main
 bb pr-create "Add new feature"
 
-# Trigger a custom pipeline with variables
-bb trigger my-repo main manual-deploy-prod LAMBDA_NAMES=mci
+# Trigger a custom pipeline with per-run variables
+bb trigger my-repo main manual-deploy-prod --var LAMBDA_NAMES=mci --var REGION=us-west-2
 
 # View pipeline logs for step 1
 bb logs my-repo 42 1

@@ -490,6 +490,106 @@ class TestPipelineTrigger:
             )
         assert opener.calls == []
 
+    def test_variables_wire_shape_items_accepted(self) -> None:
+        # Regression guard: tuple-unpacking a two-key dict iterates its
+        # KEY NAMES, so [{"key": "GOLD_VERSION", "value": "v1.0.1"}] used
+        # to silently send the literal variable key="key", value="value":
+        # corrupt payload, no error. The wire shape must round-trip.
+        opener = _CaptureOpener([_make_pipeline(104)])
+        bb_ops.pipeline_trigger(
+            _client(opener),
+            "acme",
+            "widget-service",
+            branch="develop",
+            pattern="build-installer",
+            variables=[{"key": "GOLD_VERSION", "value": "v1.0.1"}],
+        )
+        body = opener.calls[0]["body"]
+        assert body["variables"] == [{"key": "GOLD_VERSION", "value": "v1.0.1"}]
+        assert body["target"]["selector"] == {
+            "type": "custom",
+            "pattern": "build-installer",
+        }
+
+    def test_variables_wire_shape_secured_passthrough(self) -> None:
+        # `secured` is part of Bitbucket's pipeline_variable schema on
+        # this endpoint (masks the value in the run's UI/logs); wire-shape
+        # callers may set it and it must survive normalisation.
+        opener = _CaptureOpener([_make_pipeline(105)])
+        bb_ops.pipeline_trigger(
+            _client(opener),
+            "acme",
+            "widget-service",
+            branch="main",
+            variables=[{"key": "API_TOKEN", "value": "tok-xyz", "secured": True}],
+        )
+        assert opener.calls[0]["body"]["variables"] == [
+            {"key": "API_TOKEN", "value": "tok-xyz", "secured": True}
+        ]
+
+    def test_rejects_wire_shape_item_with_unknown_fields(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="variable item dicts"):
+            bb_ops.pipeline_trigger(
+                _client(opener),
+                "acme",
+                "widget-service",
+                branch="main",
+                variables=[{"key": "A", "value": "1", "scope": "repo"}],
+            )
+        assert opener.calls == []
+
+    def test_rejects_wire_shape_item_missing_value(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="variable item dicts"):
+            bb_ops.pipeline_trigger(
+                _client(opener),
+                "acme",
+                "widget-service",
+                branch="main",
+                variables=[{"key": "A"}],
+            )
+        assert opener.calls == []
+
+    def test_rejects_non_bool_secured(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="secured"):
+            bb_ops.pipeline_trigger(
+                _client(opener),
+                "acme",
+                "widget-service",
+                branch="main",
+                variables=[{"key": "A", "value": "1", "secured": "yes"}],
+            )
+        assert opener.calls == []
+
+    def test_rejects_string_variable_item(self) -> None:
+        # A bare string would tuple-unpack character-wise ("AB" becomes
+        # ("A", "B") with no error), so ["A=1"]-style CLI shapes must be
+        # rejected loudly, not half-parsed.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="got the string"):
+            bb_ops.pipeline_trigger(
+                _client(opener),
+                "acme",
+                "widget-service",
+                branch="main",
+                variables=["GOLD_VERSION=v1.0.1"],
+            )
+        assert opener.calls == []
+
+    def test_rejects_unpackable_variable_item(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="variable item"):
+            bb_ops.pipeline_trigger(
+                _client(opener),
+                "acme",
+                "widget-service",
+                branch="main",
+                variables=[("A", "1", "extra")],  # type: ignore[list-item]
+            )
+        assert opener.calls == []
+
 
 # ===========================================================================
 # pipeline_stop

@@ -244,7 +244,9 @@ def pipeline_trigger(
     *,
     branch: str,
     pattern: str | None = None,
-    variables: dict[str, str] | Iterable[tuple[str, str]] | None = None,
+    variables: dict[str, str]
+    | Iterable[tuple[str, str] | dict[str, Any]]
+    | None = None,
 ) -> dict[str, Any]:
     """Trigger a new pipeline run.
 
@@ -252,9 +254,12 @@ def pipeline_trigger(
     With `pattern`, runs the named custom pipeline (must be defined in
     bitbucket-pipelines.yml under `custom:`).
 
-    `variables` is the set of pipeline variables to pass — a dict
-    {name: value} or an iterable of (name, value) tuples. Values must
-    be strings; Bitbucket does not accept other JSON types for variables.
+    `variables` is the set of per-run pipeline variables to pass: a dict
+    {name: value}, an iterable of (name, value) tuples, or an iterable of
+    Bitbucket wire-shape dicts `{"key": ..., "value": ..., "secured"?: bool}`.
+    Values must be strings; Bitbucket does not accept other JSON types for
+    variables. Variables need not be declared in bitbucket-pipelines.yml;
+    the API accepts arbitrary per-run keys.
 
     Returns the new pipeline's record (includes build_number, uuid, etc.).
     """
@@ -281,21 +286,60 @@ def pipeline_trigger(
 
     if variables is not None:
         # Normalise to a list of {"key": k, "value": v} dicts — Bitbucket's
-        # contract. Accept both dict and iterable-of-pairs at the Python
-        # boundary so MCP tool args can use either.
+        # contract. Accept a dict, an iterable of pairs, or wire-shape
+        # dicts at the Python boundary so MCP tool args can use any form.
         if isinstance(variables, dict):
-            items = list(variables.items())
+            items: list[Any] = list(variables.items())
         else:
             items = list(variables)
-        normalised: list[dict[str, str]] = []
-        for k, v in items:
+        normalised: list[dict[str, Any]] = []
+        for item in items:
+            secured: bool | None = None
+            if isinstance(item, dict):
+                # Bitbucket's wire shape. This MUST be an explicit case:
+                # tuple-unpacking a dict iterates its KEY NAMES, so a
+                # wire-shape item would silently become the literal
+                # variable key="key", value="value", corrupting the run
+                # instead of erroring.
+                extra = set(item) - {"key", "value", "secured"}
+                if extra or "key" not in item or "value" not in item:
+                    raise ValueError(
+                        "variable item dicts must have keys 'key' and 'value' "
+                        f"(optionally 'secured'), got {sorted(item)!r}"
+                    )
+                k, v = item["key"], item["value"]
+                if "secured" in item:
+                    if not isinstance(item["secured"], bool):
+                        raise ValueError(
+                            f"variable 'secured' for {k!r} must be a bool, "
+                            f"got {type(item['secured']).__name__}"
+                        )
+                    secured = item["secured"]
+            elif isinstance(item, str):
+                # A bare string would tuple-unpack character-wise (a
+                # 2-char string "AB" unpacks to ("A", "B") without error).
+                raise ValueError(
+                    f"variable item must be a (key, value) pair or a "
+                    f"{{'key', 'value'}} dict, got the string {item!r}"
+                )
+            else:
+                try:
+                    k, v = item
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"variable item must be a (key, value) pair or a "
+                        f"{{'key', 'value'}} dict, got {item!r}"
+                    ) from exc
             if not isinstance(k, str) or not k:
                 raise ValueError(f"variable key must be a non-empty string, got {k!r}")
             if not isinstance(v, str):
                 raise ValueError(
                     f"variable value for {k!r} must be a string, got {type(v).__name__}"
                 )
-            normalised.append({"key": k, "value": v})
+            entry: dict[str, Any] = {"key": k, "value": v}
+            if secured is not None:
+                entry["secured"] = secured
+            normalised.append(entry)
         if normalised:
             payload["variables"] = normalised
 
