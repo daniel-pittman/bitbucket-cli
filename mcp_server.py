@@ -640,6 +640,7 @@ def pipeline_trigger(
     branch: str,
     repo: str = "",
     pattern: str = "",
+    pipeline: str = "",
     variables: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Trigger a new pipeline run.
@@ -650,8 +651,21 @@ def pipeline_trigger(
         pattern: Custom pipeline name (matches `custom:` entries in
                  bitbucket-pipelines.yml). Empty for the branch's default
                  pipeline.
-        variables: Dict of {name: value} pairs to pass as pipeline
-                   variables. Values must be strings.
+        pipeline: Alias for `pattern`. The alias exists because FastMCP
+                  silently discards arguments that aren't in the schema,
+                  and `pipeline=` is the name callers naturally reach for
+                  on a tool named pipeline_trigger; without it, a custom
+                  selector passed as `pipeline=` is dropped and a plain
+                  branch build runs instead. Supplying both `pattern` and
+                  `pipeline` with different values is an error.
+        variables: Dict of {name: value} pairs to pass as per-run pipeline
+                   variables (they need not be declared in the pipeline
+                   yml). Values must be strings.
+
+    The success envelope echoes `pattern` (the resolved selector, or None
+    for the default pipeline) and `variable_keys` (sorted key names only;
+    values are withheld because they may be secrets) so callers can verify
+    what was actually sent alongside the created pipeline record.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
@@ -665,13 +679,36 @@ def pipeline_trigger(
             raise ValueError(
                 f"branch is required and must be non-empty/non-whitespace; got {branch!r}"
             )
-        pipeline = bb_ops.pipeline_trigger(
+        # `pattern` and `pipeline` are aliases for the custom-pipeline
+        # selector. Conflicting values must fail loudly; picking one
+        # silently would run the wrong pipeline.
+        selector_pattern = _opt_str(pattern)
+        selector_alias = _opt_str(pipeline)
+        if (
+            selector_pattern is not None
+            and selector_alias is not None
+            and selector_pattern != selector_alias
+        ):
+            raise ValueError(
+                f"pattern={selector_pattern!r} and pipeline={selector_alias!r} "
+                "conflict; they are aliases for the custom-pipeline selector. "
+                "Supply one of them (or the same value in both)."
+            )
+        selector = selector_pattern if selector_pattern is not None else selector_alias
+        created = bb_ops.pipeline_trigger(
             client, workspace, repo_slug,
             branch=normalised_branch,
-            pattern=_opt_str(pattern),
+            pattern=selector,
             variables=variables,
         )
-        return {"ok": True, "workspace": workspace, "repo": repo_slug, "pipeline": pipeline}
+        return {
+            "ok": True,
+            "workspace": workspace,
+            "repo": repo_slug,
+            "pattern": selector,
+            "variable_keys": sorted(variables) if variables else [],
+            "pipeline": created,
+        }
     except _TOOL_EXPECTED_EXCEPTIONS as e:
         return _error_dict(e)
 

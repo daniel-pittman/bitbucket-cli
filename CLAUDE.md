@@ -62,7 +62,7 @@ Loaded in this order (later overrides earlier):
 - `resolve_repo` sets `repo` + `BB_WORKSPACE` in the CALLER's scope (called as `resolve_repo "$1"`, NOT `repo=$(...)`, so it escapes the subshell and can set the workspace). Precedence: `-w` flag > `workspace/slug` arg > git origin auto-detect > `BB_WORKSPACE` default > error. `resolve_workspace` is the repo-less companion for workspace-level commands. Both mirror the Python `_resolve_repo` contract.
 - `BB_WORKSPACE` is OPTIONAL — only `BB_USER` + `BB_TOKEN` are required at load; a missing workspace fails at the point of use, not at startup.
 - Boundary validation via helpers like `_require_build_number` (rejects non-numeric) and `_require_pr_state` (allowlists OPEN/MERGED/DECLINED/SUPERSEDED — also closes a query-param injection surface).
-- Variables are passed to `jq -Rs` with NUL delimiters to prevent injection.
+- User-supplied values ride into JSON via `jq` (`--arg` / `--args`), never string interpolation, to prevent injection. Delimited streams are off-limits for value lists: bash arguments are C strings, so a NUL delimiter embedded in a jq program is silently dropped by the shell (jq sees `split("")` and shreds the stream per character), and any printable delimiter can collide with a value. `bb trigger` passes each `KEY=VALUE` pair as its own jq argument via `$ARGS.positional` (jq 1.6+).
 - Error rc capture: `local rc=0; out=$(cmd) || rc=$?` — NOT `if ! cmd; then rc=$?` (the `!` negation makes `$?` always 0; verified on bash 3.2 + 5.x).
 - bash 3.2+ floor (macOS system bash supported) — no `${var,,}` / `${var^^}` / `mapfile` / `declare -A`; a `bash:3.2` CI job (`bash32-floor`) parses `bb` to catch regressions.
 

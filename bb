@@ -620,45 +620,75 @@ cmd_logs() {
 }
 
 cmd_pipeline_trigger() {
+    # bb trigger [repo] [branch] [pattern] [--var KEY=VALUE ...] [KEY=VALUE ...]
+    #
+    # Per-run pipeline variables arrive two ways, combined in order:
+    #   --var/-v KEY=VALUE   repeatable, position-independent (preferred)
+    #   trailing KEY=VALUE   positional pairs after [pattern] (legacy form)
+    # The variables need not be declared in bitbucket-pipelines.yml; the
+    # API accepts arbitrary per-run keys alongside the target selector.
+    local -a var_pairs=() positionals=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --var|-v)  _require_flag_value "$@"; var_pairs+=("$2"); shift 2 ;;
+            --var=*)   var_pairs+=("${1#*=}"); shift ;;
+            -*)
+                echo "Error: unknown flag for trigger: $1" >&2
+                echo "Usage: bb trigger [repo] [branch] [pattern] [--var KEY=VALUE ...]" >&2
+                exit 1 ;;
+            *)         positionals+=("$1"); shift ;;
+        esac
+    done
+
     local repo
-    resolve_repo "${1:-}"
-    local branch="${2:-}"
-    local pattern="${3:-}"
+    resolve_repo "${positionals[0]:-}"
+    local branch="${positionals[1]:-}"
+    local pattern="${positionals[2]:-}"
 
-    # `shift 3 || true` previously masked the under-3-args case:
-    # bash leaves $@ unchanged when the shift count exceeds $#, so
-    # `bb trigger myrepo` (1 arg) left "myrepo" in $@ and the
-    # var-loop below parsed it as a VAR=VALUE pair, sending
-    # {"key":"myrepo","value":"myrepo"} as a pipeline variable.
-    # Guard explicitly.
-    if [[ $# -ge 3 ]]; then
-        shift 3
-    else
-        # Consume what's there; remaining $@ is empty.
-        shift $#
-    fi
+    # Positionals past [pattern] are legacy KEY=VALUE pairs (the
+    # pre-flag form, still supported so documented invocations keep
+    # working). They merge after the --var pairs.
+    local _i
+    for (( _i=3; _i < ${#positionals[@]}; _i++ )); do
+        var_pairs+=("${positionals[$_i]}")
+    done
 
-    # Remaining args are VAR=VALUE pairs. Build the array via `jq`
-    # so values containing `"`, `\`, newlines, or tabs are correctly
-    # JSON-escaped. NUL delimiter (not newline) so values containing
-    # newlines aren't fragmented into ghost vars — the previous
-    # newline-split approach would turn VAR=$'line1\nline2' into a
-    # real {VAR:line1} entry plus a ghost {line2:""} entry. jq's
-    # split(" ") on a NUL-delimited stream sidesteps that.
+    # Validate every pair BEFORE any API call. A pair with no '=' or a
+    # malformed key must fail loudly here; otherwise it is silently
+    # sent as {"key": <arg>, "value": ""} and Bitbucket runs the build
+    # with a garbage variable. The key charset is Bitbucket's documented
+    # rule for variable names.
+    local _pair _key
+    for _pair in ${var_pairs[@]+"${var_pairs[@]}"}; do
+        if [[ "$_pair" != *=* ]]; then
+            echo "Error: pipeline variable must be KEY=VALUE, got '$_pair'." >&2
+            exit 1
+        fi
+        _key="${_pair%%=*}"
+        if ! [[ "$_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "Error: invalid pipeline variable name '$_key'." >&2
+            echo "  Names use letters, digits, and underscores, and must not start with a digit." >&2
+            exit 1
+        fi
+    done
+
+    # Build the variables array via `jq` so values containing `"`, `\`,
+    # newlines, or tabs are correctly JSON-escaped. Each pair rides in as
+    # its OWN jq argument ($ARGS.positional, jq >= 1.6), never as a
+    # delimited stream. A delimiter cannot work here: bash arguments are
+    # C strings, so a NUL delimiter embedded in the jq program is dropped
+    # by the shell (jq then sees split("") and shreds the stream into
+    # per-character ghost variables), and any printable delimiter could
+    # collide with a variable's value.
     local variables="[]"
-    if [[ $# -gt 0 ]]; then
+    if [[ ${#var_pairs[@]} -gt 0 ]]; then
         # Per-pair shape: split on the FIRST `=` only so values
         # containing `=` survive intact.
-        variables=$(printf '%s\0' "$@" | jq -Rs '
-            split(" ")
-            | map(select(length > 0))
-            | map(
-                split("=") | {
-                    key: .[0],
-                    value: (.[1:] | join("="))
-                }
-            )
-        ')
+        variables=$(jq -n '
+            [$ARGS.positional[] | split("=") | {
+                key: .[0],
+                value: (.[1:] | join("="))
+            }]' --args "${var_pairs[@]}")
     fi
 
     if [[ -z "$branch" ]]; then
@@ -714,11 +744,11 @@ cmd_pipeline_trigger() {
     fi
     if [[ "$variables" != "[]" ]]; then
         # Echo variable KEYS only — values may be secrets (API tokens,
-        # deploy creds) that the user passed as VAR=value. The previous
-        # `Variables: $*` form leaked the full value into stdout /
-        # terminal scrollback / CI logs / shell history.
+        # deploy creds) that the user passed as --var KEY=value. Echoing
+        # the full value would leak it into stdout / terminal scrollback /
+        # CI logs / shell history.
         local masked
-        masked=$(printf '%s\n' "$@" | sed -E 's/=.*$/=***/' | tr '\n' ' ')
+        masked=$(printf '%s\n' "${var_pairs[@]}" | sed -E 's/=.*$/=***/' | tr '\n' ' ')
         echo "  Variables: ${masked%% }"
     fi
 
@@ -2845,7 +2875,11 @@ PIPELINES
   bb pipeline [repo] <number>           Show pipeline details and steps
   bb watch [repo] [number] [interval]   Poll pipeline until done (default: 15s)
   bb logs [repo] <number> [step]        Show step logs
-  bb trigger [repo] [branch] [pattern]  Trigger a pipeline run
+  bb trigger [repo] [branch] [pattern] [--var KEY=VALUE ...]
+                                        Trigger a pipeline run ([pattern] selects a
+                                          custom: pipeline; --var/-v is repeatable and
+                                          passes per-run variables; trailing KEY=VALUE
+                                          positional pairs also accepted)
   bb stop [repo] <number>               Stop a running pipeline
   bb approve [repo] <number>            Open pipeline in browser (manual steps require UI)
   bb pipelines-status [repo]            Show whether Pipelines (CI) is enabled

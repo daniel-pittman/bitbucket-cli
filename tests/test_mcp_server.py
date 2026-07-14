@@ -594,6 +594,98 @@ class TestPipelineTools:
             mcp_server.pipeline_trigger(branch="  main  ", repo="my-repo")
         assert recorder.calls[0][1]["branch"] == "main"
 
+    def test_pipeline_trigger_pipeline_alias_maps_to_pattern(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """`pipeline=` is an alias for `pattern=`. FastMCP silently
+        discards arguments missing from the schema, so before the alias
+        existed a custom selector passed as `pipeline=` was DROPPED and a
+        plain branch build ran instead; the selector must reach the
+        bb_ops call as `pattern`."""
+        recorder = _recorder({"build_number": 288})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(
+                branch="develop", repo="my-repo", pipeline="build-installer"
+            )
+        assert recorder.calls[0][1]["pattern"] == "build-installer"
+        assert out["ok"] is True
+        assert out["pattern"] == "build-installer"
+
+    def test_pipeline_trigger_pattern_pipeline_conflict_errors(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Conflicting alias values must fail loudly BEFORE any API call;
+        silently picking one would run the wrong pipeline."""
+        recorder = _recorder({})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(
+                branch="develop",
+                repo="my-repo",
+                pattern="deploy-prod",
+                pipeline="build-installer",
+            )
+        assert out["ok"] is False
+        assert out["kind"] == "ValueError"
+        assert "alias" in out["message"]
+        assert recorder.calls == []  # bb_ops not reached
+
+    def test_pipeline_trigger_pattern_pipeline_agreeing_values_ok(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"build_number": 289})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(
+                branch="develop",
+                repo="my-repo",
+                pattern="build-installer",
+                pipeline="build-installer",
+            )
+        assert out["ok"] is True
+        assert recorder.calls[0][1]["pattern"] == "build-installer"
+
+    def test_pipeline_trigger_variables_forwarded_and_keys_echoed(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Variables must reach bb_ops verbatim, and the success envelope
+        echoes the sorted KEY NAMES (never the values; they may be
+        secrets) so a caller can verify what was sent."""
+        recorder = _recorder({"build_number": 290, "has_variables": True})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(
+                branch="develop",
+                repo="my-repo",
+                pattern="build-installer",
+                variables={"GOLD_VERSION": "v1.0.1", "AWS_REGION": "us-west-2"},
+            )
+        assert recorder.calls[0][1]["variables"] == {
+            "GOLD_VERSION": "v1.0.1",
+            "AWS_REGION": "us-west-2",
+        }
+        assert out["ok"] is True
+        assert out["variable_keys"] == ["AWS_REGION", "GOLD_VERSION"]
+        # Values stay out of the envelope's own fields (the pipeline
+        # record is the API's response, not ours to filter).
+        envelope_sans_record = {k: v for k, v in out.items() if k != "pipeline"}
+        assert "v1.0.1" not in repr(envelope_sans_record)
+
+    def test_pipeline_trigger_default_run_envelope_shape(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """No selector, no variables → pattern None and empty
+        variable_keys in the envelope, so 'nothing was sent' is
+        verifiable too."""
+        recorder = _recorder({"build_number": 291})
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(branch="develop", repo="my-repo")
+        assert out == {
+            "ok": True,
+            "workspace": "acme",
+            "repo": "my-repo",
+            "pattern": None,
+            "variable_keys": [],
+            "pipeline": {"build_number": 291},
+        }
+
     def test_pipeline_logs_returns_log_text(
         self, stub_client: bb_api.BBClient
     ) -> None:
