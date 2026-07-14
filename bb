@@ -744,11 +744,14 @@ cmd_pipeline_trigger() {
     fi
     if [[ "$variables" != "[]" ]]; then
         # Echo variable KEYS only — values may be secrets (API tokens,
-        # deploy creds) that the user passed as --var KEY=value. Echoing
-        # the full value would leak it into stdout / terminal scrollback /
-        # CI logs / shell history.
-        local masked
-        masked=$(printf '%s\n' "${var_pairs[@]}" | sed -E 's/=.*$/=***/' | tr '\n' ' ')
+        # deploy creds) that the user passed as --var KEY=value. Mask
+        # per ELEMENT, not per line: a line-oriented sed would print any
+        # text after an embedded newline in a value unmasked (KEY=$'a\nb'
+        # masks the KEY=a line but leaks the b line).
+        local masked="" _mp
+        for _mp in "${var_pairs[@]}"; do
+            masked+="${_mp%%=*}=*** "
+        done
         echo "  Variables: ${masked%% }"
     fi
 
