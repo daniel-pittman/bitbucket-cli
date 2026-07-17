@@ -867,13 +867,14 @@ class TestPullRequestTools:
             mcp_server.pr_merge(pr_id=42, repo="my-repo", message="")
         assert recorder.calls[0][1]["message"] is None
 
-    def test_pr_create_default_close_source_branch_passes_none(
+    def test_pr_create_default_close_source_branch_is_false(
         self,
         stub_client: bb_api.BBClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The long-lived-branch guard lives in bb_ops.pr_create; the
-        wrapper must forward None (auto), not flatten it to a bool."""
+        """close_source_branch defaults to False: branch deletion on
+        merge is opt-in, never automatic. The wrapper forwards that
+        default verbatim to bb_ops.pr_create."""
         monkeypatch.setattr(
             git_ops, "git_current_branch",
             lambda path=None: "develop",
@@ -881,7 +882,7 @@ class TestPullRequestTools:
         recorder = _recorder({"id": 12})
         with patch.object(bb_ops, "pr_create", recorder):
             mcp_server.pr_create(title="Promote", repo="my-repo")
-        assert recorder.calls[0][1]["close_source_branch"] is None
+        assert recorder.calls[0][1]["close_source_branch"] is False
 
     def test_pr_create_explicit_close_source_branch_forwarded(
         self, stub_client: bb_api.BBClient
@@ -896,15 +897,15 @@ class TestPullRequestTools:
             )
         assert recorder.calls[0][1]["close_source_branch"] is False
 
-    def test_pr_merge_default_close_source_branch_passes_none(
+    def test_pr_merge_default_close_source_branch_is_false(
         self, stub_client: bb_api.BBClient
     ) -> None:
-        """Same guard-forwarding contract as pr_create: default None
-        rides through so bb_ops.pr_merge applies the long-lived guard."""
+        """Same default as pr_create: close_source_branch defaults to
+        False (opt-in deletion). The wrapper forwards it verbatim."""
         recorder = _recorder({"state": "MERGED"})
         with patch.object(bb_ops, "pr_merge", recorder):
             mcp_server.pr_merge(pr_id=42, repo="my-repo")
-        assert recorder.calls[0][1]["close_source_branch"] is None
+        assert recorder.calls[0][1]["close_source_branch"] is False
 
     def test_pr_merge_explicit_close_source_branch_forwarded(
         self, stub_client: bb_api.BBClient

@@ -196,26 +196,25 @@ bb trigger ryan-repo develop build-installer --var GOLD_VERSION=v1.0.1
 bb prs [repo] [state]                 # List PRs (default: OPEN)
 bb pr [repo] <id>                     # View PR details
 bb pr-create [repo] <title> [dest]    # Create PR from current branch
-                                      #   opts: --keep-source-branch | --close-source-branch
+                                      #   opt: --close-source-branch
 bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                       # Update a PR title and/or description
 bb pr-approve [repo] <id>             # Approve a PR
 bb pr-merge [repo] <id> [strategy]    # Merge a PR (merge_commit|squash|fast_forward)
-                                      #   opts: --keep-source-branch | --close-source-branch
+                                      #   opt: --close-source-branch
 bb pr-decline [repo] <id>             # Decline a PR
 bb pr-diff [repo] <id>                # Show PR diff
 bb pr-comments [repo] <id>            # Show PR comments
 ```
 
-**Source-branch deletion on merge.** By default the source branch is deleted
-when the PR merges (`close_source_branch: true`) — the right behavior for
-short-lived feature/fix branches. Long-lived integration branches
-(`main`, `master`, `develop`, `dev`, `release/*`) are the exception: both
-`pr-create` and `pr-merge` automatically keep them, so a promote PR
-(develop→main) never deletes `develop` on merge. `pr-merge` applies the guard
-at merge time, overriding whatever the PR was stored with (the merge API's
-value wins), so PRs created by older tools with `close_source_branch: true`
-are covered too. Force either behavior with `--keep-source-branch` /
+**Source-branch deletion on merge.** The source branch is kept by default.
+Deleting a branch on merge is destructive, so it is opt-in, never automatic,
+the same stance `gh pr merge` takes with `--delete-branch`. Pass
+`--close-source-branch` on either `pr-create` or `pr-merge` to have the source
+branch deleted when the PR merges. `pr-merge` sends the choice explicitly, so
+it overrides whatever a PR was stored with at creation (the merge API's value
+wins over the PR's): a PR created by an older `bb` or the Bitbucket UI with
+the box checked still keeps its source branch unless you pass
 `--close-source-branch`.
 
 ### Branches & Repositories

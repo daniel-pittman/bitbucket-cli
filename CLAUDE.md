@@ -77,6 +77,9 @@ Loaded in this order (later overrides earlier):
 ### Parallel-implementation parity rule
 The bash and Python sides implement the **same Bitbucket REST contract** independently. When a defect surfaces in either side (URL construction, body shape, parameter naming), the fix lands in BOTH paths. Tests verify the correct contract — never pin existing buggy behavior. See CONTRIBUTING.md.
 
+### Destructive operations are opt-in, never a default
+Never default a destructive or irreversible action to on. A flag or field that deletes, closes, or overwrites something (`close_source_branch`, force-flags, `--yes`-style skips) defaults to the safe value; the caller opts in explicitly. This matches `gh` (`gh pr merge` keeps the branch unless you pass `--delete-branch`). History that motivated the rule: `close_source_branch` was hardcoded `true`, which deleted a repo's `develop` branch on a promote-PR merge (the 2026-07 ryan-os incident). A name-pattern "guard" that guesses whether to delete (v1.6.0's long-lived-branch heuristic) is still a destructive default and was removed — the fix is to not delete by default at all. Do NOT reintroduce delete-by-default or an auto-guess guard.
+
 ## Adding New Commands
 
 For end-user CLI features:
