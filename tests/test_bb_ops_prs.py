@@ -752,6 +752,26 @@ class TestPrMerge:
         bb_ops.pr_merge(_client(opener), "acme", "widget-service", 7)
         assert opener.calls[1]["body"]["close_source_branch"] is False
 
+    def test_failed_lookup_get_fails_safe_and_still_merges(self) -> None:
+        """The guard's lookup is advisory: a failed GET must not block
+        the merge. Parity with bash cmd_pr_merge, which captures the
+        lookup rc, keeps the branch, and proceeds to the merge POST
+        (where a truly unreachable PR surfaces the real error)."""
+        lookup_error = urllib.error.HTTPError(
+            url=_prs_url() + "/7",
+            code=500,
+            msg="Internal Server Error",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=__import__("io").BytesIO(b""),
+        )
+        opener = _CaptureOpener([lookup_error, _make_pr(7, state="MERGED")])
+        bb_ops.pr_merge(_client(opener), "acme", "widget-service", 7)
+        assert len(opener.calls) == 2
+        merge = opener.calls[1]
+        assert merge["method"] == "POST"
+        assert merge["url"] == _prs_url() + "/7/merge"
+        assert merge["body"]["close_source_branch"] is False
+
     @pytest.mark.parametrize(
         "bad_strategy",
         [
