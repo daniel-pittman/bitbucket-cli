@@ -799,8 +799,9 @@ def pr_merge(
     integration branch (see `is_long_lived_branch`), in which case it
     resolves to False — overriding whatever `close_source_branch` the PR
     was stored with, because the merge API's value wins over the PR's.
-    If the source branch can't be read from the PR record, fail safe to
-    False (not deleting a branch is recoverable; deleting one is not).
+    If the source branch can't be read (failed lookup GET or unexpected
+    record shape), fail safe to False (not deleting a branch is
+    recoverable; deleting one is not) and proceed to the merge.
     Pass an explicit bool to skip the lookup and force either behaviour.
     Parity with bash `bb pr-merge --keep-source-branch /
     --close-source-branch`.
@@ -833,8 +834,15 @@ def pr_merge(
     if close_source_branch is None:
         # Long-lived-branch guard: the merge API's close_source_branch
         # overrides the PR's stored value, so read the source branch and
-        # decide here. Unknown/unparseable source fails safe to False.
-        pr = client.get(f"{_prs_root(workspace, repo)}/{pr_id}")
+        # decide here. Unknown source fails safe to False — including a
+        # failed lookup GET (parity with bash cmd_pr_merge): the lookup
+        # is advisory, so a transient failure must not block the merge,
+        # and if the PR truly is unreachable the merge POST below
+        # surfaces the real error.
+        try:
+            pr: Any = client.get(f"{_prs_root(workspace, repo)}/{pr_id}")
+        except BBApiError:
+            pr = None
         source_name = ""
         if isinstance(pr, dict):
             source = pr.get("source")
