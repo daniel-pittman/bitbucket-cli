@@ -867,6 +867,55 @@ class TestPullRequestTools:
             mcp_server.pr_merge(pr_id=42, repo="my-repo", message="")
         assert recorder.calls[0][1]["message"] is None
 
+    def test_pr_create_default_close_source_branch_passes_none(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The long-lived-branch guard lives in bb_ops.pr_create; the
+        wrapper must forward None (auto), not flatten it to a bool."""
+        monkeypatch.setattr(
+            git_ops, "git_current_branch",
+            lambda path=None: "develop",
+        )
+        recorder = _recorder({"id": 12})
+        with patch.object(bb_ops, "pr_create", recorder):
+            mcp_server.pr_create(title="Promote", repo="my-repo")
+        assert recorder.calls[0][1]["close_source_branch"] is None
+
+    def test_pr_create_explicit_close_source_branch_forwarded(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"id": 13})
+        with patch.object(bb_ops, "pr_create", recorder):
+            mcp_server.pr_create(
+                title="Hi",
+                source_branch="feat/widget",
+                repo="my-repo",
+                close_source_branch=False,
+            )
+        assert recorder.calls[0][1]["close_source_branch"] is False
+
+    def test_pr_merge_default_close_source_branch_passes_none(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Same guard-forwarding contract as pr_create: default None
+        rides through so bb_ops.pr_merge applies the long-lived guard."""
+        recorder = _recorder({"state": "MERGED"})
+        with patch.object(bb_ops, "pr_merge", recorder):
+            mcp_server.pr_merge(pr_id=42, repo="my-repo")
+        assert recorder.calls[0][1]["close_source_branch"] is None
+
+    def test_pr_merge_explicit_close_source_branch_forwarded(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"state": "MERGED"})
+        with patch.object(bb_ops, "pr_merge", recorder):
+            mcp_server.pr_merge(
+                pr_id=42, repo="my-repo", close_source_branch=True
+            )
+        assert recorder.calls[0][1]["close_source_branch"] is True
+
     def test_pr_update_forwards_title_and_description(
         self, stub_client: bb_api.BBClient
     ) -> None:
