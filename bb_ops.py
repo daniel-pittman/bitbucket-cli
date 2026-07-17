@@ -453,6 +453,22 @@ def pipelines_config_set(
 # server's 400.
 _VALID_MERGE_STRATEGIES = frozenset({"merge_commit", "squash", "fast_forward"})
 
+# Long-lived integration branches that must never be deleted by a PR
+# merge. Deleting one is never right: they are the trunk lines that
+# GitFlow promotes flow FROM (develop→main), so `close_source_branch`
+# must not apply to them. Exact-match names plus the `release/*` prefix;
+# matching is case-sensitive because git branch names are.
+# Mirrors bash `_is_long_lived_branch` — keep the two lists identical.
+_LONG_LIVED_BRANCHES = frozenset({"main", "master", "develop", "dev"})
+
+
+def is_long_lived_branch(name: str) -> bool:
+    """True when `name` is a long-lived integration branch (main /
+    master / develop / dev / release/*) that a merge must never delete."""
+    if not isinstance(name, str):
+        return False
+    return name in _LONG_LIVED_BRANCHES or name.startswith("release/")
+
 # PR `state` filter values the Bitbucket API accepts on the simple
 # `?state=` query parameter. For multi-state filtering, Bitbucket requires
 # the BBQL `q` parameter (e.g. `?q=state="OPEN" OR state="MERGED"`); the
@@ -599,7 +615,7 @@ def pr_create(
     source_branch: str,
     destination_branch: str = "main",
     description: str = "",
-    close_source_branch: bool = True,
+    close_source_branch: bool | None = None,
     reviewers: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Create a pull request.
@@ -608,9 +624,12 @@ def pr_create(
     `[{"uuid": "..."}, ...]`). The bash script doesn't expose reviewers
     at create-time — that's a 4.7 parity gap, not a Python bug.
 
-    `close_source_branch=True` matches bash's default (it hardcodes that
-    flag in the create payload). If you don't want the branch deleted on
-    merge, pass False explicitly.
+    `close_source_branch=None` (the default) resolves to True unless the
+    source branch is a long-lived integration branch (see
+    `is_long_lived_branch`), in which case it resolves to False: a
+    promote PR (develop→main) must never delete `develop` on merge.
+    Pass an explicit bool to override the guard either way. Parity with
+    bash `bb pr-create --keep-source-branch / --close-source-branch`.
     """
     for label, value in (
         ("title", title),
@@ -628,10 +647,13 @@ def pr_create(
         raise ValueError(
             f"description must be a string, got {type(description).__name__}"
         )
-    if not isinstance(close_source_branch, bool):
+    if close_source_branch is not None and not isinstance(close_source_branch, bool):
         raise ValueError(
-            f"close_source_branch must be a bool, got {type(close_source_branch).__name__}"
+            f"close_source_branch must be a bool or None, "
+            f"got {type(close_source_branch).__name__}"
         )
+    if close_source_branch is None:
+        close_source_branch = not is_long_lived_branch(source_branch)
 
     payload: dict[str, Any] = {
         "title": title,
@@ -761,7 +783,7 @@ def pr_merge(
     pr_id: int,
     *,
     strategy: str = "merge_commit",
-    close_source_branch: bool = True,
+    close_source_branch: bool | None = None,
     message: str | None = None,
 ) -> dict[str, Any]:
     """Merge a pull request.
@@ -770,8 +792,18 @@ def pr_merge(
     `squash`, `fast_forward`. We validate at the boundary so a typo
     fails locally rather than burning an API call to get a 400.
 
-    `message` overrides the default merge-commit message. `close_source_branch`
-    matches bash's default of True.
+    `message` overrides the default merge-commit message.
+
+    `close_source_branch=None` (the default) fetches the PR first and
+    resolves to True unless the PR's source branch is a long-lived
+    integration branch (see `is_long_lived_branch`), in which case it
+    resolves to False — overriding whatever `close_source_branch` the PR
+    was stored with, because the merge API's value wins over the PR's.
+    If the source branch can't be read from the PR record, fail safe to
+    False (not deleting a branch is recoverable; deleting one is not).
+    Pass an explicit bool to skip the lookup and force either behaviour.
+    Parity with bash `bb pr-merge --keep-source-branch /
+    --close-source-branch`.
     """
     _validate_pr_id(pr_id)
     # isinstance gate before the membership test: a non-hashable strategy
@@ -783,9 +815,35 @@ def pr_merge(
             f"strategy must be one of {sorted(_VALID_MERGE_STRATEGIES)}, "
             f"got {strategy!r}"
         )
-    if not isinstance(close_source_branch, bool):
+    if close_source_branch is not None and not isinstance(close_source_branch, bool):
         raise ValueError(
-            f"close_source_branch must be a bool, got {type(close_source_branch).__name__}"
+            f"close_source_branch must be a bool or None, "
+            f"got {type(close_source_branch).__name__}"
+        )
+    # Symmetric with pr_comment_add's body validation: empty (or
+    # whitespace-only) message would produce a blank merge-commit
+    # subject line, visually empty in any `git log --oneline` view.
+    # Reject at the boundary — before the guard's GET below, so every
+    # invalid input still costs zero network IO.
+    if message is not None and (not isinstance(message, str) or not message.strip()):
+        raise ValueError(
+            f"message must be a non-empty, non-whitespace string "
+            f"when provided, got {message!r}"
+        )
+    if close_source_branch is None:
+        # Long-lived-branch guard: the merge API's close_source_branch
+        # overrides the PR's stored value, so read the source branch and
+        # decide here. Unknown/unparseable source fails safe to False.
+        pr = client.get(f"{_prs_root(workspace, repo)}/{pr_id}")
+        source_name = ""
+        if isinstance(pr, dict):
+            source = pr.get("source")
+            if isinstance(source, dict):
+                branch = source.get("branch")
+                if isinstance(branch, dict) and isinstance(branch.get("name"), str):
+                    source_name = branch["name"]
+        close_source_branch = bool(source_name) and not is_long_lived_branch(
+            source_name
         )
     payload: dict[str, Any] = {
         "type": "pullrequest",
@@ -793,15 +851,6 @@ def pr_merge(
         "close_source_branch": close_source_branch,
     }
     if message is not None:
-        # Symmetric with pr_comment_add's body validation: empty (or
-        # whitespace-only) message would produce a blank merge-commit
-        # subject line, visually empty in any `git log --oneline` view.
-        # Reject at the boundary.
-        if not isinstance(message, str) or not message.strip():
-            raise ValueError(
-                f"message must be a non-empty, non-whitespace string "
-                f"when provided, got {message!r}"
-            )
         payload["message"] = message
     # Bitbucket's PR merge endpoint is POST per the REST docs. An earlier
     # version of this op (and bash cmd_pr_merge) used PUT on the

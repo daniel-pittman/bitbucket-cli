@@ -90,13 +90,15 @@ def _prs_url() -> str:
     return DEFAULT_API_BASE + "/repositories/acme/widget-service/pullrequests"
 
 
-def _make_pr(id_: int, state: str = "OPEN") -> dict[str, Any]:
+def _make_pr(
+    id_: int, state: str = "OPEN", source_branch: str = "feat/widget"
+) -> dict[str, Any]:
     return {
         "id": id_,
         "title": f"PR {id_}",
         "state": state,
         "author": {"display_name": "Alice"},
-        "source": {"branch": {"name": "feat/widget"}},
+        "source": {"branch": {"name": source_branch}},
         "destination": {"branch": {"name": "main"}},
         "created_on": "2026-05-26T12:00:00Z",
         "updated_on": "2026-05-26T13:00:00Z",
@@ -369,6 +371,44 @@ class TestPrActivity:
 
 
 # ===========================================================================
+# is_long_lived_branch
+# ===========================================================================
+
+
+class TestIsLongLivedBranch:
+    """The guard predicate behind the pr_create / pr_merge
+    close_source_branch defaults. Mirrors bash _is_long_lived_branch."""
+
+    @pytest.mark.parametrize(
+        "name",
+        ["main", "master", "develop", "dev", "release/1.2", "release/2026.07"],
+    )
+    def test_long_lived(self, name: str) -> None:
+        assert bb_ops.is_long_lived_branch(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "feature/widget",
+            "fix/typo",
+            "hotfix/1.2",       # short-lived in GitFlow: delete-on-merge is fine
+            "developer",        # prefix trap: develop*
+            "maintenance",      # prefix trap: mai*
+            "released",         # "release" without the slash
+            "release",          # bare name, not the release/* pattern
+            "Main",             # case-sensitive by design (git branch names are)
+            "DEVELOP",
+            "",
+        ],
+    )
+    def test_short_lived(self, name: str) -> None:
+        assert bb_ops.is_long_lived_branch(name) is False
+
+    def test_non_string_is_not_long_lived(self) -> None:
+        assert bb_ops.is_long_lived_branch(None) is False  # type: ignore[arg-type]
+
+
+# ===========================================================================
 # pr_create
 # ===========================================================================
 
@@ -419,6 +459,38 @@ class TestPrCreate:
             close_source_branch=False,
         )
         assert opener.calls[0]["body"]["close_source_branch"] is False
+
+    @pytest.mark.parametrize(
+        "trunk", ["develop", "main", "master", "dev", "release/1.2"]
+    )
+    def test_long_lived_source_defaults_to_keep(self, trunk: str) -> None:
+        """The incident class this guards: a promote PR (develop→main)
+        created with close_source_branch=true deletes the long-lived
+        source branch on merge. Long-lived sources must default to
+        close_source_branch=false."""
+        opener = _CaptureOpener([_make_pr(20)])
+        bb_ops.pr_create(
+            _client(opener),
+            "acme",
+            "widget-service",
+            title="Promote develop to main",
+            source_branch=trunk,
+            destination_branch="main",
+        )
+        assert opener.calls[0]["body"]["close_source_branch"] is False
+
+    def test_long_lived_source_explicit_close_wins(self) -> None:
+        """An explicit bool overrides the guard in either direction."""
+        opener = _CaptureOpener([_make_pr(21)])
+        bb_ops.pr_create(
+            _client(opener),
+            "acme",
+            "widget-service",
+            title="Promote develop to main",
+            source_branch="develop",
+            close_source_branch=True,
+        )
+        assert opener.calls[0]["body"]["close_source_branch"] is True
 
     def test_reviewers_payload_shape(self) -> None:
         opener = _CaptureOpener([_make_pr(10)])
@@ -607,29 +679,78 @@ class TestPrUnapprove:
 
 class TestPrMerge:
     def test_default_strategy_payload(self) -> None:
-        opener = _CaptureOpener([_make_pr(7, state="MERGED")])
+        # Default close_source_branch=None: the long-lived-branch guard
+        # looks the PR up first (GET), then merges (POST).
+        opener = _CaptureOpener([_make_pr(7), _make_pr(7, state="MERGED")])
         bb_ops.pr_merge(_client(opener), "acme", "widget-service", 7)
-        call = opener.calls[0]
+        lookup, merge = opener.calls
+        assert lookup["method"] == "GET"
+        assert lookup["url"] == _prs_url() + "/7"
+        assert lookup["body"] is None
         # Bitbucket's PR merge endpoint is POST per the REST docs. An
         # earlier version used PUT and this test pinned that; PUT now
         # 403s with "endpoint does not support token-based authentication"
         # (a misleading error that actually meant "wrong method"). See
         # bb_ops.pr_merge for the full history. Pin POST going forward.
-        assert call["method"] == "POST"
-        assert call["url"] == _prs_url() + "/7/merge"
-        assert call["body"] == {
+        assert merge["method"] == "POST"
+        assert merge["url"] == _prs_url() + "/7/merge"
+        assert merge["body"] == {
             "type": "pullrequest",
             "merge_strategy": "merge_commit",
+            # feat/widget (the _make_pr default) is short-lived: current
+            # delete-on-merge behaviour is preserved for those.
             "close_source_branch": True,
         }
 
     def test_each_strategy(self) -> None:
         for strategy in ("merge_commit", "squash", "fast_forward"):
-            opener = _CaptureOpener([_make_pr(7, state="MERGED")])
+            opener = _CaptureOpener([_make_pr(7), _make_pr(7, state="MERGED")])
             bb_ops.pr_merge(
                 _client(opener), "acme", "widget-service", 7, strategy=strategy
             )
-            assert opener.calls[0]["body"]["merge_strategy"] == strategy
+            assert opener.calls[1]["body"]["merge_strategy"] == strategy
+
+    @pytest.mark.parametrize(
+        "trunk", ["develop", "main", "master", "dev", "release/2.0"]
+    )
+    def test_long_lived_source_not_deleted_by_default(self, trunk: str) -> None:
+        """The incident class this guards: a promote PR stored with
+        close_source_branch=true and a long-lived source branch. The
+        merge API's close_source_branch overrides the stored value, so
+        the default merge must send False for long-lived sources."""
+        opener = _CaptureOpener(
+            [
+                _make_pr(7, source_branch=trunk),
+                _make_pr(7, state="MERGED", source_branch=trunk),
+            ]
+        )
+        bb_ops.pr_merge(_client(opener), "acme", "widget-service", 7)
+        assert opener.calls[1]["body"]["close_source_branch"] is False
+
+    def test_explicit_close_true_overrides_guard_and_skips_lookup(self) -> None:
+        """An explicit bool is the caller's decision: no lookup GET, and
+        the value goes through even for a long-lived source (the
+        opt-in escape hatch behind bash --close-source-branch)."""
+        opener = _CaptureOpener([_make_pr(7, state="MERGED")])
+        bb_ops.pr_merge(
+            _client(opener),
+            "acme",
+            "widget-service",
+            7,
+            close_source_branch=True,
+        )
+        assert len(opener.calls) == 1
+        assert opener.calls[0]["method"] == "POST"
+        assert opener.calls[0]["url"] == _prs_url() + "/7/merge"
+        assert opener.calls[0]["body"]["close_source_branch"] is True
+
+    def test_unreadable_source_branch_fails_safe_to_keep(self) -> None:
+        """A PR record the guard can't read a source branch from must
+        resolve to False: not deleting a branch is recoverable,
+        deleting one is not."""
+        opener = _CaptureOpener([{"id": 7}, _make_pr(7, state="MERGED")])
+        bb_ops.pr_merge(_client(opener), "acme", "widget-service", 7)
+        assert opener.calls[1]["body"]["close_source_branch"] is False
 
     @pytest.mark.parametrize(
         "bad_strategy",
@@ -655,7 +776,7 @@ class TestPrMerge:
         assert opener.calls == []
 
     def test_optional_message(self) -> None:
-        opener = _CaptureOpener([_make_pr(7, state="MERGED")])
+        opener = _CaptureOpener([_make_pr(7), _make_pr(7, state="MERGED")])
         bb_ops.pr_merge(
             _client(opener),
             "acme",
@@ -663,7 +784,7 @@ class TestPrMerge:
             7,
             message="Custom merge message",
         )
-        assert opener.calls[0]["body"]["message"] == "Custom merge message"
+        assert opener.calls[1]["body"]["message"] == "Custom merge message"
 
     def test_close_source_branch_override(self) -> None:
         opener = _CaptureOpener([_make_pr(7, state="MERGED")])
@@ -674,6 +795,8 @@ class TestPrMerge:
             7,
             close_source_branch=False,
         )
+        # Explicit bool skips the guard's lookup GET entirely.
+        assert len(opener.calls) == 1
         assert opener.calls[0]["body"]["close_source_branch"] is False
 
     def test_rejects_non_string_message(self) -> None:

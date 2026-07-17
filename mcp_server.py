@@ -891,7 +891,7 @@ def pr_create(
     destination_branch: str = "main",
     repo: str = "",
     description: str = "",
-    close_source_branch: bool = True,
+    close_source_branch: bool | None = None,
     reviewers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a pull request.
@@ -906,7 +906,12 @@ def pr_create(
         destination_branch: Destination branch (default: "main").
         repo: Repo slug, "workspace/slug", or "" to auto-detect.
         description: PR description (markdown). Empty/whitespace omitted.
-        close_source_branch: Delete the source branch on merge (default: True).
+        close_source_branch: Delete the source branch on merge. Default
+                       (None) resolves to True unless the source branch
+                       is long-lived (main / master / develop / dev /
+                       release/*), which resolves to False — a promote
+                       PR must never delete its source trunk. Pass an
+                       explicit bool to override the guard either way.
         reviewers: Optional list of reviewer Bitbucket UUIDs (each
                    wrapped as `{"uuid": "..."}` in the payload).
     """
@@ -995,12 +1000,19 @@ def pr_merge(
     pr_id: int,
     repo: str = "",
     strategy: str = "merge_commit",
-    close_source_branch: bool = True,
+    close_source_branch: bool | None = None,
     message: str = "",
 ) -> dict[str, Any]:
     """Merge a pull request.
 
     Strategies: merge_commit (default), squash, fast_forward.
+
+    close_source_branch: default (None) looks up the PR's source branch
+    and resolves to True unless it is long-lived (main / master /
+    develop / dev / release/*), which resolves to False regardless of
+    the close_source_branch the PR was stored with — merging a promote
+    PR must never delete its source trunk. Pass an explicit bool to
+    force either behaviour.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
