@@ -265,18 +265,6 @@ _resolve_pr_args() {
     esac
 }
 
-# Long-lived integration branches that must never be deleted by a PR
-# merge: they are the trunk lines GitFlow promotes FROM (develop→main),
-# so close_source_branch must not apply to them. Exact-match names plus
-# the release/* prefix; case-sensitive because git branch names are.
-# Mirrors bb_ops.is_long_lived_branch — keep the two lists identical.
-_is_long_lived_branch() {
-    case "${1:-}" in
-        main|master|develop|dev|release/*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 repo_path() {
     local repo="$1"
     # Validate inputs at the boundary so a malformed slug doesn't
@@ -1067,21 +1055,17 @@ cmd_pr_view() {
 }
 
 cmd_pr_create() {
-    # bb pr-create [repo] <title> [dest-branch] [--keep-source-branch | --close-source-branch]
+    # bb pr-create [repo] <title> [dest-branch] [--close-source-branch]
     #
-    # Long-lived-branch guard: the PR is created with
-    # close_source_branch=true (delete the source branch on merge)
-    # UNLESS the source branch is long-lived (_is_long_lived_branch),
-    # which forces close_source_branch=false — a promote PR
-    # (develop→main) must never delete develop on merge.
-    # --keep-source-branch / --close-source-branch force either value.
-    # Parity with bb_ops.pr_create.
-    local close_flag=""
+    # close_source_branch defaults to false: deleting the source branch
+    # on merge is destructive, so it is opt-in (--close-source-branch),
+    # never automatic. Same stance `gh pr merge` takes with
+    # --delete-branch. Parity with bb_ops.pr_create.
+    local close_source_branch="false"
     local -a positionals=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --keep-source-branch)  close_flag="false"; shift ;;
-            --close-source-branch) close_flag="true"; shift ;;
+            --close-source-branch) close_source_branch="true"; shift ;;
             -*)
                 echo "Error: unknown flag for pr-create: $1" >&2
                 exit 1
@@ -1104,21 +1088,12 @@ cmd_pr_create() {
     fi
 
     if [[ -z "$title" ]]; then
-        echo "Usage: bb pr-create [repo] <title> [dest-branch] [--keep-source-branch | --close-source-branch]" >&2
+        echo "Usage: bb pr-create [repo] <title> [dest-branch] [--close-source-branch]" >&2
         echo "" >&2
-        echo "  Creates a PR from current branch (${source_branch}) to dest (default: main)" >&2
-        echo "  Long-lived source branches (main/master/develop/dev/release/*) are" >&2
-        echo "  kept on merge by default; short-lived branches are deleted on merge." >&2
+        echo "  Creates a PR from current branch (${source_branch}) to dest (default: main)." >&2
+        echo "  The source branch is kept on merge by default; pass" >&2
+        echo "  --close-source-branch to have it deleted when the PR merges." >&2
         exit 1
-    fi
-
-    local close_source_branch
-    if [[ -n "$close_flag" ]]; then
-        close_source_branch="$close_flag"
-    elif _is_long_lived_branch "$source_branch"; then
-        close_source_branch="false"
-    else
-        close_source_branch="true"
     fi
 
     # Read description from stdin if piped, otherwise empty.
@@ -1129,8 +1104,7 @@ cmd_pr_create() {
 
     # Parity fix: omit `description` from the payload when empty so it
     # matches the Python omit-when-empty contract (bb_ops.pr_create).
-    # close_source_branch comes from the guard above (--argjson: it is a
-    # JSON bool, not a string).
+    # close_source_branch is a JSON bool via --argjson, not a string.
     local payload
     if [[ -n "$description" ]]; then
         payload=$(jq -n \
@@ -1161,9 +1135,8 @@ cmd_pr_create() {
     fi
 
     echo "Creating PR: ${source_branch} -> ${dest}"
-    if [[ -z "$close_flag" && "$close_source_branch" == "false" ]]; then
-        echo "  Source '${source_branch}' is a long-lived branch: it will NOT be"
-        echo "  deleted on merge (override with --close-source-branch)."
+    if [[ "$close_source_branch" == "true" ]]; then
+        echo "  Source '${source_branch}' will be deleted when the PR merges."
     fi
 
     # rc-capture pattern: a 400 (typo in dest branch, duplicate PR
@@ -1363,20 +1336,21 @@ cmd_pr_unapprove() {
 }
 
 cmd_pr_merge() {
-    # bb pr-merge [repo] <pr-id> [strategy] [--keep-source-branch | --close-source-branch]
+    # bb pr-merge [repo] <pr-id> [strategy] [--close-source-branch]
     #
-    # Long-lived-branch guard (parity with bb_ops.pr_merge): the merge
-    # API's close_source_branch OVERRIDES whatever value the PR was
-    # created with, so by default we look up the PR's source branch and
-    # refuse to delete a long-lived one (_is_long_lived_branch); every
-    # other source branch keeps the delete-on-merge behaviour. The flags
-    # force either value and skip the lookup.
-    local close_flag=""
+    # close_source_branch defaults to false and is always sent explicitly
+    # in the merge payload. Deleting the source branch on merge is
+    # destructive, so it is opt-in (--close-source-branch), never
+    # automatic. Sending false explicitly also OVERRIDES whatever value
+    # the PR was created with — the merge API's value wins over the PR's —
+    # so a PR made by an older bb, or the Bitbucket UI, with the box
+    # checked still keeps its source branch here unless --close-source-branch
+    # is passed. Parity with bb_ops.pr_merge.
+    local close_source_branch="false"
     local -a positionals=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --keep-source-branch)  close_flag="false"; shift ;;
-            --close-source-branch) close_flag="true"; shift ;;
+            --close-source-branch) close_source_branch="true"; shift ;;
             -*)
                 echo "Error: unknown flag for pr-merge: $1" >&2
                 exit 1
@@ -1390,11 +1364,11 @@ cmd_pr_merge() {
     # sidesteps the empty-array-under-set-u expansion trap on bash 3.2.
     _resolve_pr_args "${positionals[0]:-}" "${positionals[1]:-}"
     if [[ -z "$pr_id" ]]; then
-        echo "Usage: bb pr-merge [repo] <pr-id> [strategy] [--keep-source-branch | --close-source-branch]" >&2
+        echo "Usage: bb pr-merge [repo] <pr-id> [strategy] [--close-source-branch]" >&2
         echo "       (or: bb pr-merge <id> [strategy] from inside a checkout)" >&2
         echo "  Strategies: merge_commit (default), squash, fast_forward" >&2
-        echo "  Long-lived source branches (main/master/develop/dev/release/*) are" >&2
-        echo "  kept on merge by default; --close-source-branch forces deletion." >&2
+        echo "  The source branch is kept on merge by default; pass" >&2
+        echo "  --close-source-branch to have it deleted." >&2
         exit 1
     fi
     # Extras start after the consumed [repo]/<id> slots; index with a
@@ -1412,31 +1386,6 @@ cmd_pr_merge() {
             exit 1
             ;;
     esac
-
-    local close_source_branch
-    if [[ -n "$close_flag" ]]; then
-        close_source_branch="$close_flag"
-    else
-        # Look up the PR's source branch for the guard. An unreadable
-        # source branch (lookup failure, unexpected shape) fails safe to
-        # "keep": not deleting a branch is recoverable, deleting one is
-        # not — and a failed lookup usually means the merge POST below
-        # will surface the real error anyway.
-        local src_branch="" pr_json="" rc_lookup=0
-        pr_json=$(bb_get "$(repo_path "$repo")/pullrequests/${pr_id}") || rc_lookup=$?
-        if [[ "$rc_lookup" -eq 0 ]]; then
-            src_branch=$(echo "$pr_json" | jq -r '.source.branch.name // empty' 2>/dev/null || true)
-        fi
-        if [[ -z "$src_branch" ]]; then
-            close_source_branch="false"
-        elif _is_long_lived_branch "$src_branch"; then
-            close_source_branch="false"
-            echo "Source branch '${src_branch}' is long-lived: keeping it after merge"
-            echo "  (override with --close-source-branch)."
-        else
-            close_source_branch="true"
-        fi
-    fi
 
     local payload
     payload=$(jq -n --arg strategy "$strategy" --argjson close "$close_source_branch" \
@@ -2994,20 +2943,17 @@ PULL REQUESTS
   bb prs [repo] [state]                 List PRs (default: OPEN)
   bb pr [repo] <id>                     View PR details
   bb pr-create [repo] <title> [dest]    Create PR from current branch
-                                          opts: --keep-source-branch |
-                                          --close-source-branch (default: delete
-                                          the source branch on merge, UNLESS it is
-                                          long-lived — main/master/develop/dev/
-                                          release/* are always kept unless forced)
+                                          opt: --close-source-branch (delete the
+                                          source branch when the PR merges; kept
+                                          by default)
   bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                         Update a PR title and/or description
   bb pr-approve [repo] <id>             Approve a PR
   bb pr-unapprove [repo] <id>           Remove your approval on a PR
   bb pr-merge [repo] <id> [strategy]    Merge a PR (merge_commit|squash|fast_forward)
-                                          opts: --keep-source-branch |
-                                          --close-source-branch (same long-lived
-                                          guard as pr-create, applied at merge
-                                          time over the PR's stored setting)
+                                          opt: --close-source-branch (delete the
+                                          source branch on merge; kept by default,
+                                          overriding the PR's stored setting)
   bb pr-decline [repo] <id>             Decline a PR
   bb pr-diff [repo] <id>                Show PR diff
   bb pr-comments [repo] <id>            Show PR comments

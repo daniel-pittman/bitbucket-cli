@@ -891,7 +891,7 @@ def pr_create(
     destination_branch: str = "main",
     repo: str = "",
     description: str = "",
-    close_source_branch: bool | None = None,
+    close_source_branch: bool = False,
     reviewers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a pull request.
@@ -906,12 +906,11 @@ def pr_create(
         destination_branch: Destination branch (default: "main").
         repo: Repo slug, "workspace/slug", or "" to auto-detect.
         description: PR description (markdown). Empty/whitespace omitted.
-        close_source_branch: Delete the source branch on merge. Default
-                       (None) resolves to True unless the source branch
-                       is long-lived (main / master / develop / dev /
-                       release/*), which resolves to False — a promote
-                       PR must never delete its source trunk. Pass an
-                       explicit bool to override the guard either way.
+        close_source_branch: Delete the source branch on merge. Defaults
+                       to False: branch deletion is destructive, so it is
+                       opt-in, never automatic (the same stance
+                       `gh pr merge` takes with `--delete-branch`). Pass
+                       True to have the branch deleted when the PR merges.
         reviewers: Optional list of reviewer Bitbucket UUIDs (each
                    wrapped as `{"uuid": "..."}` in the payload).
     """
@@ -1000,19 +999,20 @@ def pr_merge(
     pr_id: int,
     repo: str = "",
     strategy: str = "merge_commit",
-    close_source_branch: bool | None = None,
+    close_source_branch: bool = False,
     message: str = "",
 ) -> dict[str, Any]:
     """Merge a pull request.
 
     Strategies: merge_commit (default), squash, fast_forward.
 
-    close_source_branch: default (None) looks up the PR's source branch
-    and resolves to True unless it is long-lived (main / master /
-    develop / dev / release/*), which resolves to False regardless of
-    the close_source_branch the PR was stored with — merging a promote
-    PR must never delete its source trunk. Pass an explicit bool to
-    force either behaviour.
+    close_source_branch: defaults to False and is always sent explicitly.
+    Branch deletion on merge is destructive, so it is opt-in, never
+    automatic (the same stance `gh pr merge` takes with `--delete-branch`).
+    Sending False explicitly also OVERRIDES whatever value the PR was
+    stored with at creation, so a PR made by an older `bb` or the
+    Bitbucket UI with the box checked still keeps its source branch here
+    unless you pass True.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
