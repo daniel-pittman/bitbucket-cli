@@ -195,8 +195,12 @@ bb trigger ryan-repo develop build-installer --var GOLD_VERSION=v1.0.1
 ```bash
 bb prs [repo] [state]                 # List PRs (default: OPEN)
 bb pr [repo] <id>                     # View PR details
-bb pr-create [repo] <title> [dest]    # Create PR from current branch
+bb pr-create [--repo R] <title> [dest]  # Create PR from current branch
+                                      #   <title> is the FIRST positional; repo is
+                                      #   --repo (slug or ws/slug) or auto-detected
                                       #   opt: --close-source-branch
+                                      #   opt: --description TEXT | --description-file PATH
+                                      #        (or pipe a body: pr-create ... < body.md)
 bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                       # Update a PR title and/or description
 bb pr-approve [repo] <id>             # Approve a PR
@@ -323,8 +327,11 @@ bb watch
 # List open PRs
 bb prs
 
-# Create a PR from current branch to main
-bb pr-create my-repo "Add new feature"
+# Create a PR from current branch to develop (repo auto-detected from git origin)
+bb pr-create "Add new feature" develop
+
+# Target a specific repo with --repo (slug or workspace/slug)
+bb pr-create --repo my-repo "Add new feature" develop
 
 # Trigger a custom pipeline with per-run variables
 bb trigger my-repo main manual-deploy-prod --var LAMBDA_NAMES=mci --var REGION=us-west-2
