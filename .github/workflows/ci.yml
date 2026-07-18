@@ -40,6 +40,19 @@ jobs:
               exit 1
             }
 
+      # Assert the security guards (build_number / pr_id / step_index /
+      # count / pr_state) still reject their injection vectors. Runs under
+      # the same digest-pinned bash:3.2 image (no jq / curl / git needed —
+      # every malicious case is rejected before any external tool). This
+      # regression-protects the v1.7.1 token-exfiltration fix: dropping a
+      # _require_* call makes a case fail here rather than at release
+      # smoke-test time.
+      - name: Security-guard assertions under bash 3.2
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            bash:3.2@sha256:a11f59667c0a9d51724e88ebebac74b208f4177e36a33ad80dd23436e70f6115 \
+            bash tests/bash/test_security_guards.sh
+
   syntax:
     runs-on: ubuntu-latest
     strategy:

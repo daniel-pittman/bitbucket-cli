@@ -615,6 +615,12 @@ cmd_logs() {
         exit 1
     fi
     _require_build_number "$build_number"
+    # Validate step_index at the boundary — before any network call and
+    # before the jq interpolation below (jq injection / token-exfil
+    # boundary; see _require_step_index). Empty step_index takes the
+    # list-steps path, so only guard the non-empty case here. This keeps
+    # "zero network IO on bad input" parity with the Python side.
+    [[ -n "$step_index" ]] && _require_step_index "$step_index"
 
     # Parity fix: bumped pagelen 50→100 (Bitbucket's max). Symmetric
     # with cmd_pipeline_stop / cmd_pipeline.
@@ -645,10 +651,8 @@ cmd_logs() {
         return
     fi
 
-    # Validate BEFORE interpolating into the jq program below (jq
-    # injection / token-exfil boundary — see _require_step_index).
-    _require_step_index "$step_index"
-
+    # step_index is validated at the top (before any network call), so
+    # the interpolation below is safe.
     local step_uuid
     step_uuid=$(echo "$steps" | jq -r ".values[${step_index}].uuid" | tr -d '{}')
 
