@@ -11,13 +11,17 @@
 # a refactor that dropped a guard call would re-open the hole silently.
 # This harness asserts each guard rejects its injection vector.
 #
-# Offline by design: every malicious case is rejected BEFORE any network
-# call, so this runs with dummy credentials and needs no live workspace,
-# no jq, no curl, no git. That is what makes it CI-friendly AND is itself
-# a property worth pinning ("zero network IO on bad input"). To catch a
-# regression that lets input slip past a guard to the network, assertions
-# match the SPECIFIC guard message, not just a non-zero exit (a network
-# failure also exits non-zero, so exit-code alone would false-pass).
+# Offline by design: every MALICIOUS case is rejected BEFORE any network
+# call, so it needs no live workspace and invokes no jq / curl / git —
+# that "zero network IO on bad input" property is itself worth pinning
+# and is what lets the harness run in the minimal bash:3.2 CI image. (The
+# valid-input assert_passes_guard cases deliberately proceed past the
+# guard into bb_get, which invokes curl against the unrouted host; that
+# call failing is expected, and the assertion holds whether or not curl
+# is present.) To catch a regression that lets input slip past a guard to
+# the network, assertions match the SPECIFIC guard message, not just a
+# non-zero exit (a network failure also exits non-zero, so exit-code
+# alone would false-pass).
 #
 # bash 3.2-safe (runs in the bash:3.2 CI container): no ${var,,},
 # mapfile, or declare -A.
