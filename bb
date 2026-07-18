@@ -263,6 +263,10 @@ _resolve_pr_args() {
             pr_args_consumed=1
             ;;
     esac
+    # Validate non-empty ids here so every PR command inherits the guard.
+    # An empty pr_id is left to each command's own usage-error check;
+    # a non-empty one must be a positive integer before it reaches a URL.
+    [[ -n "$pr_id" ]] && _require_pr_id "$pr_id"
 }
 
 repo_path() {
@@ -316,7 +320,46 @@ repo_path() {
 # at the boundary so neither failure mode can fire.
 _require_build_number() {
     if ! [[ "$1" =~ ^[0-9]+$ ]]; then
-        echo "Error: build_number must be a positive integer (got ${1!r:-empty})." >&2
+        echo "Error: build_number must be a positive integer (got ${1:-empty})." >&2
+        exit 1
+    fi
+}
+
+# Validate a PR id before it is interpolated into a request URL path
+# (pullrequests/{id}, .../merge, .../approve, .../decline). Mirrors the
+# Python _validate_pr_id / _is_positive_int contract (positive integer).
+# Without this, a non-numeric id manipulates the URL path on mutation
+# endpoints — the bash side previously trusted it while Python did not.
+_require_pr_id() {
+    if ! [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: pr-id must be a positive integer (got ${1:-empty})." >&2
+        exit 1
+    fi
+}
+
+# Validate a pipeline step index before it is interpolated into a jq
+# PROGRAM (.values[${step_index}].uuid). This is a security boundary,
+# NOT just a usability check: an unvalidated step index is a jq injection
+# surface — a value like `0].uuid,$ENV.BB_TOKEN,.values[0` makes jq emit
+# the token, breaking the "BB_TOKEN never echoed" posture. Sibling of
+# _require_build_number (which closed the same class for build_number in
+# PR #8); step_index was missed. Mirrors the Python step_index guard
+# (non-negative int, used as a list index, never interpolated).
+_require_step_index() {
+    if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+        echo "Error: step-index must be a non-negative integer (got ${1:-empty})." >&2
+        exit 1
+    fi
+}
+
+# Validate a user-supplied result count before it is interpolated into a
+# query string (pagelen=${count}). Same query-param-injection class as
+# _require_pr_state (which closed `bb prs 'OPEN&pagelen=1000'`): a count
+# like `10&role=admin` would smuggle extra params. Mirrors the Python
+# _is_positive_int guard on count.
+_require_count() {
+    if ! [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: count must be a positive integer (got ${1:-empty})." >&2
         exit 1
     fi
 }
@@ -410,6 +453,7 @@ cmd_pipelines() {
     local repo
     resolve_repo "${1:-}"
     local count="${2:-10}"
+    _require_count "$count"
 
     echo "Pipelines for ${BB_WORKSPACE}/${repo}:"
     echo ""
@@ -600,6 +644,10 @@ cmd_logs() {
         echo "Usage: bb logs ${repo} ${build_number} <step-index>"
         return
     fi
+
+    # Validate BEFORE interpolating into the jq program below (jq
+    # injection / token-exfil boundary — see _require_step_index).
+    _require_step_index "$step_index"
 
     local step_uuid
     step_uuid=$(echo "$steps" | jq -r ".values[${step_index}].uuid" | tr -d '{}')
@@ -1586,6 +1634,7 @@ cmd_commits() {
     resolve_repo "${1:-}"
     local branch="${2:-}"
     local count="${3:-10}"
+    _require_count "$count"
 
     local path response
     if [[ -n "$branch" ]]; then
