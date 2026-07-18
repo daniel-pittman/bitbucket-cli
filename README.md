@@ -211,6 +211,21 @@ bb pr-diff [repo] <id>                # Show PR diff
 bb pr-comments [repo] <id>            # Show PR comments
 ```
 
+**Creating a PR: title first, repo via `--repo`.** `<title>` is the first
+positional and dest the second, so `bb pr-create "<title>" <dest>` works with
+the repo auto-detected from the git origin. Select a different repo with
+`--repo` (slug or `workspace/slug`). A leading `workspace/slug` positional is
+still accepted for back-compat; a single-token title shaped like `ws/slug`
+(e.g. `fix/typo`, one slash, no spaces) is taken as the repo, so pass `--repo`
+to disambiguate in that rare case.
+
+**PR body.** Supply it with `--description "..."`, `--description-file PATH`,
+or a file redirect `bb pr-create "<title>" <dest> < body.md`. `pr-create` never
+blocks reading stdin: the implicit redirect path reads a **regular file** only,
+so an interactive or piped invocation with no body never hangs. On any platform
+where the `< body.md` convenience read is not detected, use `--description-file`
+(the portable path).
+
 **Source-branch deletion on merge.** The source branch is kept by default.
 Deleting a branch on merge is destructive, so it is opt-in, never automatic,
 the same stance `gh pr merge` takes with `--delete-branch`. Pass

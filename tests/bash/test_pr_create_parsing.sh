@@ -148,6 +148,13 @@ capture -- pr-create --repo=acme/widget "Eq repo title" develop
 check_contains "--repo=value: dest parsed"  "-> develop"
 check_contains "--repo=value: title parsed" "Title: Eq repo title"
 
+# Escape hatch: a title that is itself shaped like ws/slug (single token,
+# one slash) would be swallowed as a repo by the back-compat positional, so
+# --repo is the disambiguator — with it set, every positional is title/dest.
+capture -- pr-create --repo acme/widget "release/v2" develop
+check_contains "--repo escape hatch: slug-shaped title kept as title" "Title: release/v2"
+check_contains "--repo escape hatch: dest parsed"                     "-> develop"
+
 echo ""
 echo "== BUG 1: stdin read must never hang =="
 
@@ -197,6 +204,108 @@ check_not_contains "desc-file read: no not-found err" "not found"
 # (regular files always reach EOF).
 capture_stdin "$BODY" -- pr-create --repo acme/widget "Redirect body" develop
 check_contains "stdin file redirect: reached banner" "Creating PR:"
+
+echo ""
+echo "== description lands in the request body =="
+
+# Stand up a throwaway HTTP server that records the POST body and replies
+# 201, then point BB_API_BASE at it so the actual JSON payload is
+# inspectable (the unrouted-host cases above only prove the parse reached
+# the banner). This asserts the description is present for each input path
+# and OMITTED when empty (parity with the Python omit-when-empty contract).
+if command -v python3 >/dev/null 2>&1; then
+    CAPBODY="$WORK/last_body.json"
+    CAPPORT="$WORK/port.txt"
+    : > "$CAPPORT"
+    # Threaded server: each curl connection is handled on its own thread so
+    # a lingering/serial connection can't stall a later request (a single-
+    # threaded server intermittently refused the 3rd of several rapid POSTs).
+    python3 - "$CAPBODY" "$CAPPORT" >/dev/null 2>&1 <<'PY' &
+import sys, json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+bodyfile, portfile = sys.argv[1], sys.argv[2]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        open(bodyfile, "wb").write(self.rfile.read(n))
+        resp = json.dumps({"id": 1, "links": {"html": {"href": "http://x/1"}}}).encode()
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+srv.daemon_threads = True
+open(portfile, "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+    CAPPID=$!
+
+    # Wait (bounded) for the server to bind and publish its port.
+    port=""
+    waited=0
+    while [ -z "$port" ] && [ "$waited" -lt 20 ]; do
+        sleep 0.25
+        port="$(cat "$CAPPORT" 2>/dev/null)"
+        waited=$((waited + 1))
+    done
+
+    if [ -n "$port" ]; then
+        OLD_API_BASE="$BB_API_BASE"
+        export BB_API_BASE="http://127.0.0.1:${port}/2.0"
+
+        # label -- <bb args...>  → runs bb, loads the captured JSON into BODY_JSON
+        capture_body() {
+            [ "$1" = "--" ] && shift
+            : > "$CAPBODY"
+            "$BB" "$@" >/dev/null 2>&1
+            BODY_JSON="$(cat "$CAPBODY" 2>/dev/null)"
+        }
+        # like capture_body but with bb's stdin redirected from <file>.
+        capture_body_stdin() {
+            local src="$1"; shift
+            [ "$1" = "--" ] && shift
+            : > "$CAPBODY"
+            "$BB" "$@" <"$src" >/dev/null 2>&1
+            BODY_JSON="$(cat "$CAPBODY" 2>/dev/null)"
+        }
+        # check_json label jq-filter expected
+        check_json() {
+            local got; got="$(printf '%s' "$BODY_JSON" | jq -r "$2" 2>/dev/null)"
+            if [ "$got" = "$3" ]; then ok "$1"; else failmsg "$1" "jq '$2' => [$got], expected [$3]"; fi
+        }
+
+        capture_body -- pr-create --repo acme/widget "Inline body title" develop --description "HELLO_INLINE"
+        check_json "inline --description: title in body"   '.title'                          "Inline body title"
+        check_json "inline --description: dest in body"    '.destination.branch.name'        "develop"
+        check_json "inline --description: description set"  '.description'                    "HELLO_INLINE"
+
+        capture_body -- pr-create --repo acme/widget "Filed body title" develop --description-file "$BODY"
+        check_json "--description-file: description from file" '.description'                 "line one
+line two"
+
+        capture_body_stdin "$BODY" -- pr-create --repo acme/widget "Redirect body title" develop
+        check_json "< body.md redirect: description from file" '.description'                 "line one
+line two"
+
+        capture_body -- pr-create --repo acme/widget "No body title" develop
+        check_json "no description: field omitted"         'has("description")'              "false"
+
+        capture_body -- pr-create --repo acme/widget "Empty body title" develop --description ""
+        check_json "empty --description: field omitted"    'has("description")'              "false"
+
+        export BB_API_BASE="$OLD_API_BASE"
+    else
+        echo "pass: (skipped) capture server did not bind — body-content assertions not run"
+        passes=$((passes + 1))
+    fi
+    kill "$CAPPID" 2>/dev/null
+    wait "$CAPPID" 2>/dev/null
+else
+    echo "pass: (skipped) python3 unavailable — body-content assertions not run"
+    passes=$((passes + 1))
+fi
 
 echo ""
 echo "== summary: ${passes} passed, ${fails} failed =="
