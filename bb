@@ -1158,8 +1158,13 @@ cmd_pr_create() {
     #   otherwise         → <title> [dest], repo auto-detected from git origin
     # The ws/slug back-compat form requires EXACTLY one slash and no
     # whitespace, so a multi-word title (which contains a space) is never
-    # mistaken for a repo. The `+` expansion keeps the array read safe under
-    # `set -u` on bash 3.2 when no positionals were given.
+    # mistaken for a repo. Residual caveat: a single-token title that is
+    # itself shaped like ws/slug (one slash, no spaces, e.g. "fix/typo") is
+    # still consumed as the repo. That case is rare, and --repo is the
+    # escape hatch — with --repo set, every positional is a title/dest, so
+    # `bb pr-create --repo <ws/slug> "fix/typo" <dest>` titles it correctly.
+    # The `+` expansion keeps the array read safe under `set -u` on bash 3.2
+    # when no positionals were given.
     local repo title dest
     local -a pos=( "${positionals[@]+"${positionals[@]}"}" )
     local first="${pos[0]:-}"
@@ -1208,6 +1213,14 @@ cmd_pr_create() {
     # always reaches EOF, so restricting the implicit read to regular files
     # makes that hang impossible. Pipe / interactive callers pass an
     # explicit --description or --description-file.
+    #
+    # The regular-file test probes BOTH /dev/stdin and /dev/fd/0: Linux
+    # resolves /dev/stdin to /proc/self/fd/0, but on platforms where that
+    # path is absent or its stat() doesn't reflect the redirect, /dev/fd/0
+    # is the fallback. A false negative on both only SKIPS the convenience
+    # read (callers fall back to --description-file); it can never turn a
+    # pipe/tty into a regular file, so the no-hang guarantee holds either
+    # way. --description-file is the fully portable path (README).
     if [[ -n "$have_desc_file" ]]; then
         if [[ ! -f "$desc_file" ]]; then
             echo "Error: --description-file not found: $desc_file" >&2
@@ -1219,7 +1232,7 @@ cmd_pr_create() {
             echo "Error: failed to read --description-file: $desc_file" >&2
             exit 1
         fi
-    elif [[ -z "$have_description" && -f /dev/stdin ]]; then
+    elif [[ -z "$have_description" ]] && { [[ -f /dev/stdin ]] || [[ -f /dev/fd/0 ]]; }; then
         description="$(cat)"
     fi
 
