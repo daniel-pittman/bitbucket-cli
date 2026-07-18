@@ -1107,17 +1107,36 @@ cmd_pr_view() {
 }
 
 cmd_pr_create() {
-    # bb pr-create [repo] <title> [dest-branch] [--close-source-branch]
+    # bb pr-create [--repo REPO] <title> [dest-branch] [--close-source-branch]
+    #              [--description TEXT | --description-file PATH]
+    #
+    # <title> is the FIRST positional and dest the SECOND, so the common
+    # `bb pr-create "<title>" <dest>` (repo auto-detected from git origin)
+    # parses correctly. A repo is selected with --repo (slug or ws/slug);
+    # a leading "workspace/slug" positional is still accepted for
+    # back-compat. There is deliberately NO bare-slug leading positional:
+    # it made a two-positional `pr-create "<title>" <dest>` mis-read the
+    # title as the repo. The Python/MCP pr_create takes named args, so this
+    # positional ambiguity is bash-only (no parity change on that side).
     #
     # close_source_branch defaults to false: deleting the source branch
     # on merge is destructive, so it is opt-in (--close-source-branch),
     # never automatic. Same stance `gh pr merge` takes with
     # --delete-branch. Parity with bb_ops.pr_create.
     local close_source_branch="false"
+    local repo_flag="" have_repo_flag=""
+    local description="" desc_file=""
+    local have_description="" have_desc_file=""
     local -a positionals=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --close-source-branch) close_source_branch="true"; shift ;;
+            --repo)               _require_flag_value "$@"; repo_flag="$2"; have_repo_flag=1; shift 2 ;;
+            --repo=*)             repo_flag="${1#*=}"; have_repo_flag=1; shift ;;
+            --description)        _require_flag_value "$@"; description="$2"; have_description=1; shift 2 ;;
+            --description=*)      description="${1#*=}"; have_description=1; shift ;;
+            --description-file)   _require_flag_value "$@"; desc_file="$2"; have_desc_file=1; shift 2 ;;
+            --description-file=*) desc_file="${1#*=}"; have_desc_file=1; shift ;;
             -*)
                 echo "Error: unknown flag for pr-create: $1" >&2
                 exit 1
@@ -1126,10 +1145,37 @@ cmd_pr_create() {
         esac
     done
 
-    local repo
-    resolve_repo "${positionals[0]:-}"
-    local title="${positionals[1]:-}"
-    local dest="${positionals[2]:-main}"
+    # --description and --description-file set the same field; supplying
+    # both is ambiguous. Reject rather than silently pick (parity pr-update).
+    if [[ -n "$have_description" && -n "$have_desc_file" ]]; then
+        echo "Error: --description and --description-file are mutually exclusive." >&2
+        exit 1
+    fi
+
+    # Resolve repo + title + dest.
+    #   --repo REPO       → all positionals are <title> [dest]
+    #   leading ws/slug   → back-compat repo positional, then <title> [dest]
+    #   otherwise         → <title> [dest], repo auto-detected from git origin
+    # The ws/slug back-compat form requires EXACTLY one slash and no
+    # whitespace, so a multi-word title (which contains a space) is never
+    # mistaken for a repo. The `+` expansion keeps the array read safe under
+    # `set -u` on bash 3.2 when no positionals were given.
+    local repo title dest
+    local -a pos=( "${positionals[@]+"${positionals[@]}"}" )
+    local first="${pos[0]:-}"
+    if [[ -n "$have_repo_flag" ]]; then
+        resolve_repo "$repo_flag"
+        title="${pos[0]:-}"
+        dest="${pos[1]:-main}"
+    elif [[ "$first" =~ ^[^[:space:]/]+/[^[:space:]/]+$ ]]; then
+        resolve_repo "$first"
+        title="${pos[1]:-}"
+        dest="${pos[2]:-main}"
+    else
+        resolve_repo ""
+        title="${pos[0]:-}"
+        dest="${pos[1]:-main}"
+    fi
 
     local source_branch
     source_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
@@ -1140,18 +1186,41 @@ cmd_pr_create() {
     fi
 
     if [[ -z "$title" ]]; then
-        echo "Usage: bb pr-create [repo] <title> [dest-branch] [--close-source-branch]" >&2
+        echo "Usage: bb pr-create [--repo REPO] <title> [dest-branch] [--close-source-branch]" >&2
+        echo "                    [--description TEXT | --description-file PATH]" >&2
         echo "" >&2
         echo "  Creates a PR from current branch (${source_branch}) to dest (default: main)." >&2
+        echo "  <title> is the first positional; a repo is given with --repo" >&2
+        echo "  (slug or workspace/slug) or auto-detected from the git origin." >&2
         echo "  The source branch is kept on merge by default; pass" >&2
         echo "  --close-source-branch to have it deleted when the PR merges." >&2
+        echo "  Description: --description TEXT, --description-file PATH, or a" >&2
+        echo "  file redirect (bb pr-create \"title\" dest < body.md)." >&2
         exit 1
     fi
 
-    # Read description from stdin if piped, otherwise empty.
-    local description=""
-    if [[ ! -t 0 ]]; then
-        description=$(cat)
+    # Resolve the PR description. Precedence: --description, then
+    # --description-file, then a `< body.md` regular-file redirect on stdin.
+    # The implicit stdin path reads ONLY a regular file (-f): a pipe, char
+    # device, or terminal is never auto-read. Reading a non-closing stdin
+    # (no controlling tty, no piped data, no EOF) is exactly the `cat` that
+    # blocked forever and orphaned pr-create processes; a regular file
+    # always reaches EOF, so restricting the implicit read to regular files
+    # makes that hang impossible. Pipe / interactive callers pass an
+    # explicit --description or --description-file.
+    if [[ -n "$have_desc_file" ]]; then
+        if [[ ! -f "$desc_file" ]]; then
+            echo "Error: --description-file not found: $desc_file" >&2
+            exit 1
+        fi
+        local _dfrc=0
+        description="$(cat "$desc_file")" || _dfrc=$?
+        if [[ "$_dfrc" -ne 0 ]]; then
+            echo "Error: failed to read --description-file: $desc_file" >&2
+            exit 1
+        fi
+    elif [[ -z "$have_description" && -f /dev/stdin ]]; then
+        description="$(cat)"
     fi
 
     # Parity fix: omit `description` from the payload when empty so it
@@ -1187,6 +1256,7 @@ cmd_pr_create() {
     fi
 
     echo "Creating PR: ${source_branch} -> ${dest}"
+    echo "  Title: ${title}"
     if [[ "$close_source_branch" == "true" ]]; then
         echo "  Source '${source_branch}' will be deleted when the PR merges."
     fi
@@ -2995,10 +3065,14 @@ PIPELINES
 PULL REQUESTS
   bb prs [repo] [state]                 List PRs (default: OPEN)
   bb pr [repo] <id>                     View PR details
-  bb pr-create [repo] <title> [dest]    Create PR from current branch
+  bb pr-create [--repo R] <title> [dest]  Create PR from current branch
+                                          <title> is the FIRST positional; repo is
+                                          --repo (slug or ws/slug) or auto-detected.
                                           opt: --close-source-branch (delete the
                                           source branch when the PR merges; kept
-                                          by default)
+                                          by default);
+                                          --description TEXT | --description-file PATH
+                                          (or pipe a body: pr-create ... < body.md)
   bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                         Update a PR title and/or description
   bb pr-approve [repo] <id>             Approve a PR

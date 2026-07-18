@@ -53,6 +53,16 @@ jobs:
             bash:3.2@sha256:a11f59667c0a9d51724e88ebebac74b208f4177e36a33ad80dd23436e70f6115 \
             bash tests/bash/test_security_guards.sh
 
+      # pr-create argument-parsing + stdin no-hang regressions. Unlike the
+      # guard harness this one drives the happy path up to (not through) the
+      # network, so it needs git + jq and runs on the host runner (which has
+      # both) rather than the jq/curl/git-less bash:3.2 image. bash-3.2 PARSE
+      # safety of the same code is covered by the "Parse bb under bash 3.2"
+      # step above. The no-hang case reproduces the open-pipe-no-EOF stdin
+      # that orphaned pr-create and asserts the fix does not block on it.
+      - name: pr-create parsing + no-hang regressions (host bash)
+        run: bash tests/bash/test_pr_create_parsing.sh
+
   syntax:
     runs-on: ubuntu-latest
     strategy:
