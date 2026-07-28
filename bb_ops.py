@@ -671,6 +671,28 @@ def pr_create(
     return client.post(_prs_root(workspace, repo), json_body=payload)
 
 
+def _normalise_reviewer_uuids(label: str, values: Iterable[str]) -> list[str]:
+    """Validate a reviewer-uuid iterable and return it as a list.
+
+    Rejects a bare string for the same reason pr_create does: a str is an
+    Iterable[str] that yields CHARACTERS, so `add_reviewers="{abc}"` would
+    silently become one reviewer per character.
+    """
+    if isinstance(values, str):
+        raise ValueError(
+            f"{label} must be a list/tuple of uuids, not a bare string. "
+            f"Got {values!r}; did you mean [{values!r}]?"
+        )
+    out: list[str] = []
+    for uuid in values:
+        if not isinstance(uuid, str) or not uuid.strip():
+            raise ValueError(
+                f"{label} uuids must be non-empty strings, got {uuid!r}"
+            )
+        out.append(uuid)
+    return out
+
+
 def pr_update(
     client: BBClient,
     workspace: str,
@@ -679,6 +701,9 @@ def pr_update(
     *,
     title: str | None = None,
     description: str | None = None,
+    add_reviewers: Iterable[str] | None = None,
+    remove_reviewers: Iterable[str] | None = None,
+    drop_approvals: bool = False,
 ) -> dict[str, Any]:
     """Update an OPEN pull request's title and/or description.
 
@@ -703,9 +728,35 @@ def pr_update(
     repo_update's description contract so a deliberate clear isn't collapsed
     into a no-op.
 
-    At least one of `title` / `description` must be supplied; a PUT with an
-    empty body would be a no-op round-trip, so it's rejected at the boundary
-    before burning an API call.
+    `add_reviewers` / `remove_reviewers` change who is asked to review an
+    EXISTING PR. Bitbucket has no add-a-reviewer endpoint: the PUT REPLACES
+    the whole `reviewers` array, so sending just the person being added
+    would silently unassign everyone else. Both options therefore read the
+    PR first and send the full resulting list.
+
+    That read-modify-write has a race: a reviewer added by someone else
+    between the GET and the PUT is lost. Bitbucket exposes no ETag or
+    if-match on this endpoint, so the window cannot be closed here; it is
+    narrow and the operation is trivially repeatable.
+
+    Deliberately absent: a wholesale "set the reviewers to exactly this"
+    option. Replace is the operation that silently discards other people's
+    work, and add/remove composes to the same result with each change
+    stated explicitly. Adding someone already on the PR is a no-op rather
+    than a duplicate, so both are idempotent.
+
+    `drop_approvals` guards the destructive half. Removing a reviewer who
+    has already APPROVED discards that approval, and re-adding them does
+    not bring it back — Bitbucket resets their participant state. That is
+    not recoverable from the CLI, so it is refused unless the caller opts
+    in explicitly, matching the repo-wide rule that a destructive action is
+    never a default. Removing a reviewer who has NOT approved needs no
+    opt-in.
+
+    At least one of `title` / `description` / `add_reviewers` /
+    `remove_reviewers` must be supplied; a PUT with an empty body would be
+    a no-op round-trip, so it's rejected at the boundary before burning an
+    API call.
 
     Returns the updated PR record.
     """
@@ -727,10 +778,67 @@ def pr_update(
             )
         payload["description"] = description
 
+    to_add = (
+        _normalise_reviewer_uuids("add_reviewers", add_reviewers)
+        if add_reviewers is not None
+        else None
+    )
+    to_remove = (
+        _normalise_reviewer_uuids("remove_reviewers", remove_reviewers)
+        if remove_reviewers is not None
+        else None
+    )
+    # An empty list is a caller mistake rather than a meaningful request:
+    # "add nobody" / "remove nobody" would fall through to the
+    # at-least-one-field error below and report something confusing.
+    for label, values in (("add_reviewers", to_add), ("remove_reviewers", to_remove)):
+        if values is not None and not values:
+            raise ValueError(f"{label} was empty; nothing to change")
+
+    if to_add is not None or to_remove is not None:
+        pr_path = f"{_prs_root(workspace, repo)}/{pr_id}"
+        current = client.get(pr_path)
+        current_uuids = [
+            r["uuid"]
+            for r in (current.get("reviewers") or [])
+            if isinstance(r, dict) and r.get("uuid")
+        ]
+
+        removing = set(to_remove or [])
+        if removing:
+            # An approval is only visible on `participants`, not on
+            # `reviewers`, so the check reads the participant record for
+            # each person being removed.
+            approved_uuids = {
+                p["user"]["uuid"]
+                for p in (current.get("participants") or [])
+                if isinstance(p, dict)
+                and p.get("approved")
+                and isinstance(p.get("user"), dict)
+                and p["user"].get("uuid")
+            }
+            dropping_approvals = sorted(removing & approved_uuids)
+            if dropping_approvals and not drop_approvals:
+                raise ValueError(
+                    "refusing to remove reviewer(s) who have already approved: "
+                    f"{', '.join(dropping_approvals)}. Removing them discards "
+                    "the approval and re-adding them does not restore it. Pass "
+                    "drop_approvals=True to do it anyway."
+                )
+
+        # Order is deliberate: survivors keep their existing position and
+        # additions append, so a repeated call produces a stable list.
+        new_uuids = [u for u in current_uuids if u not in removing]
+        for uuid in to_add or []:
+            if uuid not in new_uuids:
+                new_uuids.append(uuid)
+
+        payload["reviewers"] = [{"uuid": u} for u in new_uuids]
+
     if not payload:
         raise ValueError(
             "pr_update requires at least one field to change "
-            "(title and/or description)"
+            "(title, description, add_reviewers and/or remove_reviewers)"
         )
 
     return client.put(f"{_prs_root(workspace, repo)}/{pr_id}", json_body=payload)

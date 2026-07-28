@@ -212,6 +212,43 @@ capture -- members
 check_contains "members: truncation is disclosed"   "showing first 100"
 check_contains "members: points at the MCP tool"    "members_list"
 
+# A deactivated account still appears in the member list and can still be
+# sent as a reviewer, where it is dead weight on the PR. It is marked
+# inline rather than via a column that would read "active" on every row.
+scenario 200 "{\"values\":[
+  {\"user\":{\"display_name\":\"Ada Lovelace\",\"nickname\":\"ada\",\"uuid\":\"${U1}\",\"account_status\":\"active\"}},
+  {\"user\":{\"display_name\":\"Gone Person\",\"nickname\":\"gone\",\"uuid\":\"${U2}\",\"account_status\":\"inactive\"}}
+]}"
+capture -- members
+check_contains     "members: inactive account is marked"   "Gone Person (inactive)"
+check_not_contains "members: active account is not marked" "Ada Lovelace (inactive)"
+
+# The request must ask for account_status on the SAME call; a per-member
+# lookup would be an N+1 on a listing.
+if grep -q "fields=%2Bvalues.user.account_status" "$REQLOG"; then
+    ok "members: account_status requested inline (no N+1)"
+else
+    OUT="$(cat "$REQLOG")"; RC=0
+    failmsg "members: account_status requested inline (no N+1)" "fields param missing from the request"
+fi
+
+# Two accounts can share BOTH display name and nickname, differing only by
+# uuid (observed live, and neither deactivated — so the inactive marker
+# does not disambiguate this). Picking by name is then a coin flip, and
+# the wrong pick assigns review to someone who will never look at it.
+scenario 200 "{\"values\":[
+  {\"user\":{\"display_name\":\"Sam Twin\",\"nickname\":\"sam\",\"uuid\":\"${U1}\"}},
+  {\"user\":{\"display_name\":\"Sam Twin\",\"nickname\":\"sam\",\"uuid\":\"${U2}\"}}
+]}"
+capture -- members
+check_contains "members: collision is disclosed"      "shared by more than"
+check_contains "members: collision names the remedy"  "differ only by UUID"
+
+# No collision, no noise.
+scenario 200 "$MEMBERS_JSON"
+capture -- members
+check_not_contains "members: no collision warning when names are unique" "shared by more than"
+
 echo ""
 echo "== pr-create --reviewer: UUID reaches the request body =="
 

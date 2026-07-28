@@ -933,6 +933,11 @@ class TestPullRequestTools:
         assert recorder.calls[0][1] == {
             "title": "New title",
             "description": "New body.",
+            # Reviewer args default to "no change" so a title/description
+            # update never touches who is assigned.
+            "add_reviewers": None,
+            "remove_reviewers": None,
+            "drop_approvals": False,
         }
         assert out["pr"]["title"] == "New title"
         assert out["pr_id"] == 42
@@ -946,7 +951,13 @@ class TestPullRequestTools:
         recorder = _recorder({"id": 42})
         with patch.object(bb_ops, "pr_update", recorder):
             mcp_server.pr_update(pr_id=42, repo="my-repo", title="Only title")
-        assert recorder.calls[0][1] == {"title": "Only title", "description": None}
+        assert recorder.calls[0][1] == {
+            "title": "Only title",
+            "description": None,
+            "add_reviewers": None,
+            "remove_reviewers": None,
+            "drop_approvals": False,
+        }
 
     def test_pr_update_empty_description_not_collapsed_to_none(
         self, stub_client: bb_api.BBClient
@@ -957,8 +968,69 @@ class TestPullRequestTools:
         recorder = _recorder({"id": 42})
         with patch.object(bb_ops, "pr_update", recorder):
             mcp_server.pr_update(pr_id=42, repo="my-repo", description="")
-        assert recorder.calls[0][1] == {"title": None, "description": ""}
+        assert recorder.calls[0][1] == {
+            "title": None,
+            "description": "",
+            "add_reviewers": None,
+            "remove_reviewers": None,
+            "drop_approvals": False,
+        }
 
+
+    # --- pr_update reviewers (issue #57) ---
+
+    def test_pr_update_passes_reviewer_args_through(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder({"id": 42})
+        with patch.object(bb_ops, "pr_update", recorder):
+            out = mcp_server.pr_update(
+                42,
+                repo="my-repo",
+                add_reviewers=["{a}"],
+                remove_reviewers=["{b}"],
+                drop_approvals=True,
+            )
+        kwargs = recorder.calls[0][1]
+        assert kwargs["add_reviewers"] == ["{a}"]
+        assert kwargs["remove_reviewers"] == ["{b}"]
+        assert kwargs["drop_approvals"] is True
+        assert out["ok"] is True
+
+    def test_pr_update_drop_approvals_defaults_false(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """Discarding someone's approval is destructive, so the opt-in must
+        default off — the repo-wide rule that a destructive action is never
+        a default."""
+        recorder = _recorder({"id": 42})
+        with patch.object(bb_ops, "pr_update", recorder):
+            mcp_server.pr_update(42, repo="my-repo", remove_reviewers=["{b}"])
+        assert recorder.calls[0][1]["drop_approvals"] is False
+
+    def test_pr_update_reviewers_default_none_not_empty_list(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """None means "leave reviewers alone". An empty list would mean
+        "change them", which for remove_reviewers is rejected downstream —
+        defaulting to [] would break every title-only update."""
+        recorder = _recorder({"id": 42})
+        with patch.object(bb_ops, "pr_update", recorder):
+            mcp_server.pr_update(42, repo="my-repo", title="T")
+        kwargs = recorder.calls[0][1]
+        assert kwargs["add_reviewers"] is None
+        assert kwargs["remove_reviewers"] is None
+
+    def test_pr_update_approval_refusal_surfaces_as_envelope(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        def _boom(*a: object, **k: object) -> None:
+            raise ValueError("refusing to remove reviewer(s) who have already approved: {b}")
+        with patch.object(bb_ops, "pr_update", _boom):
+            out = mcp_server.pr_update(42, repo="my-repo", remove_reviewers=["{b}"])
+        assert out["ok"] is False
+        assert "already approved" in out["message"]
+        assert out["pr_id"] == 42
     def test_pr_update_threads_pr_id_on_error(
         self, stub_client: bb_api.BBClient
     ) -> None:
