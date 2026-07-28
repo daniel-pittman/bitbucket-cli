@@ -1102,14 +1102,26 @@ def pr_update(
     repo: str = "",
     title: str | None = None,
     description: str | None = None,
+    add_reviewers: list[str] | None = None,
+    remove_reviewers: list[str] | None = None,
+    drop_approvals: bool = False,
 ) -> dict[str, Any]:
-    """Update an OPEN pull request's title and/or description.
+    """Update an OPEN pull request: title, description, and/or reviewers.
 
     Bitbucket's PR mutation endpoint is a PUT to the same path pr_show GETs
     (there is no PATCH for the pullrequests resource in Bitbucket Cloud).
     Only the supplied fields change — the PUT merges them into the existing
-    PR, preserving the source/destination branches and reviewers. Only open
-    pull requests can be mutated.
+    PR, preserving the source and destination branches. Only open pull
+    requests can be mutated.
+
+    Reviewers are the exception to that merge: the PUT REPLACES the whole
+    `reviewers` array, so `add_reviewers` / `remove_reviewers` read the PR
+    first and send the full resulting list. Do NOT try to add a reviewer by
+    passing a one-element list to some other tool — sending a bare list
+    would unassign everyone else.
+
+    Use this to assign review AFTER a PR exists (pr_create takes reviewers
+    only at creation time). Resolve people to UUIDs with `members_list`.
 
     Args:
         pr_id: Pull request ID.
@@ -1122,9 +1134,22 @@ def pr_update(
             `""` (empty string) = intentionally CLEAR the body; any other
             string = set it. This three-way distinction matches repo_update
             so a deliberate clear isn't collapsed into a no-op.
+        add_reviewers: Account UUIDs to ADD, keeping the existing reviewers.
+            Someone already on the PR is a no-op, not a duplicate.
+        remove_reviewers: Account UUIDs to REMOVE, keeping everyone else.
+        drop_approvals: Removing a reviewer who has already APPROVED
+            discards that approval, and re-adding them does not restore it.
+            That is refused unless this is True. Removing a reviewer who has
+            not approved needs no opt-in. Leave False unless the user has
+            asked for exactly that.
 
-    At least one of `title` / `description` must be supplied. Returns the
-    updated PR record under `pr`.
+    There is deliberately no "set reviewers to exactly this" option: replace
+    is the operation that silently discards other people's approvals, and
+    add/remove composes to the same result with each change stated.
+
+    At least one of `title` / `description` / `add_reviewers` /
+    `remove_reviewers` must be supplied. Returns the updated PR record
+    under `pr`.
     """
     try:
         client, workspace, repo_slug = _resolve_repo(repo)
@@ -1139,6 +1164,9 @@ def pr_update(
             pr_id,
             title=title,
             description=description,
+            add_reviewers=add_reviewers,
+            remove_reviewers=remove_reviewers,
+            drop_approvals=drop_approvals,
         )
         return {
             "ok": True,

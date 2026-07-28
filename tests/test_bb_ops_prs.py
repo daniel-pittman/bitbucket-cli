@@ -1046,3 +1046,221 @@ class TestPrUpdate:
         with pytest.raises(ValueError, match="pr_id"):
             bb_ops.pr_update(_client(opener), "acme", "widget-service", 0)
         assert opener.calls == []
+
+
+# ===========================================================================
+# pr_update — reviewers (issue #57)
+# ===========================================================================
+
+
+def _pr_with_reviewers(
+    pr_id: int,
+    reviewer_uuids: list[str],
+    approved_uuids: list[str] | None = None,
+) -> dict[str, Any]:
+    """A PR record carrying the two arrays the reviewer logic reads.
+
+    The split matters and is the reason this fixture exists: the CURRENT
+    reviewer list is `.reviewers[].uuid`, but whether someone APPROVED is
+    only on `.participants[]`. Code that looks for approval on `.reviewers`
+    finds nothing and silently discards approvals.
+    """
+    approved = set(approved_uuids or [])
+    return {
+        "id": pr_id,
+        "title": "Existing title",
+        "reviewers": [
+            {"type": "user", "uuid": u, "display_name": f"User {u}"}
+            for u in reviewer_uuids
+        ],
+        "participants": [
+            {
+                "type": "participant",
+                "role": "REVIEWER",
+                "approved": u in approved,
+                "state": "approved" if u in approved else None,
+                "user": {"type": "user", "uuid": u, "display_name": f"User {u}"},
+            }
+            for u in reviewer_uuids
+        ],
+    }
+
+
+_A = "{aaaaaaaa-1111-2222-3333-444444444444}"
+_B = "{bbbbbbbb-1111-2222-3333-444444444444}"
+_C = "{cccccccc-1111-2222-3333-444444444444}"
+
+
+class TestPrUpdateReviewers:
+    def _url(self, pr_id: int) -> str:
+        return _prs_url() + f"/{pr_id}"
+
+    def test_add_reviewer_preserves_existing(self) -> None:
+        """The defining behaviour. The PUT replaces the whole array, so
+        adding C must resend A and B; a naive implementation that sends
+        only [C] silently unassigns them."""
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A, _B]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, add_reviewers=[_C]
+        )
+        # First call reads the PR, second writes it.
+        assert opener.calls[0]["method"] == "GET"
+        assert opener.calls[0]["url"] == self._url(42)
+        put = opener.calls[1]
+        assert put["method"] == "PUT"
+        assert put["body"]["reviewers"] == [
+            {"uuid": _A},
+            {"uuid": _B},
+            {"uuid": _C},
+        ]
+
+    def test_add_existing_reviewer_is_idempotent(self) -> None:
+        # Re-adding someone already on the PR must not duplicate them.
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A, _B]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, add_reviewers=[_B]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}, {"uuid": _B}]
+
+    def test_remove_reviewer_keeps_the_others(self) -> None:
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A, _B, _C]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, remove_reviewers=[_B]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}, {"uuid": _C}]
+
+    def test_add_and_remove_compose(self) -> None:
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A, _B]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            add_reviewers=[_C],
+            remove_reviewers=[_A],
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _B}, {"uuid": _C}]
+
+    def test_removing_everyone_sends_empty_list(self) -> None:
+        # Clearing the reviewers is legitimate; it must send [] rather than
+        # omitting the key (which would leave the reviewers untouched).
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, remove_reviewers=[_A]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == []
+
+    def test_refuses_to_remove_an_approver(self) -> None:
+        """Removing someone who approved discards the approval and
+        re-adding them does not restore it, so it is refused without an
+        explicit opt-in. Nothing may be written."""
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A, _B], approved_uuids=[_B])])
+        with pytest.raises(ValueError) as exc:
+            bb_ops.pr_update(
+                _client(opener), "acme", "widget-service", 42, remove_reviewers=[_B]
+            )
+        assert "already approved" in str(exc.value)
+        assert _B in str(exc.value)
+        # The GET happened; the PUT must not have.
+        assert [c["method"] for c in opener.calls] == ["GET"]
+
+    def test_drop_approvals_opts_in(self) -> None:
+        opener = _CaptureOpener(
+            [_pr_with_reviewers(42, [_A, _B], approved_uuids=[_B]), _make_pr(42)]
+        )
+        bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            remove_reviewers=[_B],
+            drop_approvals=True,
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}]
+
+    def test_removing_a_non_approver_needs_no_opt_in(self) -> None:
+        # The guard must be scoped to approvers. Refusing every removal
+        # would make the flag useless for its main case.
+        opener = _CaptureOpener(
+            [_pr_with_reviewers(42, [_A, _B], approved_uuids=[_B]), _make_pr(42)]
+        )
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, remove_reviewers=[_A]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _B}]
+
+    def test_approval_is_read_from_participants_not_reviewers(self) -> None:
+        """`.reviewers[]` carries no `approved` field at all, so a guard
+        that reads it there sees nothing and lets the removal through.
+        This pins that the participant record is the source."""
+        pr = _pr_with_reviewers(42, [_A], approved_uuids=[_A])
+        assert "approved" not in pr["reviewers"][0]
+        opener = _CaptureOpener([pr])
+        with pytest.raises(ValueError):
+            bb_ops.pr_update(
+                _client(opener), "acme", "widget-service", 42, remove_reviewers=[_A]
+            )
+
+    def test_no_reviewer_args_issues_no_extra_get(self) -> None:
+        # A title-only update must not pay for the read-modify-write.
+        opener = _CaptureOpener([_make_pr(42)])
+        bb_ops.pr_update(_client(opener), "acme", "widget-service", 42, title="T")
+        assert [c["method"] for c in opener.calls] == ["PUT"]
+
+    def test_reviewers_combine_with_title(self) -> None:
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            title="New title",
+            add_reviewers=[_C],
+        )
+        body = opener.calls[1]["body"]
+        assert body["title"] == "New title"
+        assert body["reviewers"] == [{"uuid": _A}, {"uuid": _C}]
+
+    def test_handles_pr_with_no_reviewers(self) -> None:
+        opener = _CaptureOpener([{"id": 42, "title": "t"}, _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, add_reviewers=[_A]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}]
+
+    def test_rejects_bare_string_reviewers(self) -> None:
+        # A str is an Iterable[str] yielding CHARACTERS: without this the
+        # typo becomes one reviewer per character.
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError) as exc:
+            bb_ops.pr_update(
+                _client(opener), "acme", "widget-service", 42, add_reviewers=_A
+            )
+        assert "not a bare string" in str(exc.value)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad", [[""], ["   "], [None], [42]])
+    def test_rejects_bad_reviewer_values_no_network(self, bad: Any) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.pr_update(
+                _client(opener), "acme", "widget-service", 42, add_reviewers=bad
+            )
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("field", ["add_reviewers", "remove_reviewers"])
+    def test_rejects_empty_reviewer_list(self, field: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError) as exc:
+            bb_ops.pr_update(
+                _client(opener), "acme", "widget-service", 42, **{field: []}
+            )
+        assert "nothing to change" in str(exc.value)
+        assert opener.calls == []
+
+    def test_still_requires_at_least_one_field(self) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError) as exc:
+            bb_ops.pr_update(_client(opener), "acme", "widget-service", 42)
+        assert "at least one field" in str(exc.value)
+        assert opener.calls == []

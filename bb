@@ -1237,9 +1237,13 @@ cmd_pr_view() {
 
     echo ""
     echo "  Reviewers:"
+    # UUID alongside the name: display names are not unique in a workspace
+    # (two accounts can share name AND nickname), and the uuid is what
+    # --reviewer / --remove-reviewer take, so printing it here makes the
+    # list directly actionable instead of requiring a second `bb members`.
     echo "$response" | jq -r '
-        if (.reviewers | length) == 0 then "    (none)"
-        else .reviewers[] | "    - " + .display_name
+        if ((.reviewers // []) | length) == 0 then "    (none)"
+        else .reviewers[] | "    - " + (.display_name // "?") + "  " + (.uuid // "?")
         end
     '
 
@@ -1472,21 +1476,36 @@ cmd_pr_create() {
 
 cmd_pr_update() {
     # bb pr-update [repo] <pr-id> [--title TEXT] [--description TEXT | --description-file PATH]
+    #              [--reviewer UUID ...] [--remove-reviewer UUID ...] [--drop-approvals]
     #
-    # Updates an OPEN pull request's title and/or description via PUT to
+    # Updates an OPEN pull request via PUT to
     # /repositories/{ws}/{slug}/pullrequests/{id} — the same path `bb pr`
     # GETs. Only the fields supplied go in the body; the PUT merges them
-    # into the existing PR, preserving source/destination branches and
-    # reviewers (Bitbucket keeps omitted PR fields on this endpoint). The
-    # method is PUT, not PATCH: Bitbucket Cloud has no PATCH for the
-    # pullrequests resource. Parity with bb_ops.pr_update.
+    # into the existing PR, preserving source/destination branches
+    # (Bitbucket keeps omitted PR fields on this endpoint). The method is
+    # PUT, not PATCH: Bitbucket Cloud has no PATCH for the pullrequests
+    # resource. Parity with bb_ops.pr_update.
+    #
+    # Reviewers are the exception to that merge: the PUT REPLACES the whole
+    # reviewers array, so --reviewer / --remove-reviewer read the PR first
+    # and send the full resulting list. Sending only the person being added
+    # would silently unassign everyone else.
+    #
+    # There is deliberately no "set the reviewers to exactly this" flag:
+    # replace is the operation that silently discards other people's
+    # approvals, and add/remove composes to the same result with each
+    # change stated explicitly.
     #
     # [repo] accepts the same shapes as every other PR command (bare slug,
     # ws/slug, or omitted for git-origin auto-detect). At least one of
-    # --title / --description / --description-file must be supplied.
+    # --title / --description / --description-file / --reviewer /
+    # --remove-reviewer must be supplied.
     local title="" description="" desc_file=""
     local have_title="" have_description="" have_desc_file=""
+    local drop_approvals=""
     local -a positionals=()
+    local -a add_reviewers=()
+    local -a remove_reviewers=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1496,6 +1515,11 @@ cmd_pr_update() {
             --description=*)      description="${1#*=}"; have_description=1; shift ;;
             --description-file)   _require_flag_value "$@"; desc_file="$2"; have_desc_file=1; shift 2 ;;
             --description-file=*) desc_file="${1#*=}"; have_desc_file=1; shift ;;
+            --reviewer)           _require_flag_value "$@"; _require_reviewer_uuid "$2"; add_reviewers+=("$2"); shift 2 ;;
+            --reviewer=*)         _require_reviewer_uuid "${1#*=}"; add_reviewers+=("${1#*=}"); shift ;;
+            --remove-reviewer)    _require_flag_value "$@"; _require_reviewer_uuid "$2"; remove_reviewers+=("$2"); shift 2 ;;
+            --remove-reviewer=*)  _require_reviewer_uuid "${1#*=}"; remove_reviewers+=("${1#*=}"); shift ;;
+            --drop-approvals)     drop_approvals=1; shift ;;
             -*)
                 echo "Error: unknown flag for pr-update: $1" >&2
                 exit 1 ;;
@@ -1534,12 +1558,16 @@ cmd_pr_update() {
     # round-trip. Gate on the have_* flags (not `-n "$value"`) so an
     # intentional clear (`--description ""`) still counts as a change.
     # Reject BEFORE resolving the repo so the usage error needs no API call.
-    if [[ -z "$have_title" && -z "$have_description" ]]; then
+    if [[ -z "$have_title" && -z "$have_description" \
+          && "${#add_reviewers[@]}" -eq 0 && "${#remove_reviewers[@]}" -eq 0 ]]; then
         echo "Usage: bb pr-update [repo] <pr-id> [--title TEXT] [--description TEXT | --description-file PATH]" >&2
+        echo "                    [--reviewer UUID ...] [--remove-reviewer UUID ...] [--drop-approvals]" >&2
         echo "" >&2
-        echo "  Updates an OPEN pull request's title and/or description." >&2
-        echo "  At least one of --title / --description / --description-file" >&2
-        echo "  is required. [repo] is auto-detected from git origin if omitted." >&2
+        echo "  Updates an OPEN pull request's title, description and/or reviewers." >&2
+        echo "  At least one of --title / --description / --description-file /" >&2
+        echo "  --reviewer / --remove-reviewer is required." >&2
+        echo "  Reviewer UUIDs come from 'bb members'." >&2
+        echo "  [repo] is auto-detected from git origin if omitted." >&2
         exit 1
     fi
 
@@ -1577,6 +1605,59 @@ cmd_pr_update() {
         payload=$(echo "$payload" | jq --arg d "$description" '. + {description: $d}')
     fi
 
+    # Reviewer changes need the CURRENT list: the PUT replaces the whole
+    # array, so the request has to carry every reviewer who should remain.
+    # This read-modify-write has a race (a reviewer added by someone else
+    # between the GET and the PUT is lost). Bitbucket exposes no ETag or
+    # if-match on this endpoint, so the window cannot be closed here; it is
+    # narrow and the operation is trivially repeatable. Parity with
+    # bb_ops.pr_update, which reads the same way.
+    if [[ "${#add_reviewers[@]}" -gt 0 || "${#remove_reviewers[@]}" -gt 0 ]]; then
+        local current rc_get=0
+        current=$(bb_get "$(repo_path "$repo")/pullrequests/${pr_id}") || rc_get=$?
+        if [[ "$rc_get" -ne 0 ]]; then
+            echo "  Could not read PR #${pr_id}'s current reviewers; nothing was changed." >&2
+            exit "$rc_get"
+        fi
+
+        # An approval is recorded on `participants`, not on `reviewers`, so
+        # the guard reads the participant record for each person being
+        # removed. Removing an approver discards the approval and re-adding
+        # them does not restore it, so it is refused without an explicit
+        # opt-in (the repo-wide rule: a destructive action is never a
+        # default).
+        if [[ "${#remove_reviewers[@]}" -gt 0 && -z "$drop_approvals" ]]; then
+            local approved_hits
+            approved_hits=$(echo "$current" | jq -r --args '
+                [.participants[]? | select(.approved) | .user.uuid] as $approved
+                | [$ARGS.positional[] | select(. as $u | $approved | index($u))]
+                | join(", ")
+            ' -- "${remove_reviewers[@]}")
+            if [[ -n "$approved_hits" ]]; then
+                echo "Error: refusing to remove reviewer(s) who have already approved:" >&2
+                echo "  ${approved_hits}" >&2
+                echo "  Removing them discards the approval, and re-adding them does" >&2
+                echo "  not restore it. Pass --drop-approvals to do it anyway." >&2
+                exit 1
+            fi
+        fi
+
+        # Survivors keep their existing order and additions append, so a
+        # repeated call produces a stable list. Adding someone already on
+        # the PR is a no-op rather than a duplicate.
+        local merged
+        merged=$(echo "$current" | jq -c --args \
+            --argjson nremove "${#remove_reviewers[@]}" '
+            [.reviewers[]?.uuid] as $current
+            | ($ARGS.positional[:$nremove]) as $remove
+            | ($ARGS.positional[$nremove:]) as $add
+            | [$current[] | select(. as $u | ($remove | index($u)) | not)] as $kept
+            | $kept + [$add[] | select(. as $u | ($kept | index($u)) | not)]
+            | map({uuid: .})
+        ' -- "${remove_reviewers[@]+"${remove_reviewers[@]}"}" "${add_reviewers[@]+"${add_reviewers[@]}"}")
+        payload=$(echo "$payload" | jq --argjson r "$merged" '. + {reviewers: $r}')
+    fi
+
     echo "Updating PR #${pr_id}..."
 
     # rc-capture pattern (same as cmd_pr_create): a 4xx (wrong id, PR not
@@ -1594,6 +1675,18 @@ cmd_pr_update() {
     pr_url=$(echo "$response" | jq -r '.links.html.href // empty')
 
     echo "Updated PR #${pr_id}: ${new_title}"
+    # Echo the resulting reviewer list back. The whole point of the flags is
+    # who is on the PR now, and the response already carries it — reading it
+    # back is what turns "the call succeeded" into "the right people are
+    # assigned". Names can collide in a workspace, so print the uuid too.
+    if [[ "${#add_reviewers[@]}" -gt 0 || "${#remove_reviewers[@]}" -gt 0 ]]; then
+        echo "  Reviewers now:"
+        echo "$response" | jq -r '
+            if ((.reviewers // []) | length) == 0 then "    (none)"
+            else .reviewers[] | "    - " + (.display_name // "?") + "  " + (.uuid // "?")
+            end
+        '
+    fi
     [[ -n "$pr_url" ]] && echo "  ${pr_url}"
 }
 
@@ -2076,8 +2169,12 @@ cmd_members() {
     echo "Members of ${BB_WORKSPACE}:"
     echo ""
 
+    # `fields=+values.user.account_status` asks for one extra field on the
+    # SAME request rather than a per-member lookup, so marking deactivated
+    # accounts costs no extra call. The `+` must be percent-encoded or it
+    # is read as a space in the query string.
     local response rc=0
-    response=$(bb_get "/workspaces/${BB_WORKSPACE}/members?pagelen=100") || rc=$?
+    response=$(bb_get "/workspaces/${BB_WORKSPACE}/members?pagelen=100&fields=%2Bvalues.user.account_status") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         exit "$rc"
     fi
@@ -2087,12 +2184,39 @@ cmd_members() {
     printf "  %-28s %-20s %s\n" "DISPLAY NAME" "NICKNAME" "UUID"
     printf "  %-28s %-20s %s\n" "------------" "--------" "----"
 
+    # A deactivated account still appears in the member list and can still
+    # be sent as a reviewer, where it is dead weight on the PR. Mark it
+    # inline rather than adding a column that would read "active" on every
+    # row of a healthy workspace. `account_status` is absent when the API
+    # does not return it, which reads as unmarked.
     echo "$response" | jq -r '
         .values[] | .user |
-        [(.display_name // "-"), (.nickname // "-"), (.uuid // "-")] | @tsv
+        [
+          (.display_name // "-") + (if (.account_status // "active") != "active" then " (inactive)" else "" end),
+          (.nickname // "-"),
+          (.uuid // "-")
+        ] | @tsv
     ' | while IFS=$'\t' read -r display nickname uuid; do
         printf "  %-28s %-20s %s\n" "$display" "$nickname" "$uuid"
     done
+
+    # Two accounts can share BOTH display name and nickname, differing only
+    # by uuid (observed in a live workspace, and neither was deactivated —
+    # so "mark the inactive one" does not disambiguate this). Picking by
+    # name is then a coin flip, and the wrong pick assigns review to someone
+    # who will never look at it. Say so explicitly instead of leaving two
+    # identical-looking rows.
+    local collisions
+    collisions=$(echo "$response" | jq -r '
+        [.values[].user | (.display_name // "-") + "\u0000" + (.nickname // "-")]
+        | group_by(.) | map(select(length > 1)) | length
+    ')
+    if [[ "$collisions" != "0" ]]; then
+        echo "" >&2
+        echo "  Note: ${collisions} display name/nickname pair(s) are shared by more than" >&2
+        echo "  one account above. They differ only by UUID, so confirm which account" >&2
+        echo "  you mean before using it as a reviewer." >&2
+    fi
 
     # Same single-page convention (and same honest truncation notice) as
     # cmd_projects / cmd_repos / cmd_workspaces. A workspace with more than
@@ -3288,6 +3412,11 @@ PULL REQUESTS
                                           from bb members)
   bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                         Update a PR title and/or description
+                                          opt: --reviewer UUID (repeatable; adds,
+                                          keeping existing reviewers)
+                                          opt: --remove-reviewer UUID (repeatable)
+                                          opt: --drop-approvals (allow removing a
+                                          reviewer who already approved)
   bb pr-approve [repo] <id>             Approve a PR
   bb pr-unapprove [repo] <id>           Remove your approval on a PR
   bb pr-merge [repo] <id> [strategy]    Merge a PR (merge_commit|squash|fast_forward)

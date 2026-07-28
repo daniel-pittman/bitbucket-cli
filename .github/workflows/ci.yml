@@ -80,6 +80,15 @@ jobs:
       - name: members + pr-create --reviewer (host bash)
         run: bash tests/bash/test_members_and_reviewers.sh
 
+      # `bb pr-update` reviewer changes. The PR PUT REPLACES the reviewers
+      # array, so every assertion reads the actual request body: sending
+      # only the added person silently unassigns everyone else and still
+      # returns 200. Also pins that removing an already-approved reviewer is
+      # refused BEFORE the write, since a guard that fires after it is
+      # worthless. Needs curl + jq + git + python3.
+      - name: pr-update reviewers (host bash)
+        run: bash tests/bash/test_pr_update_reviewers.sh
+
   syntax:
     runs-on: ubuntu-latest
     strategy:

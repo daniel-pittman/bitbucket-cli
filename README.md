@@ -20,7 +20,7 @@ The bash CLI has no dependencies beyond `curl` and `jq`. The MCP server adds Pyt
 - **Pull Requests**: Create, view, approve, unapprove, merge, decline, diff, comment
 - **Repositories**: List repos, view details, list/show branches, list recent commits
 - **Browser Integration**: Quick-open any resource in your browser
-- **MCP server**: 42 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
+- **MCP server**: 43 tools covering the full surface, plus git-context wrappers (current branch, status, recent commits, uncommitted changes) for agent workflows
 
 ## Requirements
 
@@ -233,6 +233,9 @@ bb pr-create [--repo R] <title> [dest]  # Create PR from current branch
                                       #   opt: --reviewer UUID (repeatable; bb members)
 bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                       # Update a PR title and/or description
+                                      #   opt: --reviewer UUID (repeatable; adds)
+                                      #   opt: --remove-reviewer UUID (repeatable)
+                                      #   opt: --drop-approvals
 bb pr-approve [repo] <id>             # Approve a PR
 bb pr-merge [repo] <id> [strategy]    # Merge a PR (merge_commit|squash|fast_forward)
                                       #   opt: --close-source-branch
@@ -259,11 +262,33 @@ bb pr-create "Add widget cache" develop \
     --reviewer "{66666666-7777-8888-9999-000000000000}"
 ```
 
+Reviewers can also be changed after the PR exists, which is how review
+actually gets assigned:
+
+```bash
+bb pr-update 42 --reviewer "{6666...}"          # add, keeping the existing ones
+bb pr-update 42 --remove-reviewer "{1111...}"   # remove, keeping everyone else
+```
+
+Bitbucket's PR update **replaces** the whole reviewer array, so both flags read
+the PR first and send the full resulting list; sending only the person being
+added would silently unassign everyone else. Adding someone already on the PR is
+a no-op, not a duplicate.
+
+There is deliberately no "set the reviewers to exactly this" flag. Replace is the
+operation that silently discards other people's approvals, and add/remove
+composes to the same result with each change stated explicitly. Relatedly,
+removing a reviewer who has **already approved** discards that approval and
+re-adding them does not restore it, so it is refused unless you pass
+`--drop-approvals`. Removing a reviewer who has not approved needs no opt-in.
+
 `--reviewer` is repeatable and takes the UUID column verbatim (braces optional).
 A name or nickname is rejected locally, before any request, with a pointer back
 to `bb members` — Bitbucket would only answer that with a 400. `bb members`
 lists the first 100 members and says so when there are more; the MCP
-`members_list` tool paginates.
+`members_list` tool paginates. Deactivated accounts are marked `(inactive)`,
+and `bb members` warns when two accounts share a display name **and** nickname,
+which happens and leaves the UUID as the only thing telling them apart.
 
 **PR body.** Supply it with `--description "..."`, `--description-file PATH`,
 or a file redirect `bb pr-create "<title>" <dest> < body.md`. `pr-create` never
