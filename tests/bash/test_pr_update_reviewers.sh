@@ -247,6 +247,20 @@ set_pr "" "$A"
 run -- pr-update acme/widget 42 --remove-reviewer "$C"
 check_put "remove non-reviewer: list unchanged" '[.reviewers[].uuid] | join(",")' "$A"
 
+# A bare (unbraced) UUID is explicitly accepted by the validator, but the
+# API returns reviewers BRACED. If the value is stored raw, the string
+# comparison matches nothing and the removal silently no-ops with exit 0.
+BARE_A="aaaaaaaa-1111-2222-3333-444444444444"
+set_pr "" "$A" "$B"
+run -- pr-update acme/widget 42 --remove-reviewer "$BARE_A"
+check_put "remove by bare uuid still removes" '[.reviewers[].uuid] | join(",")' "$B"
+
+# Same shape on the add side: a bare add must dedup against the braced
+# entry already on the PR rather than appending a second copy.
+set_pr "" "$A"
+run -- pr-update acme/widget 42 --reviewer "$BARE_A"
+check_put "add by bare uuid does not duplicate" '.reviewers | length' "1"
+
 echo ""
 echo "== approvals are not discarded silently =="
 

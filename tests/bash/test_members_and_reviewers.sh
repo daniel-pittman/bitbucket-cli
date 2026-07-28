@@ -293,10 +293,14 @@ check_json "reviewer + description: description kept" '.description'       "BODY
 check_json "reviewer + description: reviewer kept"    '.reviewers[0].uuid' "$U1"
 check_json "reviewer + description: base fields kept" '.destination.branch.name' "develop"
 
-# A bare (unbraced) UUID is accepted: users routinely strip the braces.
+# A bare (unbraced) UUID is accepted, and is CANONICALISED to the braced
+# form the API uses. Accepting both forms is only safe if they converge:
+# pr-update compares these strings against reviewers/participants from a
+# live response, which are always braced, so a bare value left as-is would
+# match nothing there (silent no-op removal, duplicate on add).
 BARE="11111111-2222-3333-4444-555555555555"
 body_json -- pr-create --repo acme/widget "Bare uuid" develop --reviewer "$BARE"
-check_json "bare (unbraced) uuid accepted" '.reviewers[0].uuid' "$BARE"
+check_json "bare uuid canonicalised to braced form" '.reviewers[0].uuid' "$U1"
 
 echo ""
 echo "== pr-create --reviewer: bad values fail locally, before any request =="

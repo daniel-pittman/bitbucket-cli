@@ -1228,6 +1228,38 @@ class TestPrUpdateReviewers:
         )
         assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}]
 
+    def test_bare_uuid_is_canonicalised_for_removal(self) -> None:
+        """A caller-supplied uuid may arrive unbraced (people strip the
+        braces when copying), but the API always returns them braced. If
+        the value is compared raw it matches nothing, so the removal
+        silently no-ops and reports success."""
+        bare = _A.strip("{}")
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A, _B]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, remove_reviewers=[bare]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _B}]
+
+    def test_bare_uuid_dedups_on_add(self) -> None:
+        # The milder half of the same bug: a bare add against a braced
+        # existing entry would append a duplicate.
+        bare = _A.strip("{}")
+        opener = _CaptureOpener([_pr_with_reviewers(42, [_A]), _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, add_reviewers=[bare]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}]
+
+    def test_non_uuid_shaped_values_pass_through_untouched(self) -> None:
+        """Canonicalisation must not wrap arbitrary strings in braces: this
+        layer does not validate uuid format (the bash _require_* sibling
+        does), and mangling an unrecognised value would corrupt it."""
+        opener = _CaptureOpener([{"id": 42, "reviewers": []}, _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener), "acme", "widget-service", 42, add_reviewers=["alice-uuid"]
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": "alice-uuid"}]
+
     def test_rejects_bare_string_reviewers(self) -> None:
         # A str is an Iterable[str] yielding CHARACTERS: without this the
         # typo becomes one reviewer per character.

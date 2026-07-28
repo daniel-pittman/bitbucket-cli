@@ -18,6 +18,8 @@ before invoking these ops.
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -653,22 +655,43 @@ def pr_create(
         # which would silently produce `[{"uuid":"a"}, {"uuid":"l"}, ...]`
         # from `reviewers="alice-uuid"`. Reject explicitly so the typo
         # fails locally rather than as a 400 from Bitbucket.
-        if isinstance(reviewers, str):
-            raise ValueError(
-                f"reviewers must be a list/tuple of uuids, not a bare string. "
-                f"Got {reviewers!r}; did you mean [{reviewers!r}]?"
-            )
-        normalised: list[dict[str, str]] = []
-        for uuid in reviewers:
-            if not isinstance(uuid, str) or not uuid:
-                raise ValueError(
-                    f"reviewer uuids must be non-empty strings, got {uuid!r}"
-                )
-            normalised.append({"uuid": uuid})
-        if normalised:
-            payload["reviewers"] = normalised
+        # Same helper pr_update uses, so both paths validate identically
+        # AND canonicalise a bare uuid to the braced form the API returns.
+        uuids = _normalise_reviewer_uuids("reviewers", reviewers)
+        if uuids:
+            payload["reviewers"] = [{"uuid": u} for u in uuids]
 
     return client.post(_prs_root(workspace, repo), json_body=payload)
+
+
+# Bitbucket account UUIDs, as returned by members_list and on a PR's
+# reviewers/participants, are BRACED: {8-4-4-4-12}. Callers routinely strip
+# the braces when copying one by hand.
+_UUID_RE = re.compile(
+    r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$"
+)
+
+
+def _canonical_reviewer_uuid(value: str) -> str:
+    """Return a uuid in the braced form the API uses.
+
+    pr_update's reviewer arithmetic compares caller-supplied uuids against
+    `.reviewers[].uuid` and `.participants[].user.uuid` from a live
+    response, all of which are braced. A bare uuid would therefore match
+    nothing: the removal would silently no-op and an add would append a
+    duplicate. Converging both forms here is what makes accepting either
+    one safe.
+
+    Anything that is not uuid-shaped is returned untouched — this layer
+    does not validate format (the bash `_require_*` sibling does), and
+    wrapping an unrecognised string in braces would corrupt it.
+    """
+    stripped = value.strip()
+    if not _UUID_RE.match(stripped):
+        return value
+    core = stripped[1:-1] if stripped.startswith("{") and stripped.endswith("}") else stripped
+    return "{" + core + "}"
 
 
 def _normalise_reviewer_uuids(label: str, values: Iterable[str]) -> list[str]:
@@ -689,7 +712,7 @@ def _normalise_reviewer_uuids(label: str, values: Iterable[str]) -> list[str]:
             raise ValueError(
                 f"{label} uuids must be non-empty strings, got {uuid!r}"
             )
-        out.append(uuid)
+        out.append(_canonical_reviewer_uuid(uuid))
     return out
 
 
