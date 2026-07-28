@@ -63,6 +63,15 @@ jobs:
       - name: pr-create parsing + no-hang regressions (host bash)
         run: bash tests/bash/test_pr_create_parsing.sh
 
+      # API-error reporting + the repo `project` field. Drives bb against a
+      # local mock that returns scripted statuses and bodies, so it needs
+      # curl + jq + python3 and runs on the host runner. Guards the property
+      # that made `curl -sf` a defect: a failed request must print the API's
+      # own explanation (including the required/granted scopes on a 403)
+      # without leaking the token, and must keep exit 22.
+      - name: API-error reporting + repo project (host bash)
+        run: bash tests/bash/test_error_reporting.sh
+
   syntax:
     runs-on: ubuntu-latest
     strategy:
