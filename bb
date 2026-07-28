@@ -540,6 +540,18 @@ _require_reviewer_uuid() {
         echo "  Run 'bb members' to list workspace members and their UUIDs." >&2
         exit 1
     fi
+    # Canonicalise to the BRACED form, which is what the API returns. The
+    # reviewer-set arithmetic in pr-update compares these strings against
+    # `.reviewers[].uuid` and `.participants[].user.uuid` from a live
+    # response, so an accepted-but-bare value would match nothing: the
+    # removal would silently no-op and an add would append a duplicate.
+    # Accepting both forms only works if they converge here.
+    #
+    # Set in the CALLER's scope rather than echoed: `exit 1` inside a
+    # `$( )` command substitution kills only the subshell, so a rejected
+    # value would slip through as an empty string. Same reason resolve_repo
+    # assigns instead of printing.
+    REVIEWER_UUID="{${core}}"
 }
 
 _require_workspace() {
@@ -1304,8 +1316,8 @@ cmd_pr_create() {
             --description=*)      description="${1#*=}"; have_description=1; shift ;;
             --description-file)   _require_flag_value "$@"; desc_file="$2"; have_desc_file=1; shift 2 ;;
             --description-file=*) desc_file="${1#*=}"; have_desc_file=1; shift ;;
-            --reviewer)           _require_flag_value "$@"; _require_reviewer_uuid "$2"; reviewers+=("$2"); shift 2 ;;
-            --reviewer=*)         _require_reviewer_uuid "${1#*=}"; reviewers+=("${1#*=}"); shift ;;
+            --reviewer)           _require_flag_value "$@"; _require_reviewer_uuid "$2"; reviewers+=("$REVIEWER_UUID"); shift 2 ;;
+            --reviewer=*)         _require_reviewer_uuid "${1#*=}"; reviewers+=("$REVIEWER_UUID"); shift ;;
             -*)
                 echo "Error: unknown flag for pr-create: $1" >&2
                 exit 1
@@ -1515,10 +1527,10 @@ cmd_pr_update() {
             --description=*)      description="${1#*=}"; have_description=1; shift ;;
             --description-file)   _require_flag_value "$@"; desc_file="$2"; have_desc_file=1; shift 2 ;;
             --description-file=*) desc_file="${1#*=}"; have_desc_file=1; shift ;;
-            --reviewer)           _require_flag_value "$@"; _require_reviewer_uuid "$2"; add_reviewers+=("$2"); shift 2 ;;
-            --reviewer=*)         _require_reviewer_uuid "${1#*=}"; add_reviewers+=("${1#*=}"); shift ;;
-            --remove-reviewer)    _require_flag_value "$@"; _require_reviewer_uuid "$2"; remove_reviewers+=("$2"); shift 2 ;;
-            --remove-reviewer=*)  _require_reviewer_uuid "${1#*=}"; remove_reviewers+=("${1#*=}"); shift ;;
+            --reviewer)           _require_flag_value "$@"; _require_reviewer_uuid "$2"; add_reviewers+=("$REVIEWER_UUID"); shift 2 ;;
+            --reviewer=*)         _require_reviewer_uuid "${1#*=}"; add_reviewers+=("$REVIEWER_UUID"); shift ;;
+            --remove-reviewer)    _require_flag_value "$@"; _require_reviewer_uuid "$2"; remove_reviewers+=("$REVIEWER_UUID"); shift 2 ;;
+            --remove-reviewer=*)  _require_reviewer_uuid "${1#*=}"; remove_reviewers+=("$REVIEWER_UUID"); shift ;;
             --drop-approvals)     drop_approvals=1; shift ;;
             -*)
                 echo "Error: unknown flag for pr-update: $1" >&2
