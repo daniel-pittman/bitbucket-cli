@@ -1250,6 +1250,27 @@ class TestPrUpdateReviewers:
         )
         assert opener.calls[1]["body"]["reviewers"] == [{"uuid": _A}]
 
+    @pytest.mark.parametrize(
+        "half_braced",
+        [
+            "{aaaaaaaa-1111-2222-3333-444444444444",
+            "aaaaaaaa-1111-2222-3333-444444444444}",
+        ],
+    )
+    def test_half_braced_uuid_is_not_mangled(self, half_braced: str) -> None:
+        """An unbalanced brace is malformed, not an accepted alternate form.
+        Canonicalisation must leave it alone rather than re-wrapping it into
+        `{{aaaa…}`, which is neither what the caller typed nor a valid uuid."""
+        opener = _CaptureOpener([{"id": 42, "reviewers": []}, _make_pr(42)])
+        bb_ops.pr_update(
+            _client(opener),
+            "acme",
+            "widget-service",
+            42,
+            add_reviewers=[half_braced],
+        )
+        assert opener.calls[1]["body"]["reviewers"] == [{"uuid": half_braced}]
+
     def test_non_uuid_shaped_values_pass_through_untouched(self) -> None:
         """Canonicalisation must not wrap arbitrary strings in braces: this
         layer does not validate uuid format (the bash _require_* sibling
