@@ -667,10 +667,15 @@ def pr_create(
 # Bitbucket account UUIDs, as returned by members_list and on a PR's
 # reviewers/participants, are BRACED: {8-4-4-4-12}. Callers routinely strip
 # the braces when copying one by hand.
-_UUID_RE = re.compile(
-    r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$"
+# Braces must be BALANCED. `\{?...\}?` would also match a half-braced
+# `{aaaa…` (leading brace, no closer), which then fails the matched-pair
+# strip below and gets re-wrapped into `{{aaaa…}` — mangling input the
+# docstring promises to return untouched.
+_UUID_CORE = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+_UUID_RE = re.compile(r"^(?:\{" + _UUID_CORE + r"\}|" + _UUID_CORE + r")$")
 
 
 def _canonical_reviewer_uuid(value: str) -> str:
