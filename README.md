@@ -160,6 +160,34 @@ export BB_TOKEN="your-api-token"
 export BB_WORKSPACE="your-workspace"
 ```
 
+Two optional variables affect diagnostics rather than auth:
+
+| Variable | Effect |
+|---|---|
+| `BB_DEBUG=1` | Traces every request to stderr as `[bb] GET /path -> 200`. The token is never part of a URL, so nothing sensitive is traced. |
+| `BB_API_BASE` | Overrides the API root (default `https://api.bitbucket.org/2.0`). Honoured by both the CLI and the MCP server. |
+
+### When a request fails
+
+A failed request prints Bitbucket's own explanation, not a guess. The most
+useful case is a missing token scope, where the API names both the scope it
+needs and the scopes the token actually carries:
+
+```
+$ bb workspaces
+Error: HTTP 403 on GET /user/workspaces
+  Your credentials lack one or more required privilege scopes.
+  required scopes: read:workspace:bitbucket
+  granted scopes:  read:repository:bitbucket, read:pullrequest:bitbucket
+  A token's scopes are fixed at creation. To add one, create or
+  rotate the token at
+  https://id.atlassian.com/manage-profile/security/api-tokens
+```
+
+Exit codes are unchanged: `22` for any HTTP status >= 400, curl's own exit
+code for a connectivity failure (which is reported as such, never as an API
+rejection).
+
 ## Usage
 
 ```
@@ -256,7 +284,9 @@ bb vars delete [scope] [repo] <KEY>   # Delete a pipeline variable (destructive)
 
 `bb environments` lists a repo's deployment environments (the named targets a pipeline deploys to: Test / Staging / Production). `bb environment-create <name> [--type Test|Staging|Production]` adds one (default type `Test`); `bb environment-delete <name>` removes it by name. Each environment carries its own deployment variables, managed via `bb vars [set] --deployment <env>`. Create and delete need `admin:pipeline:bitbucket` scope.
 
-`bb projects` lists a workspace's projects (KEY and NAME). The KEY is what `--project` expects on `bb repo-create` and `bb repo-update`. The workspace defaults to the resolved one (`-w` / git origin / `BB_WORKSPACE`); pass an explicit `[workspace]` to list another's. Needs `read:project:bitbucket` scope. See [Required Bitbucket Permissions](#required-bitbucket-permissions).
+`bb repo` shows a repository's project as `Project: KEY (Name)`, and `bb repos` carries a `PROJECT` column of keys. Both read the field from the response they already fetch, so neither costs an extra call, and both answer "which project is this repo in?" without a detour to the API. A repo in a workspace that does not use projects reads `(none)` / `-`. This matters because `bb repo-update --project KEY` can change a repo's project: without a way to read the value back, setting the wrong key looks exactly like setting the right one.
+
+`bb projects` lists a workspace's projects (KEY and NAME). The KEY is what `--project` expects on `bb repo-create` and `bb repo-update`. The workspace defaults to the resolved one (`-w` / git origin / `BB_WORKSPACE`); pass an explicit `[workspace]` to list another's. Needs `read:project:bitbucket` scope, which `bb repo` does NOT (a repo's own project comes back on the repository record). See [Required Bitbucket Permissions](#required-bitbucket-permissions).
 
 ```bash
 bb projects                # projects in the resolved workspace

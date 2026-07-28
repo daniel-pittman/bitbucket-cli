@@ -89,42 +89,181 @@ load_config() {
 }
 
 # --- API helpers ---
+#
+# curl's `-f` is deliberately absent from every request below. `-f`
+# suppresses the response body on 4xx/5xx, and Bitbucket's error body is
+# the only place the actual cause appears: a 403 names the exact scope
+# the token is missing AND the scopes it carries, under
+# `error.detail.{required,granted}`. Discarding that leaves a bare exit
+# code, which is why commands used to compensate with hardcoded guesses
+# ("if this is a 403, the token probably lacks X") that were speculative
+# and wrong whenever the real cause differed (expired token, wrong
+# workspace slug, deleted resource, rate limit).
+#
+# `-f`'s exit-code contract is preserved so callers do not have to
+# change: HTTP >= 400 returns 22, transport failures (DNS / TLS /
+# connection refused) return curl's own exit code. Only stderr gains the
+# real message.
+#
+# --fail-with-body would do this in one flag but needs curl 7.76+ (2021);
+# the status is captured via `-w` instead so the floor stays where the
+# rest of the script's (bash 3.2 / macOS system tooling) floor is.
+
+# Redact credential-shaped substrings from anything echoed to the
+# terminal: the token itself, and URL-embedded `user:secret@host` forms
+# an upstream proxy or redirect target could echo back. Mirrors the
+# Python `_safe_text` chokepoint, so a leak through an error body needs
+# a new vector on both surfaces rather than just one.
+_redact() {
+    local text="$1"
+    if [[ -n "${BB_TOKEN:-}" ]]; then
+        text="${text//"$BB_TOKEN"/[redacted]}"
+    fi
+    printf '%s' "$text" | sed -E 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]+:[^/@[:space:]]*@#\1[redacted]@#g'
+}
+
+# Print the API's own explanation of a failed request to stderr.
+# Bitbucket's envelope is {"type":"error","error":{"message":…,"detail":…}}
+# where `detail` is either a string or, for a scope denial, the object
+# {"required":[…],"granted":[…]} — the single most actionable payload the
+# API returns, and the reason this function exists.
+_print_api_error() {
+    local status="$1" body="$2" method="$3" path="$4"
+    echo "Error: HTTP ${status} on ${method} ${path}" >&2
+
+    local msg detail required granted excerpt
+    if msg=$(printf '%s' "$body" | jq -re '.error.message' 2>/dev/null); then
+        echo "  $(_redact "$msg")" >&2
+
+        detail=$(printf '%s' "$body" \
+            | jq -r 'if (.error.detail | type) == "string" then .error.detail else empty end' \
+            2>/dev/null) || detail=""
+        if [[ -n "$detail" ]]; then
+            echo "  $(_redact "$detail")" >&2
+        fi
+
+        required=$(printf '%s' "$body" \
+            | jq -r '(.error.detail.required // []) | join(", ")' 2>/dev/null) || required=""
+        granted=$(printf '%s' "$body" \
+            | jq -r '(.error.detail.granted // []) | join(", ")' 2>/dev/null) || granted=""
+        if [[ -n "$required" ]]; then
+            echo "  required scopes: ${required}" >&2
+        fi
+        if [[ -n "$granted" ]]; then
+            echo "  granted scopes:  ${granted}" >&2
+        fi
+    elif [[ -n "$body" ]]; then
+        # Not a Bitbucket error envelope (an HTML error page from a proxy,
+        # a gateway timeout, ...). A bounded excerpt still beats silence.
+        excerpt="${body:0:500}"
+        echo "  $(_redact "$excerpt")" >&2
+        if [[ "${#body}" -gt 500 ]]; then
+            echo "  ... (body truncated at 500 characters)" >&2
+        fi
+    fi
+
+    # Scopes are fixed when a token is issued: granting one later does not
+    # apply to an already-issued token, so a 401/403 always ends at the
+    # same place. This is the only non-API text printed here, and it is
+    # not a guess about the cause — the cause is quoted above it.
+    if [[ "$status" == "401" ]]; then
+        echo "  The token is invalid, expired, or revoked. Issue a new one at" >&2
+        echo "  https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+    elif [[ "$status" == "403" ]]; then
+        echo "  A token's scopes are fixed at creation. To add one, create or" >&2
+        echo "  rotate the token at" >&2
+        echo "  https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+    fi
+    return 0
+}
+
+# Perform a request and echo the response body with the HTTP status
+# appended on its own line. Prints no diagnosis of its own (beyond the
+# BB_DEBUG trace) so callers can decide what a given status means —
+# `bb pipelines-status`, for instance, treats 404 as "never configured"
+# rather than an error. Returns curl's exit code on a transport failure.
+#
+# Body and status are recovered with the suffix/prefix split below rather
+# than by reading two streams. The status is appended LAST because an
+# empty body (a 204, say) then still yields a parseable "\n204" — leading
+# a response with the status would collapse to an unsplittable "204".
+_bb_http() {
+    local method="$1" path="$2" data="${3:-}"
+    shift 3
+    local -a args
+    args=(-s -w '\n%{http_code}' -u "${BB_USER}:${BB_TOKEN}")
+    if [[ "$method" != "GET" ]]; then
+        args+=(-X "$method")
+    fi
+    if [[ -n "$data" ]]; then
+        args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+
+    local raw rc=0
+    raw=$(curl "${args[@]}" "${BB_API}${path}" "$@") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Error: request failed before any HTTP response (curl exit ${rc})." >&2
+        echo "  ${method} ${path}" >&2
+        echo "  This is a connectivity error, not an API rejection." >&2
+        return "$rc"
+    fi
+
+    if [[ -n "${BB_DEBUG:-}" ]]; then
+        # Endpoint + status only. The token is never part of a URL (it
+        # rides in the Basic auth header), so nothing here is sensitive.
+        echo "[bb] ${method} ${path} -> ${raw##*$'\n'}" >&2
+    fi
+
+    printf '%s' "$raw"
+}
+
+# The default policy over _bb_http: 2xx writes the body to stdout,
+# anything else reports the API's own error and returns 22.
+_bb_request() {
+    local method="$1" path="$2" data="${3:-}"
+    shift 3
+
+    local raw rc=0
+    raw=$(_bb_http "$method" "$path" "$data" "$@") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        return "$rc"
+    fi
+
+    local status="${raw##*$'\n'}"
+    local body="${raw%$'\n'*}"
+
+    case "$status" in
+        2*)
+            printf '%s' "$body"
+            ;;
+        *)
+            _print_api_error "$status" "$body" "$method" "$path"
+            return 22
+            ;;
+    esac
+}
 
 bb_get() {
     local path="$1"
     shift
-    curl -sf -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}" "$@"
+    _bb_request GET "$path" "" "$@"
 }
 
 bb_post() {
     local path="$1"
     local data="${2:-}"
-    if [[ -n "$data" ]]; then
-        curl -sf -u "${BB_USER}:${BB_TOKEN}" \
-            -X POST -H "Content-Type: application/json" \
-            -d "$data" "${BB_API}${path}"
-    else
-        curl -sf -u "${BB_USER}:${BB_TOKEN}" \
-            -X POST "${BB_API}${path}"
-    fi
+    _bb_request POST "$path" "$data"
 }
 
 bb_put() {
     local path="$1"
     local data="${2:-}"
-    if [[ -n "$data" ]]; then
-        curl -sf -u "${BB_USER}:${BB_TOKEN}" \
-            -X PUT -H "Content-Type: application/json" \
-            -d "$data" "${BB_API}${path}"
-    else
-        curl -sf -u "${BB_USER}:${BB_TOKEN}" \
-            -X PUT "${BB_API}${path}"
-    fi
+    _bb_request PUT "$path" "$data"
 }
 
 bb_delete() {
     local path="$1"
-    curl -sf -u "${BB_USER}:${BB_TOKEN}" -X DELETE "${BB_API}${path}"
+    _bb_request DELETE "$path" ""
 }
 
 # Resolve the (workspace, repo-slug) pair for a command from its
@@ -666,9 +805,17 @@ cmd_logs() {
     echo "Logs for step [${step_index}] ${step_name}:"
     echo ""
 
-    curl -sfL -u "${BB_USER}:${BB_TOKEN}" \
-        "${BB_API}$(repo_path "$repo")/pipelines/%7B${pipeline_uuid}%7D/steps/%7B${step_uuid}%7D/log" \
-        2>/dev/null || echo "(no log output available)"
+    # -L because a log can be served as a 307 to a signed object-store URL.
+    # `curl -L -u` does not resend credentials to a different host, so the
+    # Bitbucket Basic header never reaches the redirect target.
+    #
+    # A failure here used to be swallowed (`2>/dev/null` plus a fallback
+    # line), which reported "no log output" for a missing scope, an
+    # expired token, and a genuinely empty log alike. bb_get now prints
+    # the API's own reason first; the fallback line stays for the case
+    # where the request succeeded and the log really is empty.
+    bb_get "$(repo_path "$repo")/pipelines/%7B${pipeline_uuid}%7D/steps/%7B${step_uuid}%7D/log" -L \
+        || echo "(no log output available)"
 }
 
 cmd_pipeline_trigger() {
@@ -818,9 +965,6 @@ cmd_pipeline_trigger() {
     local response rc=0
     response=$(bb_post "$(repo_path "$repo")/pipelines/" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Trigger request failed for ${BB_WORKSPACE}/${repo} branch ${branch} (exit $rc)." >&2
-        echo "  Common causes: protected branch, custom pipeline name not" >&2
-        echo "  found, or invalid variable shape." >&2
         exit "$rc"
     fi
 
@@ -902,26 +1046,20 @@ cmd_pipelines_status() {
     resolve_repo "${1:-}"
 
     # The status command must distinguish a 404 ("never configured" — the
-    # normal pre-enable state, reported as disabled) from a 403 (token
-    # lacks read:pipeline:bitbucket) or any other error, which must be
-    # surfaced. The Python side (bb_ops.pipelines_config_show) translates
-    # ONLY a 404 and re-raises everything else. `bb_get` uses `curl -f`,
-    # which collapses every HTTP >=400 to exit 22 with no body, so it can't
-    # make that distinction. Do a single un-`-f`'d curl that writes the
-    # body to stdout with the status code appended on its own line, then
-    # split the two. One request (no re-probe), so there's no window where
-    # the state changes between two calls. Mirrors the auth + base that
-    # bb_get uses, so BB_API_BASE overrides still apply.
+    # normal pre-enable state, reported as disabled) from a 403 or any
+    # other error, which must be surfaced. The Python side
+    # (bb_ops.pipelines_config_show) translates ONLY a 404 and re-raises
+    # everything else. `bb_get` applies the default policy (any non-2xx is
+    # an error), so this reads the status directly via `_bb_http` and
+    # decides for itself. One request (no re-probe), so there's no window
+    # where the state changes between two calls.
     local path raw code body rc=0
     path="$(repo_path "$repo")/pipelines_config"
     # `|| rc=$?` so a transport-level curl failure (DNS, TLS, connection
-    # refused — NOT an HTTP error, since we don't pass -f) surfaces a
-    # friendly message instead of tripping `set -e` and exiting silently.
-    raw=$(curl -s -w '\n%{http_code}' \
-        -u "${BB_USER}:${BB_TOKEN}" "${BB_API}${path}") || rc=$?
+    # refused — NOT an HTTP status) exits with curl's code; _bb_http has
+    # already explained it.
+    raw=$(_bb_http GET "$path" "") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Could not read pipelines config (curl exit $rc)." >&2
-        echo "  This looks like a connectivity error (not an HTTP response)." >&2
         exit "$rc"
     fi
     code="${raw##*$'\n'}"     # last line: the HTTP status code
@@ -937,10 +1075,7 @@ cmd_pipelines_status() {
             echo "Pipelines: disabled (never configured) for ${BB_WORKSPACE}/${repo}"
             ;;
         *)
-            echo "Could not read pipelines config (HTTP ${code})." >&2
-            if [[ "$code" == "403" ]]; then
-                echo "  The token lacks read:pipeline:bitbucket scope." >&2
-            fi
+            _print_api_error "$code" "$body" "GET" "$path"
             exit 22
             ;;
     esac
@@ -958,9 +1093,6 @@ _pipelines_set_enabled() {
     local response rc=0
     response=$(bb_put "$(repo_path "$repo")/pipelines_config" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Pipelines $([[ "$enabled" == "true" ]] && echo enable || echo disable) failed (exit $rc)." >&2
-        echo "  Common cause: the token lacks admin:pipeline:bitbucket scope" >&2
-        echo "  (write:pipeline:bitbucket alone is not enough)." >&2
         exit "$rc"
     fi
     local now
@@ -1286,9 +1418,6 @@ cmd_pr_create() {
     local response rc=0
     response=$(bb_post "$(repo_path "$repo")/pullrequests" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "PR-create request failed (exit $rc)." >&2
-        echo "  Common causes: dest branch typo, a PR with this source" >&2
-        echo "  branch is already open, source branch not pushed." >&2
         exit "$rc"
     fi
 
@@ -1412,12 +1541,10 @@ cmd_pr_update() {
     # rc-capture pattern (same as cmd_pr_create): a 4xx (wrong id, PR not
     # open, empty title, missing scope) makes bb_put exit non-zero and
     # `set -e` would silently abort after the banner without this guard.
+    # bb_put has already printed the API's reason.
     local response rc=0
     response=$(bb_put "$(repo_path "$repo")/pullrequests/${pr_id}" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "PR-update request failed for PR #${pr_id} (exit $rc)." >&2
-        echo "  Common causes: the PR id is wrong or the PR is not open," >&2
-        echo "  the title is empty, or the token lacks pull-request write scope." >&2
         exit "$rc"
     fi
 
@@ -1539,9 +1666,6 @@ cmd_pr_merge() {
         echo "Merged PR #${pr_id} (${strategy})"
     else
         local rc=$?
-        echo "Merge request failed for PR #${pr_id} (exit $rc)." >&2
-        echo "  Common causes: unresolved comments, failing required" >&2
-        echo "  builds, or wrong merge strategy for this repo." >&2
         exit $rc
     fi
 }
@@ -1579,8 +1703,7 @@ cmd_pr_diff() {
     # `curl -L -u` does NOT resend credentials to a different host by
     # default, so the cross-host credential-leak concern is already
     # mitigated by curl semantics.
-    curl -sfL -u "${BB_USER}:${BB_TOKEN}" \
-        "${BB_API}$(repo_path "$repo")/pullrequests/${pr_id}/diff"
+    bb_get "$(repo_path "$repo")/pullrequests/${pr_id}/diff" -L
 }
 
 cmd_pr_comments() {
@@ -1763,12 +1886,9 @@ cmd_workspaces() {
     # (effective 2026-04-14). Workspace-scoped (no BB_WORKSPACE
     # involvement), so no -w override applies here.
     #
-    # Requires `read:workspace:bitbucket` scope on the API token.
-    # A token granted only repository/pullrequest/pipeline scopes
-    # returns 403 — bb_get (`curl -sf`) exits non-zero WITHOUT printing
-    # the body, so we can't echo Bitbucket's exact message; instead we
-    # name the scope unconditionally on the error path so the user
-    # knows the fix regardless.
+    # Requires `read:workspace:bitbucket` scope on the API token. A token
+    # granted only repository/pullrequest/pipeline scopes returns 403,
+    # whose body names the required and granted scopes; bb_get prints it.
     if [[ $# -gt 0 ]]; then
         echo "Usage: bb workspaces   (takes no arguments)" >&2
         exit 1
@@ -1780,22 +1900,16 @@ cmd_workspaces() {
     # Capture rc via `|| rc=$?` rather than `if ! cmd; then rc=$?`.
     # The `!`-negation form sets $? to the LOGICAL NEGATION of the
     # command's status (always 0 for a failing command), so the real
-    # curl exit code is unrecoverable inside an `if !` block — verified
-    # on bash 3.2 and 5.x. curl -f exits 22 on an HTTP >=400 response;
-    # other codes are transport-level (DNS, connection, TLS).
+    # exit code is unrecoverable inside an `if !` block — verified on
+    # bash 3.2 and 5.x. bb_get exits 22 on an HTTP >=400 response; other
+    # codes are transport-level (DNS, connection, TLS).
+    #
+    # bb_get has already printed the API's own explanation (for a 403,
+    # the scope it needs and the ones the token carries), so this only
+    # has to preserve the exit code.
     local response rc=0
     response=$(bb_get "/user/workspaces?pagelen=100") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Workspace listing failed (exit $rc)." >&2
-        if [[ "$rc" -eq 22 ]]; then
-            echo "If this is a 403, the token lacks the read:workspace:bitbucket" >&2
-            echo "scope. Rotate it at" >&2
-            echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
-            echo "with that scope checked (existing scopes stay as they are)." >&2
-        else
-            echo "This looks like a connectivity error (not an HTTP response)." >&2
-            echo "Check your network and that api.bitbucket.org is reachable." >&2
-        fi
         exit "$rc"
     fi
 
@@ -1837,9 +1951,8 @@ cmd_projects() {
     # origin / BB_WORKSPACE just like cmd_repos.
     #
     # Requires the `read:project:bitbucket` scope on the API token. A
-    # token without it returns 403; bb_get (`curl -sf`) exits non-zero
-    # WITHOUT printing the body, so we name the scope on the error path
-    # so the user knows the fix regardless.
+    # token without it returns 403, whose body names the required and
+    # granted scopes; bb_get prints it.
     # Precedence: a -w flag (BB_WORKSPACE_OVERRIDE) is the most explicit
     # signal and wins; otherwise an explicit positional [workspace] wins
     # over the git-origin / BB_WORKSPACE default. resolve_workspace owns
@@ -1862,22 +1975,13 @@ cmd_projects() {
     echo "Projects in ${BB_WORKSPACE}:"
     echo ""
 
-    # Capture rc via `|| rc=$?` (not `if ! cmd`) so curl's real exit code
-    # survives — same idiom as cmd_workspaces. curl -f exits 22 on HTTP
-    # >=400; other codes are transport-level.
+    # Capture rc via `|| rc=$?` (not `if ! cmd`) so the real exit code
+    # survives — same idiom as cmd_workspaces. bb_get exits 22 on HTTP
+    # >=400 having already printed the API's explanation; other codes are
+    # transport-level.
     local response rc=0
     response=$(bb_get "/workspaces/${BB_WORKSPACE}/projects?pagelen=100") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Project listing failed (exit $rc)." >&2
-        if [[ "$rc" -eq 22 ]]; then
-            echo "If this is a 403, the token lacks the read:project:bitbucket" >&2
-            echo "scope. Rotate it at" >&2
-            echo "https://id.atlassian.com/manage-profile/security/api-tokens" >&2
-            echo "with that scope checked (existing scopes stay as they are)." >&2
-        else
-            echo "This looks like a connectivity error (not an HTTP response)." >&2
-            echo "Check your network and that api.bitbucket.org is reachable." >&2
-        fi
         exit "$rc"
     fi
 
@@ -1910,18 +2014,22 @@ cmd_repos() {
     local response
     response=$(bb_get "/repositories/${BB_WORKSPACE}?pagelen=100&sort=-updated_on")
 
-    printf "  %-35s %-12s %s\n" "REPO" "UPDATED" "LANGUAGE"
-    printf "  %-35s %-12s %s\n" "----" "-------" "--------"
+    printf "  %-35s %-12s %-12s %s\n" "REPO" "UPDATED" "PROJECT" "LANGUAGE"
+    printf "  %-35s %-12s %-12s %s\n" "----" "-------" "-------" "--------"
 
+    # PROJECT is the project KEY, which is what `--project` expects on
+    # repo-create / repo-update. It rides along on the listing response,
+    # so the column costs no extra call.
     echo "$response" | jq -r '
         .values[] |
         [
             .slug,
             (.updated_on | split("T") | .[0]),
+            (.project.key // "-"),
             (.language // "-")
         ] | @tsv
-    ' | while IFS=$'\t' read -r slug updated lang; do
-        printf "  %-35s %-12s %s\n" "$slug" "$updated" "$lang"
+    ' | while IFS=$'\t' read -r slug updated project lang; do
+        printf "  %-35s %-12s %-12s %s\n" "$slug" "$updated" "$project" "$lang"
     done
 }
 
@@ -1932,9 +2040,16 @@ cmd_repo() {
     local response
     response=$(bb_get "$(repo_path "$repo")")
 
+    # `project` comes back on this same GET, so showing it costs no extra
+    # call. It is displayed because `bb repo-update --project KEY` can SET
+    # a repo's project: a field that can be written but not read makes a
+    # wrong value invisible, and project keys are not reliably the obvious
+    # abbreviation of the project name. Repos in workspaces that do not
+    # use projects have no `project` at all, hence the "(none)" fallback.
     echo "$response" | jq -r '
         .full_name + " - " + (.description // "(no description)"),
         "",
+        "  Project:     " + (if .project then (.project.key // "?") + " (" + (.project.name // "?") + ")" else "(none)" end),
         "  Language:    " + (.language // "n/a"),
         "  Created:     " + .created_on,
         "  Updated:     " + .updated_on,
@@ -2043,10 +2158,6 @@ cmd_repo_create() {
     local response rc=0
     response=$(bb_post "$path" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Repo-create request failed (exit $rc)." >&2
-        echo "  Common causes: a repo with this slug already exists, the" >&2
-        echo "  workspace requires a --project KEY, or the token lacks" >&2
-        echo "  repository:admin scope." >&2
         exit "$rc"
     fi
 
@@ -2145,10 +2256,6 @@ cmd_repo_update() {
     local response rc=0
     response=$(bb_put "$path" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Repo-update request failed (exit $rc)." >&2
-        echo "  Common causes: the target --project KEY doesn't exist in" >&2
-        echo "  the workspace, the repo slug is wrong, or the token lacks" >&2
-        echo "  admin:repository:bitbucket scope (write alone is not enough)." >&2
         exit "$rc"
     fi
 
@@ -2314,9 +2421,6 @@ cmd_environment_create() {
     local response rc=0
     response=$(bb_post "$(repo_path "$repo")/environments/" "$payload") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Environment create failed (exit $rc)." >&2
-        echo "  Common cause: a same-named environment already exists, or the" >&2
-        echo "  token lacks admin:pipeline:bitbucket scope." >&2
         exit "$rc"
     fi
     local created_name uuid
@@ -2370,8 +2474,6 @@ cmd_environment_delete() {
     local rc=0
     bb_delete "$(repo_path "$repo")/environments/${encoded}/" > /dev/null || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "Environment delete failed for '$name' (exit $rc)." >&2
-        echo "  The token may lack admin:pipeline:bitbucket scope." >&2
         exit "$rc"
     fi
     echo "Deleted environment '${name}' from ${BB_WORKSPACE}/${repo}"
@@ -2563,13 +2665,13 @@ cmd_vars() {
     echo "$(_vars_scope_label "$scope") variables for ${target}:"
     echo ""
 
-    # rc-capture so a 5xx / expired-token on the list surfaces a curated
-    # error instead of `set -e` aborting with only curl's stderr (parity
-    # with cmd_vars_set's lookup-failure handling).
+    # rc-capture so a 5xx / expired-token on the list exits on the spot
+    # rather than falling through to a jq parse of an empty response
+    # (parity with cmd_vars_set's lookup-failure handling). bb_get has
+    # already printed the API's reason.
     local response rc=0
     response=$(bb_get "${base}?pagelen=100") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "vars list failed (exit $rc). Check token scope / connectivity." >&2
         exit "$rc"
     fi
 
@@ -2742,9 +2844,12 @@ cmd_vars_set() {
         local page rc=0
         page=$(bb_get "$page_url") || rc=$?
         if [[ "$rc" -ne 0 ]]; then
-            echo "vars-set lookup failed (exit $rc) while checking for an" >&2
-            echo "  existing '${key}'. Aborting before any write to avoid" >&2
-            echo "  creating a duplicate. Check token scope / connectivity." >&2
+            # State what the failure MEANS for the write, which the API
+            # response cannot know: the lookup that decides create-vs-update
+            # never completed, so nothing was written and no duplicate was
+            # created. bb_get already printed why the lookup failed.
+            echo "  The lookup for an existing '${key}' did not complete;" >&2
+            echo "  aborting before any write, so no duplicate was created." >&2
             exit "$rc"
         fi
         # Use jq's `first(...)` to emit at most one match rather than
@@ -2810,10 +2915,6 @@ cmd_vars_set() {
     fi
 
     if [[ "$rc" -ne 0 ]]; then
-        echo "vars-set request failed (exit $rc)." >&2
-        echo "  Common causes: token lacks admin:pipeline:bitbucket scope" >&2
-        echo "  (write:pipeline alone is not enough for any variable scope)," >&2
-        echo "  or the repo has no pipelines configuration yet." >&2
         exit "$rc"
     fi
 
@@ -2898,10 +2999,11 @@ cmd_vars_delete() {
         local page rc=0
         page=$(bb_get "$page_url") || rc=$?
         if [[ "$rc" -ne 0 ]]; then
-            echo "vars-delete lookup failed (exit $rc) while resolving '${key}'." >&2
-            echo "  Aborting before any delete. The token may lack" >&2
-            echo "  admin:pipeline:bitbucket scope (write:pipeline alone is not" >&2
-            echo "  enough for any variable scope), or check connectivity." >&2
+            # State what the failure means for the delete, which the API
+            # response cannot know: the key was never resolved to a UUID,
+            # so nothing was deleted.
+            echo "  The lookup resolving '${key}' did not complete;" >&2
+            echo "  aborting before any delete." >&2
             exit "$rc"
         fi
         local matched uuid_val
@@ -2938,9 +3040,6 @@ cmd_vars_delete() {
     encoded_uuid=$(_url_encode_segment "$existing_uuid")
     bb_delete "${base}${encoded_uuid}" > /dev/null || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        echo "vars-delete request failed (exit $rc)." >&2
-        echo "  The token may lack admin:pipeline:bitbucket scope" >&2
-        echo "  (write:pipeline alone is not enough for any variable scope)." >&2
         exit "$rc"
     fi
 
@@ -3151,6 +3250,9 @@ NOTES
   treated as the PR id and the repo is auto-detected (e.g. `bb pr 42` from
   inside the checkout). Pass `workspace/slug <id>` for an explicit repo.
   Config: ~/.config/bb/config or env vars BB_USER, BB_TOKEN, BB_WORKSPACE.
+  BB_DEBUG=1 traces each request as "[bb] METHOD /path -> status" on
+  stderr. Failed requests always print the API's own error, including the
+  required and granted token scopes on a 403.
 
   Auth uses Atlassian API tokens with HTTP Basic auth.
   BB_USER is your Bitbucket account email address.
