@@ -1552,3 +1552,145 @@ class TestCommitsList:
         )
         assert len(result) == 175
         assert "pagelen=100" in opener.calls[0]["url"]
+
+
+# ===========================================================================
+# members_list
+# ===========================================================================
+
+
+def _member_value(display: str, nickname: str, uuid: str) -> dict[str, Any]:
+    """Mirror the shape Bitbucket's /workspaces/{ws}/members returns: a
+    `workspace_membership` envelope whose `.user` carries the identifying
+    fields. Hand-authored from the documented/observed field set — the
+    identifiers are invented, never copied from a real workspace.
+
+    The nesting is the point: the UUID that `pr_create(reviewers=...)`
+    needs lives at `.user.uuid`, NOT at the top level, so a flattening
+    regression fails these tests rather than shipping."""
+    return {
+        "type": "workspace_membership",
+        "user": {
+            "type": "user",
+            "display_name": display,
+            "nickname": nickname,
+            "account_id": f"acct-{nickname}",
+            "uuid": uuid,
+            "links": {"self": {"href": f"https://api.bitbucket.org/2.0/users/{uuid}"}},
+        },
+        "workspace": {"type": "workspace", "slug": "acme"},
+        "links": {"self": {"href": "https://api.bitbucket.org/2.0/workspaces/acme"}},
+    }
+
+
+_M1 = "{11111111-2222-3333-4444-555555555555}"
+_M2 = "{66666666-7777-8888-9999-000000000000}"
+
+
+class TestMembersList:
+    def test_hits_workspace_members_endpoint(self) -> None:
+        # Must be /workspaces/{ws}/members — members are a workspace
+        # resource. /users/{ws}/members and /repositories/... are not it.
+        opener = _CaptureOpener(
+            [{"values": [_member_value("Ada L", "ada", _M1),
+                         _member_value("Grace H", "grace", _M2)]}]
+        )
+        result = bb_ops.members_list(_client(opener))
+        assert len(result) == 2
+        url = opener.calls[0]["url"]
+        assert url.startswith(DEFAULT_API_BASE + "/workspaces/acme/members?")
+        assert "pagelen=100" in url
+        assert opener.calls[0]["method"] == "GET"
+        assert opener.calls[0]["body"] is None
+
+    def test_returns_raw_membership_records_with_nested_user(self) -> None:
+        # The whole point of the op is resolving a person to the UUID
+        # `pr_create(reviewers=[...])` takes. Pin that it survives at
+        # `.user.uuid` rather than being flattened or dropped.
+        opener = _CaptureOpener([{"values": [_member_value("Ada L", "ada", _M1)]}])
+        result = bb_ops.members_list(_client(opener))
+        assert result[0]["user"]["uuid"] == _M1
+        assert result[0]["user"]["display_name"] == "Ada L"
+        assert result[0]["user"]["nickname"] == "ada"
+        assert result[0]["user"]["account_id"] == "acct-ada"
+
+    def test_uuid_is_accepted_by_pr_create_reviewers(self) -> None:
+        """The two ops have to agree on the identifier or the lookup is
+        useless: whatever members_list surfaces must be what pr_create
+        puts in the payload. This is the contract issue #55 exists for,
+        so it is asserted end to end rather than assumed."""
+        opener = _CaptureOpener([{"values": [_member_value("Ada L", "ada", _M1)]}])
+        members = bb_ops.members_list(_client(opener))
+        uuid = members[0]["user"]["uuid"]
+
+        post_opener = _CaptureOpener([{"id": 1}])
+        bb_ops.pr_create(
+            _client(post_opener),
+            "acme",
+            "widget-service",
+            title="T",
+            source_branch="feat/x",
+            reviewers=[uuid],
+        )
+        body = post_opener.calls[0]["body"]
+        assert body["reviewers"] == [{"uuid": _M1}]
+
+    def test_default_workspace_from_client(self) -> None:
+        opener = _CaptureOpener([{"values": [_member_value("Ada L", "ada", _M1)]}])
+        bb_ops.members_list(_client(opener))
+        assert opener.calls[0]["url"].startswith(
+            DEFAULT_API_BASE + "/workspaces/acme/members?"
+        )
+
+    def test_explicit_workspace_overrides_config(self) -> None:
+        opener = _CaptureOpener([{"values": [_member_value("Ada L", "ada", _M1)]}])
+        bb_ops.members_list(_client(opener), workspace="widget-co")
+        assert opener.calls[0]["url"].startswith(
+            DEFAULT_API_BASE + "/workspaces/widget-co/members?"
+        )
+
+    def test_count_walks_pages(self) -> None:
+        # A workspace big enough to paginate is exactly where a silent
+        # truncation would hide the person being looked up.
+        opener = _CaptureOpener(
+            [
+                {
+                    "values": [
+                        _member_value(f"P{i}", f"p{i}", f"{{uuid-{i}}}")
+                        for i in range(100)
+                    ],
+                    "next": DEFAULT_API_BASE + "/workspaces/acme/members?page=2",
+                },
+                {
+                    "values": [
+                        _member_value(f"P{i}", f"p{i}", f"{{uuid-{i}}}")
+                        for i in range(100, 130)
+                    ]
+                },
+            ]
+        )
+        result = bb_ops.members_list(_client(opener), count=130)
+        assert len(result) == 130
+        assert len(opener.calls) == 2
+        assert "page=2" in opener.calls[1]["url"]
+
+    def test_count_caps_response(self) -> None:
+        opener = _CaptureOpener(
+            [{"values": [_member_value(f"P{i}", f"p{i}", f"{{u{i}}}") for i in range(10)]}]
+        )
+        result = bb_ops.members_list(_client(opener), count=3)
+        assert len(result) == 3
+
+    @pytest.mark.parametrize("bad_ws", ["", "   ", "acme/widget", ".", ".."])
+    def test_rejects_bad_workspace_no_network(self, bad_ws: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.members_list(_client(opener), workspace=bad_ws)
+        assert opener.calls == []
+
+    @pytest.mark.parametrize("bad", [0, -1, "5", 1.5, True, None])
+    def test_rejects_bad_count_no_network(self, bad: Any) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError):
+            bb_ops.members_list(_client(opener), count=bad)
+        assert opener.calls == []

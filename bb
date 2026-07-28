@@ -518,6 +518,30 @@ _require_count() {
 # leading/trailing. That's intentional and safe for a workspace slug,
 # which can never legitimately contain a space — unlike a `--project KEY`,
 # where cmd_repo_update strips leading/trailing only (true `.strip()`).
+_require_reviewer_uuid() {
+    # Bitbucket identifies PR reviewers ONLY by account UUID. A display
+    # name or nickname is accepted by nothing, and sending one costs a
+    # round trip to learn that; reject it here with a pointer to the
+    # lookup instead. `bb members` prints the UUID column this wants.
+    #
+    # Both brace forms are accepted: `bb members` and the API emit the
+    # braced `{8-4-4-4-12}`, but users routinely strip the braces when
+    # copying. Exactly one MATCHED pair is stripped before the check, so a
+    # half-brace (`{abc…` with no closer) still fails.
+    local raw="${1:-}"
+    local core="$raw"
+    if [[ "$raw" == "{"*"}" ]]; then
+        core="${raw#\{}"
+        core="${core%\}}"
+    fi
+    if [[ ! "$core" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        echo "Error: --reviewer must be a Bitbucket account UUID (got '$raw')." >&2
+        echo "  Reviewers are identified by UUID, not by name or nickname." >&2
+        echo "  Run 'bb members' to list workspace members and their UUIDs." >&2
+        exit 1
+    fi
+}
+
 _require_workspace() {
     local ws="$1"
     local stripped
@@ -1242,6 +1266,7 @@ cmd_pr_view() {
 cmd_pr_create() {
     # bb pr-create [--repo REPO] <title> [dest-branch] [--close-source-branch]
     #              [--description TEXT | --description-file PATH]
+    #              [--reviewer UUID ...]
     #
     # <title> is the FIRST positional and dest the SECOND, so the common
     # `bb pr-create "<title>" <dest>` (repo auto-detected from git origin)
@@ -1256,11 +1281,16 @@ cmd_pr_create() {
     # on merge is destructive, so it is opt-in (--close-source-branch),
     # never automatic. Same stance `gh pr merge` takes with
     # --delete-branch. Parity with bb_ops.pr_create.
+    #
+    # --reviewer takes a Bitbucket account UUID and is repeatable. UUIDs
+    # are the only reviewer identifier the PR API accepts; `bb members`
+    # lists them. Parity with bb_ops.pr_create(reviewers=[...]).
     local close_source_branch="false"
     local repo_flag="" have_repo_flag=""
     local description="" desc_file=""
     local have_description="" have_desc_file=""
     local -a positionals=()
+    local -a reviewers=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --close-source-branch) close_source_branch="true"; shift ;;
@@ -1270,6 +1300,8 @@ cmd_pr_create() {
             --description=*)      description="${1#*=}"; have_description=1; shift ;;
             --description-file)   _require_flag_value "$@"; desc_file="$2"; have_desc_file=1; shift 2 ;;
             --description-file=*) desc_file="${1#*=}"; have_desc_file=1; shift ;;
+            --reviewer)           _require_flag_value "$@"; _require_reviewer_uuid "$2"; reviewers+=("$2"); shift 2 ;;
+            --reviewer=*)         _require_reviewer_uuid "${1#*=}"; reviewers+=("${1#*=}"); shift ;;
             -*)
                 echo "Error: unknown flag for pr-create: $1" >&2
                 exit 1
@@ -1326,6 +1358,7 @@ cmd_pr_create() {
     if [[ -z "$title" ]]; then
         echo "Usage: bb pr-create [--repo REPO] <title> [dest-branch] [--close-source-branch]" >&2
         echo "                    [--description TEXT | --description-file PATH]" >&2
+        echo "                    [--reviewer UUID ...]" >&2
         echo "" >&2
         echo "  Creates a PR from current branch (${source_branch}) to dest (default: main)." >&2
         echo "  <title> is the first positional; a repo is given with --repo" >&2
@@ -1334,6 +1367,7 @@ cmd_pr_create() {
         echo "  --close-source-branch to have it deleted when the PR merges." >&2
         echo "  Description: --description TEXT, --description-file PATH, or a" >&2
         echo "  file redirect (bb pr-create \"title\" dest < body.md)." >&2
+        echo "  Reviewers: --reviewer UUID, repeatable. Run 'bb members' for UUIDs." >&2
         exit 1
     fi
 
@@ -1369,40 +1403,46 @@ cmd_pr_create() {
         description="$(cat)"
     fi
 
-    # Parity fix: omit `description` from the payload when empty so it
-    # matches the Python omit-when-empty contract (bb_ops.pr_create).
+    # Build the base payload, then add the optional fields. Adding them
+    # incrementally keeps ONE definition of the required shape: the
+    # earlier form duplicated the whole jq program per description branch,
+    # and a second optional field (reviewers) would have squared that into
+    # four copies of the same object.
+    #
+    # Parity fix: `description` is omitted when empty so it matches the
+    # Python omit-when-empty contract (bb_ops.pr_create).
     # close_source_branch is a JSON bool via --argjson, not a string.
     local payload
+    payload=$(jq -n \
+        --arg title "$title" \
+        --arg src "$source_branch" \
+        --arg dst "$dest" \
+        --argjson close "$close_source_branch" \
+        '{
+            title: $title,
+            source: {branch: {name: $src}},
+            destination: {branch: {name: $dst}},
+            close_source_branch: $close
+        }')
     if [[ -n "$description" ]]; then
-        payload=$(jq -n \
-            --arg title "$title" \
-            --arg desc "$description" \
-            --arg src "$source_branch" \
-            --arg dst "$dest" \
-            --argjson close "$close_source_branch" \
-            '{
-                title: $title,
-                description: $desc,
-                source: {branch: {name: $src}},
-                destination: {branch: {name: $dst}},
-                close_source_branch: $close
-            }')
-    else
-        payload=$(jq -n \
-            --arg title "$title" \
-            --arg src "$source_branch" \
-            --arg dst "$dest" \
-            --argjson close "$close_source_branch" \
-            '{
-                title: $title,
-                source: {branch: {name: $src}},
-                destination: {branch: {name: $dst}},
-                close_source_branch: $close
-            }')
+        payload=$(echo "$payload" | jq --arg desc "$description" '. + {description: $desc}')
+    fi
+    # Each UUID rides in as its OWN jq argument ($ARGS.positional, jq >=
+    # 1.6) rather than inside a delimited string — same discipline as the
+    # trigger command's variable pairs, for the same reason. The key is
+    # omitted entirely when no --reviewer was passed, matching
+    # bb_ops.pr_create, which only sets it for a non-empty list.
+    if [[ "${#reviewers[@]}" -gt 0 ]]; then
+        payload=$(echo "$payload" | jq \
+            '. + {reviewers: [$ARGS.positional[] | {uuid: .}]}' \
+            --args "${reviewers[@]}")
     fi
 
     echo "Creating PR: ${source_branch} -> ${dest}"
     echo "  Title: ${title}"
+    if [[ "${#reviewers[@]}" -gt 0 ]]; then
+        echo "  Reviewers requested: ${#reviewers[@]}"
+    fi
     if [[ "$close_source_branch" == "true" ]]; then
         echo "  Source '${source_branch}' will be deleted when the PR merges."
     fi
@@ -2004,6 +2044,64 @@ cmd_projects() {
         echo "" >&2
         echo "  (showing first 100 — workspace has more; use the MCP" >&2
         echo "   projects_list tool, which paginates, for the full set)" >&2
+    fi
+}
+
+cmd_members() {
+    # bb members [workspace]
+    #
+    # GET /2.0/workspaces/{ws}/members — list a workspace's members.
+    #
+    # This is the lookup that makes `bb pr-create --reviewer` usable: the
+    # PR API identifies reviewers ONLY by account UUID, so without a member
+    # listing there is no supported way to discover the value to pass. The
+    # UUID column is exactly what --reviewer takes, braces included.
+    #
+    # Workspace precedence mirrors cmd_projects: a -w flag
+    # (BB_WORKSPACE_OVERRIDE) wins, then an explicit [workspace]
+    # positional, then resolve_workspace's git-origin / BB_WORKSPACE
+    # default.
+    local ws_arg="${1:-}"
+    if [[ -n "$ws_arg" && -z "${BB_WORKSPACE_OVERRIDE:-}" ]]; then
+        BB_WORKSPACE="$ws_arg"
+    else
+        resolve_workspace
+    fi
+
+    # Validate the resolved workspace at the boundary (empty / whitespace /
+    # embedded '/' / '.' / '..') — parity with bb_ops.members_list, which
+    # rejects these before any network call.
+    _require_workspace "$BB_WORKSPACE"
+
+    echo "Members of ${BB_WORKSPACE}:"
+    echo ""
+
+    local response rc=0
+    response=$(bb_get "/workspaces/${BB_WORKSPACE}/members?pagelen=100") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        exit "$rc"
+    fi
+
+    # UUID last and unpadded: it is the value users copy into --reviewer,
+    # and a trailing column can be selected without picking up padding.
+    printf "  %-28s %-20s %s\n" "DISPLAY NAME" "NICKNAME" "UUID"
+    printf "  %-28s %-20s %s\n" "------------" "--------" "----"
+
+    echo "$response" | jq -r '
+        .values[] | .user |
+        [(.display_name // "-"), (.nickname // "-"), (.uuid // "-")] | @tsv
+    ' | while IFS=$'\t' read -r display nickname uuid; do
+        printf "  %-28s %-20s %s\n" "$display" "$nickname" "$uuid"
+    done
+
+    # Same single-page convention (and same honest truncation notice) as
+    # cmd_projects / cmd_repos / cmd_workspaces. A workspace with more than
+    # 100 members is exactly where a silent cut would hide the person you
+    # were looking for.
+    if [[ "$(echo "$response" | jq -r '.next // empty')" != "" ]]; then
+        echo "" >&2
+        echo "  (showing first 100 — workspace has more; use the MCP" >&2
+        echo "   members_list tool, which paginates, for the full set)" >&2
     fi
 }
 
@@ -3185,7 +3283,9 @@ PULL REQUESTS
                                           source branch when the PR merges; kept
                                           by default);
                                           --description TEXT | --description-file PATH
-                                          (or pipe a body: pr-create ... < body.md)
+                                          (or pipe a body: pr-create ... < body.md);
+                                          --reviewer UUID (repeatable; get UUIDs
+                                          from bb members)
   bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                         Update a PR title and/or description
   bb pr-approve [repo] <id>             Approve a PR
@@ -3207,6 +3307,8 @@ BRANCHES
 REPOSITORY
   bb workspaces                         List workspaces you belong to (needs read:workspace:bitbucket scope)
   bb projects [workspace]               List workspace projects (needs read:project:bitbucket scope)
+  bb members [workspace]                List workspace members + their UUIDs
+                                          (the UUID --reviewer takes)
   bb repos                              List workspace repos
   bb repo [repo]                        Show repo details
   bb repo-create <name> [opts]          Create a repo (default PRIVATE)
@@ -3336,6 +3438,7 @@ case "$command" in
     # Repos
     workspaces|ws)        cmd_workspaces "$@" ;;
     projects|proj)        cmd_projects "$@" ;;
+    members|mem)          cmd_members "$@" ;;
     repos)                cmd_repos "$@" ;;
     repo)                 cmd_repo "$@" ;;
     repo-create|rc)       cmd_repo_create "$@" ;;

@@ -1219,6 +1219,38 @@ def projects_list(workspace: str = "", count: int = 100) -> dict[str, Any]:
         return _error_dict(e)
 
 
+@mcp.tool()
+def members_list(workspace: str = "", count: int = 100) -> dict[str, Any]:
+    """List the members of a Bitbucket workspace.
+
+    This is how you resolve a PERSON to the account UUID that
+    `pr_create(reviewers=[...])` requires. The PR API identifies reviewers
+    only by UUID, so without this there is no supported way to discover
+    the value to pass. Each record is a `workspace_membership` envelope
+    whose `.user` carries `.uuid` (pass this to `reviewers`, braces
+    included), `.display_name`, `.nickname`, and `.account_id`.
+
+    Match a person by `.user.display_name` or `.user.nickname`, then pass
+    the corresponding `.user.uuid`. Nicknames are not unique across a
+    workspace, so when two members match, surface both rather than
+    guessing which one the user meant.
+
+    Args:
+        workspace: Workspace slug. Empty = use BB_WORKSPACE from config.
+        count: Maximum number of members to return (default 100).
+    """
+    try:
+        client = _get_client()
+        # Mirror projects_list: strip + fall back so " acme" / "acme " don't
+        # build `/workspaces/%20acme/members`; whitespace-only falls back to
+        # the configured workspace.
+        ws = (workspace or "").strip() or client.config.workspace
+        members = bb_ops.members_list(client, workspace=ws, count=count)
+        return {"ok": True, "workspace": ws, "members": members}
+    except _TOOL_EXPECTED_EXCEPTIONS as e:
+        return _error_dict(e)
+
+
 # =============================================================================
 #  REPO / BRANCH / VARS / DOWNLOADS / COMMITS TOOLS
 # =============================================================================

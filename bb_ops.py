@@ -605,8 +605,9 @@ def pr_create(
     """Create a pull request.
 
     `reviewers` is an iterable of Bitbucket account UUIDs (the API expects
-    `[{"uuid": "..."}, ...]`). The bash script doesn't expose reviewers
-    at create-time — that's a 4.7 parity gap, not a Python bug.
+    `[{"uuid": "..."}, ...]`). Discover them with `members_list`, whose
+    `.user.uuid` is exactly this value, braces included. Parity with bash
+    `bb pr-create --reviewer <uuid>` (repeatable).
 
     `close_source_branch` defaults to False: deleting the source branch on
     merge is a destructive action, so it is opt-in, never automatic (the
@@ -999,6 +1000,53 @@ def projects_list(
     out: list[dict[str, Any]] = []
     for p in client.paginate(f"/workspaces/{ws}/projects", query=q):
         out.append(p)
+        if len(out) >= count:
+            break
+    return out
+
+
+def members_list(
+    client: BBClient,
+    workspace: str | None = None,
+    *,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """List the members of a workspace.
+
+    Uses `GET /2.0/workspaces/{workspace}/members` (paginated). Each value
+    is a `workspace_membership` envelope whose `.user` carries the fields
+    that identify a person: `.uuid`, `.display_name`, `.nickname`, and
+    `.account_id`.
+
+    This is the lookup that makes `pr_create(reviewers=[...])` usable. The
+    PR API identifies reviewers ONLY by account UUID, so without a member
+    listing there is no supported way to discover the value to pass, and
+    callers were forced to hand-roll the API call. The `.user.uuid` here
+    is exactly what `reviewers` expects, braces included.
+
+    `workspace=None` defaults to the client's configured workspace
+    (`client.config.workspace`); pass an explicit workspace to query a
+    different one.
+    """
+    ws = workspace if workspace is not None else client.config.workspace
+    # Mirror projects_list / repos_list: a workspace-level listing does not
+    # route through repo_path, so the workspace contract is validated
+    # inline — empty/whitespace AND embedded `/`, `.`, `..`.
+    if not isinstance(ws, str) or not ws.strip():
+        raise ValueError(f"workspace must be a non-empty string, got {ws!r}")
+    if "/" in ws:
+        raise ValueError(f"workspace must not contain '/', got {ws!r}")
+    if ws in (".", ".."):
+        raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
+    if not _is_positive_int(count):
+        raise ValueError(f"count must be a positive int, got {count!r}")
+
+    pagelen = min(count, _BITBUCKET_MAX_PAGELEN)
+    q: dict[str, Any] = {"pagelen": pagelen}
+
+    out: list[dict[str, Any]] = []
+    for m in client.paginate(f"/workspaces/{ws}/members", query=q):
+        out.append(m)
         if len(out) >= count:
             break
     return out
