@@ -812,8 +812,9 @@ cmd_logs() {
     # A failure here used to be swallowed (`2>/dev/null` plus a fallback
     # line), which reported "no log output" for a missing scope, an
     # expired token, and a genuinely empty log alike. bb_get now prints
-    # the API's own reason first; the fallback line stays for the case
-    # where the request succeeded and the log really is empty.
+    # the API's own reason first, and the fallback line still marks the
+    # request as having produced nothing. It fires only on failure: a
+    # successful but empty log exits 0 and prints nothing at all.
     bb_get "$(repo_path "$repo")/pipelines/%7B${pipeline_uuid}%7D/steps/%7B${step_uuid}%7D/log" -L \
         || echo "(no log output available)"
 }

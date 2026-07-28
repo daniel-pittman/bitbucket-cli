@@ -258,6 +258,26 @@ capture -- environment-delete widget Test
 check_rc       "204 empty body: delete succeeds"  0
 check_contains "204 empty body: success reported" "Deleted environment 'Test'"
 
+# Raw-passthrough endpoints (pr-diff, logs) must emit the response byte for
+# byte. They used to stream straight from curl; they now go through the
+# capture-and-split core, so this pins that the round trip is lossless.
+# The trailing newline is the part at risk: `printf '%s'` preserves it,
+# `echo` would append a second one, and leading with the status in the -w
+# format would eat it.
+DIFF_BODY="$WORK/diff_expected.txt"
+DIFF_GOT="$WORK/diff_got.txt"
+printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n' > "$DIFF_BODY"
+printf '200' > "$STATUS_FILE"
+cp "$DIFF_BODY" "$BODY_FILE"
+"$BB" pr-diff widget 42 > "$DIFF_GOT" 2>/dev/null
+if cmp -s "$DIFF_BODY" "$DIFF_GOT"; then
+    ok "pr-diff: response passed through byte for byte"
+else
+    OUT="expected $(wc -c < "$DIFF_BODY") bytes, got $(wc -c < "$DIFF_GOT")"
+    RC=0
+    failmsg "pr-diff: response passed through byte for byte" "output differs from the served body"
+fi
+
 echo ""
 echo "== #53: a repo's project is readable =="
 
