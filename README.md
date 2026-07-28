@@ -138,6 +138,7 @@ Your Bitbucket account needs these workspace permissions:
 | Create/approve/merge PRs | **Read + Write** access to Pull Requests (`read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`) |
 | List workspaces (`bb workspaces`) | `read:workspace:bitbucket` (new in v1.2.0 — Atlassian API token scope, opt-in when creating the token) |
 | List projects (`bb projects`) | `read:project:bitbucket` (Atlassian API token scope, opt-in when creating the token). Verified against the live 403 envelope: the missing scope is named under `error.detail.required`. |
+| List workspace members (`bb members`) | `read:workspace:bitbucket` — membership is a workspace resource, so the same scope `bb workspaces` needs covers it. Verified live against a token carrying `read:workspace:bitbucket` and NOT `read:project:bitbucket`: the listing succeeds, so it does not depend on the project scope. |
 | Create a repository (`bb repo-create`) | **Admin** access to repositories (`admin:repository:bitbucket`). `write:repository:bitbucket` alone is not sufficient. |
 | Update a repository (`bb repo-update`, e.g. move its project) | **Admin** access to repositories (`admin:repository:bitbucket`). `write:repository:bitbucket` alone is not sufficient (same scope as `bb repo-create`). |
 | Read Pipelines status (`bb pipelines-status`) | **Read** access to Pipelines (`read:pipeline:bitbucket`). |
