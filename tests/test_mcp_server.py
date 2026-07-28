@@ -104,6 +104,7 @@ EXPECTED_TOOLS = {
     # Workspaces
     "workspaces_list",
     "projects_list",
+    "members_list",
     # Repos / branches / metadata
     "repos_list",
     "repo_show",
@@ -143,11 +144,11 @@ def test_all_expected_tools_registered() -> None:
 
 def test_tool_count_matches_expectation() -> None:
     """Independent sanity check — pin the exact number so a silent
-    regression that drops a registration is visible. 42 = 8 pipelines
+    regression that drops a registration is visible. 43 = 8 pipelines
     (incl. pipelines_config show/set) + 12 PRs (incl. pr_update)
-    + 2 workspaces/projects + 14 repos/metadata (incl. vars_delete +
+    + 3 workspaces/projects/members + 14 repos/metadata (incl. vars_delete +
     environments list/create/delete) + 5 git context + 1 meta."""
-    assert len(mcp_server.mcp._tools) == 42
+    assert len(mcp_server.mcp._tools) == 43
 
 
 # ---------------------------------------------------------------------------
@@ -1432,6 +1433,80 @@ class TestRepoTools:
         with patch.object(bb_ops, "projects_list", recorder):
             mcp_server.projects_list(workspace="   ")
         assert recorder.calls[0][1]["workspace"] == "acme"  # from config
+
+    # --- members_list ---
+
+    def test_members_list_uses_config_workspace_when_omitted(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        member = {"user": {"uuid": "{u-1}", "display_name": "Ada L", "nickname": "ada"}}
+        recorder = _recorder([member])
+        with patch.object(bb_ops, "members_list", recorder):
+            out = mcp_server.members_list()
+        assert recorder.calls[0][1]["workspace"] == "acme"
+        assert out["ok"] is True
+        assert out["workspace"] == "acme"
+        assert out["members"] == [member]
+
+    def test_members_list_surfaces_uuid_for_reviewers(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """The tool exists so an agent can resolve a person to the UUID
+        pr_create(reviewers=...) needs. Pin that the nested user record
+        reaches the caller intact rather than being flattened to a name."""
+        member = {
+            "user": {
+                "uuid": "{11111111-2222-3333-4444-555555555555}",
+                "display_name": "Ada L",
+                "nickname": "ada",
+                "account_id": "acct-ada",
+            }
+        }
+        with patch.object(bb_ops, "members_list", _recorder([member])):
+            out = mcp_server.members_list()
+        assert out["members"][0]["user"]["uuid"] == "{11111111-2222-3333-4444-555555555555}"
+
+    def test_members_list_explicit_workspace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "members_list", recorder):
+            mcp_server.members_list(workspace="other")
+        assert recorder.calls[0][1]["workspace"] == "other"
+
+    def test_members_list_strips_workspace_whitespace(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "members_list", recorder):
+            mcp_server.members_list(workspace="  other-org  ")
+        assert recorder.calls[0][1]["workspace"] == "other-org"
+
+    def test_members_list_whitespace_only_workspace_falls_back(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "members_list", recorder):
+            mcp_server.members_list(workspace="   ")
+        assert recorder.calls[0][1]["workspace"] == "acme"  # from config
+
+    def test_members_list_error_envelope(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        """A 403 must arrive as the standard flat error envelope, not an
+        exception, so the agent can read the missing scope from `body`."""
+        err = bb_api.BBApiError(
+            403,
+            bb_api.DEFAULT_API_BASE + "/workspaces/acme/members",
+            '{"error": {"detail": {"required": ["read:workspace:bitbucket"]}}}',
+        )
+        def _boom(*a: object, **k: object) -> None:
+            raise err
+        with patch.object(bb_ops, "members_list", _boom):
+            out = mcp_server.members_list()
+        assert out["ok"] is False
+        assert out["status"] == 403
+        assert "read:workspace:bitbucket" in out["body"]
 
     # --- repo_update ---
 

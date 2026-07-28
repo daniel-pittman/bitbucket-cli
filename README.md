@@ -229,6 +229,7 @@ bb pr-create [--repo R] <title> [dest]  # Create PR from current branch
                                       #   opt: --close-source-branch
                                       #   opt: --description TEXT | --description-file PATH
                                       #        (or pipe a body: pr-create ... < body.md)
+                                      #   opt: --reviewer UUID (repeatable; bb members)
 bb pr-update [repo] <id> [--title T] [--description D | --description-file F]
                                       # Update a PR title and/or description
 bb pr-approve [repo] <id>             # Approve a PR
@@ -246,6 +247,22 @@ the repo auto-detected from the git origin. Select a different repo with
 still accepted for back-compat; a single-token title shaped like `ws/slug`
 (e.g. `fix/typo`, one slash, no spaces) is taken as the repo, so pass `--repo`
 to disambiguate in that rare case.
+
+**Requesting review.** Bitbucket identifies reviewers only by account UUID, so
+`bb members` is the lookup and `--reviewer` is the consumer:
+
+```bash
+bb members                                    # DISPLAY NAME / NICKNAME / UUID
+bb pr-create "Add widget cache" develop \
+    --reviewer "{11111111-2222-3333-4444-555555555555}" \
+    --reviewer "{66666666-7777-8888-9999-000000000000}"
+```
+
+`--reviewer` is repeatable and takes the UUID column verbatim (braces optional).
+A name or nickname is rejected locally, before any request, with a pointer back
+to `bb members` — Bitbucket would only answer that with a 400. `bb members`
+lists the first 100 members and says so when there are more; the MCP
+`members_list` tool paginates.
 
 **PR body.** Supply it with `--description "..."`, `--description-file PATH`,
 or a file redirect `bb pr-create "<title>" <dest> < body.md`. `pr-create` never
@@ -269,6 +286,7 @@ the box checked still keeps its source branch unless you pass
 ```bash
 bb branches [repo]                    # List branches
 bb projects [workspace]               # List workspace projects
+bb members [workspace]                # List workspace members + their UUIDs
 bb repos                              # List workspace repos
 bb repo [repo]                        # Show repo details
 bb repo-create <name> [opts]          # Create a repo (default PRIVATE)
@@ -402,7 +420,7 @@ A Python [Model Context Protocol](https://modelcontextprotocol.io/) server (`mcp
 | Pipelines (write) | `pipeline_trigger`, `pipeline_stop`, `pipelines_config_set` (enable/disable; needs `admin:pipeline:bitbucket`) |
 | Pull requests (read) | `prs_list`, `pr_show`, `pr_activity`, `pr_diff`, `pr_comments_list` |
 | Pull requests (write) | `pr_create`, `pr_approve`, `pr_unapprove`, `pr_merge`, `pr_decline`, `pr_comment_add` |
-| Workspaces / projects | `workspaces_list` (needs `read:workspace:bitbucket` scope), `projects_list` (needs `read:project:bitbucket` scope) — see [Required Bitbucket Permissions](#required-bitbucket-permissions) |
+| Workspaces / projects / members | `workspaces_list` (needs `read:workspace:bitbucket` scope), `projects_list` (needs `read:project:bitbucket` scope), `members_list` (resolves a person to the account UUID `pr_create(reviewers=...)` needs) — see [Required Bitbucket Permissions](#required-bitbucket-permissions) |
 | Repos / metadata | `repos_list`, `repo_show`, `repo_create`, `repo_update`, `branches_list`, `branch_show`, `commits_list`, `vars_list`, `vars_set`, `vars_delete`, `downloads_list` |
 | Deployment environments | `environments_list`, `environment_create`, `environment_delete` (create/delete need `admin:pipeline:bitbucket`) |
 | Git context | `git_current_branch`, `git_status`, `git_remote_repo`, `git_recent_commits`, `git_uncommitted_changes` |

@@ -72,6 +72,14 @@ jobs:
       - name: API-error reporting + repo project (host bash)
         run: bash tests/bash/test_error_reporting.sh
 
+      # `bb members` + `bb pr-create --reviewer`. Guards the contract that
+      # makes the pair usable: the UUID the listing prints is the value the
+      # flag accepts and sends. Also pins that a name/nickname is rejected
+      # locally with ZERO requests issued, so validation can't drift to the
+      # API. Needs curl + jq + git + python3, so it runs on the host runner.
+      - name: members + pr-create --reviewer (host bash)
+        run: bash tests/bash/test_members_and_reviewers.sh
+
   syntax:
     runs-on: ubuntu-latest
     strategy:
