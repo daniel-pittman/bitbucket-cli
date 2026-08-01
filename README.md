@@ -129,7 +129,32 @@ Python tools agree on which workspace a given invocation targets.
 
 ### Required Bitbucket Permissions
 
-Your Bitbucket account needs these workspace permissions:
+**Creating or rotating a token? Tick these nine.** Scopes are fixed when a
+token is issued, so a rotation must re-select the whole set: ticking only the
+one you were missing leaves you with a token that has only that one.
+
+```
+read:repository:bitbucket      read:pullrequest:bitbucket
+admin:repository:bitbucket     write:pullrequest:bitbucket
+
+read:pipeline:bitbucket        read:workspace:bitbucket
+write:pipeline:bitbucket       read:project:bitbucket
+admin:pipeline:bitbucket
+```
+
+`write:repository:bitbucket` is deliberately absent: no `bb` command needs it.
+The only writes to the repository resource itself are `bb repo-create` and
+`bb repo-update`, which need `admin:repository:bitbucket`; every other write
+targets a sub-resource (pipelines, pull requests) covered by its own scope.
+Atlassian's token UI may include it alongside the admin tier, which is
+harmless.
+
+After rotating, `bb projects` is a good single check: it needs
+`read:project:bitbucket`, the scope most often left off. Any command that
+fails now prints the exact scope it needed and the ones the token carries, so
+a gap names itself rather than needing a guess.
+
+The per-feature breakdown:
 
 | Feature | Required Permission |
 |---------|---------------------|
