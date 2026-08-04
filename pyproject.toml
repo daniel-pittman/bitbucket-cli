@@ -35,7 +35,7 @@ dependencies = []
 [project.optional-dependencies]
 # Pull in the MCP runtime when installing for the MCP server use case:
 #   pip install -e ".[mcp]"
-mcp = ["mcp >= 1.0"]
+mcp = ["mcp >= 2.0.0"]
 
 # Test-time dependencies.
 test = ["pytest >= 7"]
