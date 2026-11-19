@@ -130,12 +130,13 @@ jobs:
       - name: Python syntax check
         run: python -m py_compile bb_api.py bb_ops.py git_ops.py mcp_server.py
 
-      # Install pytest only. The MCP server's heavy dependencies (mcp) are
-      # exercised at runtime, not here — the unit tests mock the network and
-      # the MCP transport entirely, so pulling them into CI would just slow
-      # the matrix down for no signal.
-      - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+      # Install pytest plus the `mcp` extra. Most tests run against the
+      # MCPServer stub, but TestRealMCPServer registers every tool on the
+      # real SDK and lists them, which is the only check that the tool
+      # signatures and the import path work on the pinned mcp major
+      # version. Without the SDK installed that class skips.
+      - name: Install pytest and the mcp extra
+        run: python -m pip install --upgrade pip pytest ".[mcp]"
 
       - name: Run pytest
         run: python -m pytest tests/ -v

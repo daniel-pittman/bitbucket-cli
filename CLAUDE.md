@@ -26,7 +26,7 @@ bitbucket-cli/
 ├── bb_api.py           # urllib-based HTTP client, pagination, redacting
 ├── bb_ops.py           # Bitbucket operations: pipelines / PRs / repos / branches / vars / commits
 ├── git_ops.py          # subprocess wrappers: branch / status / remote / commits / diffs
-├── mcp_server.py       # FastMCP tool registry + self-bootstrap venv
+├── mcp_server.py       # MCPServer (mcp 2.x) tool registry + self-bootstrap venv
 ├── agents/bitbucket.md # Generic agent definition for the MCP server
 ├── tests/              # pytest suite (~360 tests)
 ├── pyproject.toml      # Python packaging + pytest config
