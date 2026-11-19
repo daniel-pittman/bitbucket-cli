@@ -2098,7 +2098,7 @@ class TestVenvLocation:
         """The venv path must end in `bitbucket-cli/venv` so it lives
         alongside other XDG-spec app state."""
         from pathlib import Path
-        assert mcp_server._VENV_DIR.parts[-2:] == ("bitbucket-cli", "venv")
+        assert mcp_server._VENV_DIR.parts[-2:] == ("bitbucket-cli", "venv-mcp2")
         # NOT /tmp (which would re-bootstrap every reboot).
         assert not str(mcp_server._VENV_DIR).startswith("/tmp")
 
@@ -2143,6 +2143,11 @@ class TestVenvDependencyStamp:
         monkeypatch.setattr(mcp_server, "_VENV_DIR", venv_dir)
         monkeypatch.setattr(mcp_server, "_VENV_PY", venv_py)
         monkeypatch.setattr(mcp_server, "_VENV_READY", ready)
+        # The lock lives beside the venv; redirect it too, or the tests
+        # would take a lock beside the real venv directory.
+        monkeypatch.setattr(
+            mcp_server, "_VENV_LOCK", venv_dir.parent / "venv-mcp2.lock"
+        )
         return ready
 
     @pytest.fixture
@@ -2254,10 +2259,39 @@ class TestRealMCPServer:
     the pinned SDK major version. Skips when the SDK is not installed
     (CI installs the `mcp` extra so it runs there)."""
 
+    @staticmethod
+    def _module_server_import() -> tuple[str, str]:
+        """(module, class) from mcp_server.py's own real-SDK import, the
+        `from mcp... import MCPServer` inside the bootstrap branch. Read
+        from the source so a wrong module path on that line fails here;
+        the suite itself always runs the stub branch."""
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path(mcp_server.__file__).read_text())
+        found = [
+            (node.module, alias.name)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module and node.module.startswith("mcp")
+            for alias in node.names
+        ]
+        assert len(found) == 1, found
+        return found[0]
+
     @pytest.fixture
     def real_server(self):
-        mcpserver = pytest.importorskip("mcp.server.mcpserver")
-        server = mcpserver.MCPServer("bb")
+        import importlib
+
+        # Skip only when the SDK is absent. An installed SDK that lacks
+        # the module mcp_server imports must FAIL, not skip.
+        pytest.importorskip("mcp")
+        module, cls = self._module_server_import()
+        server_cls = getattr(importlib.import_module(module), cls)
+        # The module-level server is built from the same name the stub
+        # uses, so `mcp = MCPServer("bb")` matches what this constructs.
+        assert cls == type(mcp_server.mcp).__name__
+        server = server_cls("bb")
         for fn in mcp_server.mcp._tools.values():
             server.tool()(fn)
         return server
@@ -2302,3 +2336,123 @@ class TestInvalidUrlEnvelope:
         assert out["ok"] is False
         assert "only letters, digits" in out["message"]
         assert recorder.calls == []
+
+
+class TestVenvPerMajor:
+    """The venv directory is named for the mcp major version in
+    _VENV_DEPS, so releases built for another major keep their own venv
+    and a rollback never meets an SDK it cannot import (#71)."""
+
+    def test_venv_dir_names_the_pinned_major(self) -> None:
+        import re
+
+        (spec,) = mcp_server._VENV_DEPS
+        m = re.search(r"<\s*(\d+)", spec)
+        assert m, f"no major-version ceiling in {spec!r}"
+        major = int(m.group(1)) - 1
+        assert mcp_server._VENV_DIR.name == f"venv-mcp{major}"
+
+    def test_old_major_venv_is_not_reused(self) -> None:
+        """The pre-2.x releases bootstrapped `bitbucket-cli/venv`."""
+        assert mcp_server._VENV_DIR.name != "venv"
+
+    def test_lock_lives_beside_the_venv(self) -> None:
+        assert mcp_server._VENV_LOCK.parent == mcp_server._VENV_DIR.parent
+        assert mcp_server._VENV_LOCK.name == mcp_server._VENV_DIR.name + ".lock"
+
+
+class TestVenvInstallLock:
+    """Install-and-stamp runs under an exclusive flock, and the sentinel
+    is checked again once the lock is held (#71)."""
+
+    @pytest.fixture
+    def venv(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        venv_dir = tmp_path / "bitbucket-cli" / "venv-mcp2"
+        venv_py = venv_dir / "bin" / "python3"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text("")
+        ready = venv_dir / ".bbenv-ready"
+        monkeypatch.setattr(mcp_server, "_VENV_DIR", venv_dir)
+        monkeypatch.setattr(mcp_server, "_VENV_PY", venv_py)
+        monkeypatch.setattr(mcp_server, "_VENV_READY", ready)
+        monkeypatch.setattr(
+            mcp_server, "_VENV_LOCK", venv_dir.parent / "venv-mcp2.lock"
+        )
+        return ready
+
+    @pytest.fixture
+    def events(self, monkeypatch: pytest.MonkeyPatch):
+        """Record lock, pip and exec events in order, without running any."""
+        log: list[str] = []
+        real_flock = mcp_server.fcntl.flock
+
+        def flock(fd, op):
+            log.append("lock" if op == mcp_server.fcntl.LOCK_EX else "unlock")
+            return real_flock(fd, op)
+
+        monkeypatch.setattr(mcp_server.fcntl, "flock", flock)
+        monkeypatch.setattr(
+            mcp_server, "_find_builder_python", lambda: "builder-python"
+        )
+        monkeypatch.setattr(
+            mcp_server, "_pip_install_or_diagnose",
+            lambda args: log.append("pip"),
+        )
+        monkeypatch.setattr(
+            mcp_server.subprocess, "check_call",
+            lambda args, **kw: log.append("venv"),
+        )
+        monkeypatch.setattr(
+            mcp_server.os, "execv", lambda path, argv: log.append("execv")
+        )
+        return log
+
+    def test_install_runs_inside_the_lock(self, venv, events) -> None:
+        mcp_server._bootstrap_venv()
+        assert events == ["lock", "pip", "pip", "unlock", "execv"]
+        assert venv.read_text() == mcp_server._venv_stamp()
+        assert mcp_server._VENV_LOCK.exists()
+
+    def test_waiter_skips_install_another_launch_finished(
+        self, venv, events, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """While this launch waited on the lock, another launch finished
+        the install and stamped the sentinel: the re-check sees that and
+        this launch installs nothing."""
+        def flock(fd, op):
+            if op == mcp_server.fcntl.LOCK_EX:
+                events.append("lock")
+                venv.write_text(mcp_server._venv_stamp())  # the other launch
+            else:
+                events.append("unlock")
+
+        monkeypatch.setattr(mcp_server.fcntl, "flock", flock)
+        mcp_server._bootstrap_venv()
+        assert events == ["lock", "unlock", "execv"]
+
+    def test_current_venv_takes_no_lock(self, venv, events) -> None:
+        venv.write_text(mcp_server._venv_stamp())
+        mcp_server._bootstrap_venv()
+        assert events == ["execv"]
+
+    def test_lock_released_when_install_fails(
+        self, venv, events, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(args):
+            events.append("pip")
+            raise RuntimeError("[bb-mcp] pip install failed (exit 1)")
+
+        monkeypatch.setattr(mcp_server, "_pip_install_or_diagnose", fail)
+        with pytest.raises(RuntimeError, match="pip install failed"):
+            mcp_server._bootstrap_venv()
+        assert events == ["lock", "pip", "unlock"]
+        assert not venv.exists()
+
+    def test_corrupt_sentinel_reinstalls(self, venv, events) -> None:
+        """A sentinel holding bytes that are not UTF-8 counts as stale
+        and triggers a reinstall instead of crashing startup."""
+        venv.write_bytes(b"\xff\xfe\x00garbage")
+        assert mcp_server._venv_is_current() is False
+        mcp_server._bootstrap_venv()
+        assert events == ["lock", "pip", "pip", "unlock", "execv"]
+        assert venv.read_text() == mcp_server._venv_stamp()

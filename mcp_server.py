@@ -20,8 +20,8 @@ Every Bitbucket tool accepts an optional `repo` argument:
 Run as a subprocess (stdio transport):
     python3 mcp_server.py
 
-The script self-bootstraps a venv under `$XDG_DATA_HOME/bitbucket-cli/venv`
-(default `~/.local/share/bitbucket-cli/venv`) on first run, installs the
+The script self-bootstraps a venv under `$XDG_DATA_HOME/bitbucket-cli/venv-mcp2`
+(default `~/.local/share/bitbucket-cli/venv-mcp2`) on first run, installs the
 `mcp` package into it, then re-execs under that venv. Any python3 on
 PATH that can run `python3 -m venv` works as the launcher (must be 3.10+;
 on macOS prefer Homebrew or pyenv over Apple's bundled 3.9 at
@@ -39,11 +39,12 @@ Environment overrides:
   BB_MCP_SKIP_BOOTSTRAP=1         — test escape hatch (skips venv + stubs MCPServer)
   XDG_DATA_HOME                   — overrides the venv parent dir (default
                                     ~/.local/share); the venv lives at
-                                    `$XDG_DATA_HOME/bitbucket-cli/venv`
+                                    `$XDG_DATA_HOME/bitbucket-cli/venv-mcp2`
 """
 
 from __future__ import annotations
 
+import fcntl
 import http.client
 import os
 import re
@@ -55,11 +56,17 @@ from typing import Any
 
 # ---------------------------------------------------------------------------
 # Self-bootstrap: ensure the venv exists and re-exec into it. Built under
-# `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/
-# venv`) so it survives reboots — the previous `/tmp/bbenv` location would
-# get wiped at every boot, forcing a fresh ~30s rebuild. The new location
-# follows the XDG Base Directory spec and matches the pattern used by
-# zenhub-cli (`~/.local/share/zenhub-cli/venv`).
+# `$XDG_DATA_HOME/bitbucket-cli/venv-mcp2` (default `~/.local/share/
+# bitbucket-cli/venv-mcp2`) so it survives reboots; a /tmp location would
+# be wiped at every boot, forcing a fresh ~30s rebuild. The location
+# follows the XDG Base Directory spec.
+#
+# The directory is named for the mcp MAJOR version this module imports.
+# Releases built for another major (the mcp 1.x releases used
+# `bitbucket-cli/venv`) keep their own venv, so running an older release
+# after a newer one, or switching a checkout between them, never finds a
+# venv holding an SDK it cannot import. Bump the name with the major in
+# _VENV_DEPS (a test enforces they agree).
 #
 # Must run before any third-party import (mcp).
 # ---------------------------------------------------------------------------
@@ -76,8 +83,13 @@ def _xdg_data_home() -> Path:
     return Path.home() / ".local" / "share"
 
 
-_VENV_DIR = _xdg_data_home() / "bitbucket-cli" / "venv"
+_VENV_DIR = _xdg_data_home() / "bitbucket-cli" / "venv-mcp2"
 _VENV_PY = _VENV_DIR / "bin" / "python3"
+# Held (fcntl.flock, exclusive) around install-and-stamp so concurrent
+# first launches do not run pip in the same site-packages at once, where
+# one can re-exec into an SDK the other is still replacing. Lives beside
+# the venv, not inside it, so it exists before the venv does.
+_VENV_LOCK = _VENV_DIR.parent / f"{_VENV_DIR.name}.lock"
 # Sentinel file written ONLY after the full bootstrap (venv create + pip
 # install) succeeds. If pip is Ctrl-C'd / OOM-killed / disk-full mid-run,
 # _VENV_PY exists but `mcp` doesn't — without this sentinel, every
@@ -107,10 +119,11 @@ def _venv_is_current() -> bool:
     """True when the venv finished bootstrapping for the CURRENT
     _VENV_DEPS. A missing sentinel, an empty one (written by releases
     before the stamp existed), or one naming another spec all mean the
-    install must run again."""
+    install must run again. So does an unreadable or undecodable one
+    (a corrupt sentinel must trigger a reinstall, not crash startup)."""
     try:
-        return _VENV_READY.read_text() == _venv_stamp()
-    except OSError:
+        return _VENV_READY.read_text(encoding="utf-8") == _venv_stamp()
+    except (OSError, UnicodeDecodeError):
         return False
 
 
@@ -174,6 +187,32 @@ def _pip_install_or_diagnose(args: list[str]) -> None:
         ) from e
 
 
+def _install_venv() -> None:
+    """Create the venv if needed, install _VENV_DEPS, then stamp the
+    sentinel. The caller holds _VENV_LOCK."""
+    builder = _find_builder_python()
+    # Log to stderr so MCP stdio transport isn't corrupted.
+    print(
+        f"[bb-mcp] bootstrapping {_VENV_DIR} with {builder}",
+        file=sys.stderr,
+    )
+    # Only create the venv if it doesn't already exist (a previous
+    # half-finished bootstrap left _VENV_PY in place).
+    if not _VENV_PY.exists():
+        subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
+    _pip_install_or_diagnose(
+        [str(_VENV_PY), "-m", "pip", "install",
+         "--no-cache-dir", "--upgrade", "pip"]
+    )
+    _pip_install_or_diagnose(
+        [str(_VENV_PY), "-m", "pip", "install",
+         "--no-cache-dir", *_VENV_DEPS]
+    )
+    # Sentinel last — any earlier failure leaves it absent (or stale)
+    # so the next launch retries the install.
+    _VENV_READY.write_text(_venv_stamp(), encoding="utf-8")
+
+
 def _bootstrap_venv() -> None:
     """Create the venv on first run, install deps, re-exec under it.
 
@@ -185,34 +224,24 @@ def _bootstrap_venv() -> None:
 
     Creates parent directories if needed (e.g. on a fresh machine the
     XDG data dir may not exist yet).
+
+    Concurrent launches serialize on _VENV_LOCK, and the sentinel is
+    checked again once the lock is held, so a launch that waited for
+    another one's install re-execs without installing a second time.
     """
     if not _venv_is_current():
-        builder = _find_builder_python()
-        # Log to stderr so MCP stdio transport isn't corrupted.
-        print(
-            f"[bb-mcp] bootstrapping {_VENV_DIR} with {builder}",
-            file=sys.stderr,
-        )
         # Make sure the parent directory exists. On a fresh machine
         # `~/.local/share` may exist but `~/.local/share/bitbucket-cli`
         # won't yet — `python -m venv` doesn't create intermediate
-        # directories above the target.
+        # directories above the target, and the lock file lives here.
         _VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-        # Only create the venv if it doesn't already exist (a previous
-        # half-finished bootstrap left _VENV_PY in place).
-        if not _VENV_PY.exists():
-            subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
-        _pip_install_or_diagnose(
-            [str(_VENV_PY), "-m", "pip", "install",
-             "--no-cache-dir", "--upgrade", "pip"]
-        )
-        _pip_install_or_diagnose(
-            [str(_VENV_PY), "-m", "pip", "install",
-             "--no-cache-dir", *_VENV_DEPS]
-        )
-        # Sentinel last — any earlier failure leaves it absent (or stale)
-        # so the next launch retries the install.
-        _VENV_READY.write_text(_venv_stamp())
+        with open(_VENV_LOCK, "a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                if not _venv_is_current():
+                    _install_venv()
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     # Detect "are we already running under the bootstrap venv?" via
     # resolved sys.prefix. `python -m venv` on Linux/macOS symlinks

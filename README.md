@@ -503,11 +503,15 @@ claude mcp add --scope user bitbucket \
 # (see "Multiple workspaces" below).
 
 # 3. On first invocation, the server self-bootstraps a durable venv at
-#    $XDG_DATA_HOME/bitbucket-cli/venv (default: ~/.local/share/bitbucket-cli/venv)
-#    and installs the `mcp` package into it. Subsequent launches reuse the venv.
+#    $XDG_DATA_HOME/bitbucket-cli/venv-mcp2 (default:
+#    ~/.local/share/bitbucket-cli/venv-mcp2) and installs the `mcp` package
+#    into it. Subsequent launches reuse the venv. The directory is named for
+#    the mcp major version, so releases built for mcp 1.x keep their own
+#    `bitbucket-cli/venv`; once you no longer run one, that old directory
+#    can be deleted.
 #
 #    To force a clean rebuild:
-#      rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/bitbucket-cli/venv"
+#      rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/bitbucket-cli/venv-mcp2"
 #    and relaunch the MCP server.
 
 # 4. Verify the connection (handshake only — does NOT validate credentials):
@@ -543,7 +547,7 @@ claude mcp add --scope user bitbucket-work \
 |---|---|
 | `BB_API_BASE` | Override the Bitbucket REST base URL (default `https://api.bitbucket.org/2.0`). Useful for a test / proxied / staging mirror. |
 | `BB_DEFAULT_REPO_PATH` | Default working directory for repo auto-detection (when a Bitbucket tool is called with `repo=""`) AND for the `git_*` tools' default `path=""` resolution. Defaults to the MCP server's launch cwd. |
-| `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/venv`). |
+| `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/bitbucket-cli/venv-mcp2` (default `~/.local/share/bitbucket-cli/venv-mcp2`). |
 
 ### Optional: install the bundled `bitbucket` agent for delegated use
 

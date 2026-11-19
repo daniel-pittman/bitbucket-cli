@@ -45,7 +45,7 @@ bitbucket-cli/
   - `BB_USER`: Bitbucket account email
   - `BB_TOKEN`: API token from id.atlassian.com (never echoed)
   - `BB_WORKSPACE`: workspace slug
-- **MCP runtime**: stdlib-only at runtime; the `mcp` package is the only third-party dep, installed into a self-bootstrapped venv at `$XDG_DATA_HOME/bitbucket-cli/venv` (default `~/.local/share/bitbucket-cli/venv`) on first invocation.
+- **MCP runtime**: stdlib-only at runtime; the `mcp` package is the only third-party dep, installed into a self-bootstrapped venv at `$XDG_DATA_HOME/bitbucket-cli/venv-mcp2` (default `~/.local/share/bitbucket-cli/venv-mcp2`) on first invocation. The directory is named for the mcp major version, so releases built for another major keep their own venv.
 
 ## Configuration
 

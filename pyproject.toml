@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 # Runtime dependencies are intentionally minimal. The MCP server self-bootstraps
-# a venv at $XDG_DATA_HOME/bitbucket-cli/venv on first run and installs `mcp`
+# a venv at $XDG_DATA_HOME/bitbucket-cli/venv-mcp2 on first run and installs `mcp`
 # there; consumers who install via `pip install -e .` get the same package
 # added explicitly via the `mcp` extra. The transport layer (bb_api) is
 # stdlib-only.
