@@ -262,7 +262,7 @@ def detect_repo(
 # space, `?`, `#`, `%`, a control character) would either be rejected by
 # urllib or change which endpoint the request reaches. UUID-form
 # identifiers (`{...}`) are not accepted here. Mirrored by the bash
-# _require_slug_chars helper.
+# _slug_chars_ok helper.
 _SLUG_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 

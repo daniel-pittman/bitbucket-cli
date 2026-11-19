@@ -2038,15 +2038,14 @@ class TestWhoami:
         # Token must NEVER be echoed, even on the auth-failure path.
         assert "tok-xyz" not in str(out)
 
-    def test_auth_probe_url_encodes_workspace(
+    def test_auth_probe_skips_workspace_with_slash(
         self,
         stub_client: bb_api.BBClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """If the workspace slug has a character that needs URL
-        encoding (rare, but `/` would break path parsing), the probe
-        must encode it — bash uses raw curl, Python uses urllib.quote
-        with safe=''. Test the encoding rather than the raw substitution."""
+        """A workspace holding `/` is not a slug, so the probe does not
+        run (encoding it would still probe a workspace that cannot
+        exist). Both surfaces skip the probe for an invalid slug."""
         # BBConfig is frozen; swap the whole client in.
         weird_cfg = bb_api.BBConfig(
             user="alice@example.com",
@@ -2064,8 +2063,10 @@ class TestWhoami:
         calls = self._stub_auth_ok(stub_client)
         out = mcp_server.whoami()
         assert out["ok"] is True
-        # `/` must be encoded as %2F so it doesn't fragment the path.
-        assert calls == [("/repositories/ws%2Fwith-slash", {"pagelen": "1"})]
+        assert calls == []
+        assert out["auth"]["ok"] is False
+        assert out["auth"]["kind"] == "ValueError"
+        assert "'/'" in out["auth"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -2456,3 +2457,39 @@ class TestVenvInstallLock:
         mcp_server._bootstrap_venv()
         assert events == ["lock", "pip", "pip", "unlock", "execv"]
         assert venv.read_text() == mcp_server._venv_stamp()
+
+
+class TestWhoamiProbeSlug:
+    """whoami must not probe an invalid workspace. quote() leaves `..`
+    intact, and `/repositories/..` can reach the global listing and
+    report a false "auth OK" (review of #69)."""
+
+    @pytest.mark.parametrize("bad", ["..", "acme?x=1", "acme#f"])
+    def test_invalid_probe_workspace_is_not_probed(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+        bad: str,
+    ) -> None:
+        import dataclasses
+
+        monkeypatch.setattr(
+            stub_client, "config",
+            dataclasses.replace(stub_client.config, workspace=bad),
+        )
+        monkeypatch.setattr(git_ops, "git_current_branch", lambda path=None: "main")
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo", lambda path=None: ("acme", "widget-service")
+        )
+        calls: list[str] = []
+
+        def fake_get(path: str, *, query=None, timeout=None):
+            calls.append(path)
+            return {}
+
+        monkeypatch.setattr(stub_client, "get", fake_get)
+        out = mcp_server.whoami()
+        assert calls == []
+        assert out["auth"]["ok"] is False
+        assert out["auth"]["workspace"] == bad
+        assert out["auth"]["kind"] == "ValueError"

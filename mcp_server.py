@@ -2170,6 +2170,10 @@ def whoami() -> dict[str, Any]:
             }
         else:
             try:
+                # quote() leaves `..` intact, which would reach the global
+                # /repositories listing and falsely report auth OK; the
+                # slug check rejects it (and `?`, `#`) as a ValueError.
+                bb_api.validate_slug("workspace", probe_ws)
                 client.get(
                     f"/repositories/{urllib.parse.quote(probe_ws, safe='')}",
                     query={"pagelen": "1"},
