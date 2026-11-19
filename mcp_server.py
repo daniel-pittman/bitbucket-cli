@@ -36,7 +36,7 @@ Environment overrides:
   BB_USER, BB_TOKEN, BB_WORKSPACE — auth + workspace (see bb_api docs)
   BB_API_BASE                     — Bitbucket REST base (default api.bitbucket.org/2.0)
   BB_DEFAULT_REPO_PATH            — git checkout dir for auto-detect (default: cwd)
-  BB_MCP_SKIP_BOOTSTRAP=1         — test escape hatch (skips venv + stubs FastMCP)
+  BB_MCP_SKIP_BOOTSTRAP=1         — test escape hatch (skips venv + stubs MCPServer)
   XDG_DATA_HOME                   — overrides the venv parent dir (default
                                     ~/.local/share); the venv lives at
                                     `$XDG_DATA_HOME/bitbucket-cli/venv`
@@ -81,14 +81,36 @@ _VENV_PY = _VENV_DIR / "bin" / "python3"
 # install) succeeds. If pip is Ctrl-C'd / OOM-killed / disk-full mid-run,
 # _VENV_PY exists but `mcp` doesn't — without this sentinel, every
 # subsequent launch would silently skip reinstall, re-exec into the
-# broken venv, and die on `from mcp.server.fastmcp import FastMCP`.
+# broken venv, and die on `from mcp.server.mcpserver import MCPServer`.
+#
+# The sentinel's CONTENT is the dependency spec it was built for (see
+# _venv_stamp). A venv built for a different spec reinstalls on the next
+# launch, so changing _VENV_DEPS upgrades existing installs instead of
+# leaving them on the old major version, where the import below fails.
 _VENV_READY = _VENV_DIR / ".bbenv-ready"
-# Pin to mcp>=1.0,<2 so a breaking mcp 2.x release doesn't silently
-# install on a fresh-machine bootstrap (or a manual `rm` of the venv)
-# and break every subsequent launch. Matches the pyproject.toml [mcp]
-# extra.
-_VENV_DEPS = ("mcp>=1.0,<2",)  # No heavy deps (no torch / sentence-transformers).
+# The <3 ceiling keeps a breaking mcp 3.x release from installing on a
+# fresh-machine bootstrap and breaking every subsequent launch. 2.1.1 is
+# the floor because mcp 2.x renamed FastMCP to MCPServer
+# (mcp.server.mcpserver), the API this module imports. Must match the
+# pyproject.toml [mcp] extra (a test enforces it).
+_VENV_DEPS = ("mcp>=2.1.1,<3",)  # No heavy deps (no torch / sentence-transformers).
 _VENV_MIN_PY = (3, 10)  # bb_api uses PEP 604 unions; mcp also needs >=3.10
+
+
+def _venv_stamp() -> str:
+    """The sentinel content for the current dependency spec."""
+    return "\n".join(_VENV_DEPS) + "\n"
+
+
+def _venv_is_current() -> bool:
+    """True when the venv finished bootstrapping for the CURRENT
+    _VENV_DEPS. A missing sentinel, an empty one (written by releases
+    before the stamp existed), or one naming another spec all mean the
+    install must run again."""
+    try:
+        return _VENV_READY.read_text() == _venv_stamp()
+    except OSError:
+        return False
 
 
 def _find_builder_python() -> str:
@@ -154,16 +176,16 @@ def _pip_install_or_diagnose(args: list[str]) -> None:
 def _bootstrap_venv() -> None:
     """Create the venv on first run, install deps, re-exec under it.
 
-    Idempotent: a fully-bootstrapped venv (sentinel file present)
-    re-execs immediately. A partially-bootstrapped venv (venv exists
-    but sentinel doesn't — e.g. previous pip install was Ctrl-C'd or
-    OOM-killed) gets the pip install retried with no manual cleanup
-    needed.
+    Idempotent: a fully-bootstrapped venv (sentinel matches the current
+    dependency spec) re-execs immediately. A partially-bootstrapped venv
+    (venv exists but sentinel doesn't — e.g. previous pip install was
+    Ctrl-C'd or OOM-killed) or one built for an older spec gets the pip
+    install rerun with no manual cleanup needed.
 
     Creates parent directories if needed (e.g. on a fresh machine the
     XDG data dir may not exist yet).
     """
-    if not _VENV_READY.exists():
+    if not _venv_is_current():
         builder = _find_builder_python()
         # Log to stderr so MCP stdio transport isn't corrupted.
         print(
@@ -187,9 +209,9 @@ def _bootstrap_venv() -> None:
             [str(_VENV_PY), "-m", "pip", "install",
              "--no-cache-dir", *_VENV_DEPS]
         )
-        # Sentinel last — any earlier failure leaves it absent so the
-        # next launch retries the install.
-        _VENV_READY.touch()
+        # Sentinel last — any earlier failure leaves it absent (or stale)
+        # so the next launch retries the install.
+        _VENV_READY.write_text(_venv_stamp())
 
     # Detect "are we already running under the bootstrap venv?" via
     # resolved sys.prefix. `python -m venv` on Linux/macOS symlinks
@@ -211,27 +233,28 @@ def _bootstrap_venv() -> None:
 
 
 # Test-mode escape hatch: setting BB_MCP_SKIP_BOOTSTRAP=1 in the environment
-# skips the venv bootstrap AND substitutes a minimal FastMCP stub for the
+# skips the venv bootstrap AND substitutes a minimal MCPServer stub for the
 # import below. This lets the pytest suite exercise tool wiring + result-dict
 # shapes without pulling in `mcp`. Production (the actual MCP server
-# transport) must NEVER set this — without the real FastMCP, the server
+# transport) must NEVER set this — without the real MCPServer, the server
 # doesn't serve.
 _MCP_SKIP_BOOTSTRAP = os.environ.get("BB_MCP_SKIP_BOOTSTRAP", "") == "1"
 
 if not _MCP_SKIP_BOOTSTRAP:
     _bootstrap_venv()
     try:
-        from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+        from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]
     except ImportError as e:
-        # Sentinel-present launch found `mcp` missing — manual `pip
-        # uninstall`, partial filesystem cleanup that wiped the package
-        # dir but spared the touch file, or an image-layer accident.
-        # Tell the user the recovery path explicitly rather than
-        # letting them chase a bare ModuleNotFoundError.
+        # Sentinel-present launch found `mcp` missing or on the wrong
+        # major version — manual `pip uninstall`/`pip install`, partial
+        # filesystem cleanup that wiped the package dir but spared the
+        # sentinel, or an image-layer accident. Tell the user the
+        # recovery path explicitly rather than letting them chase a
+        # bare ModuleNotFoundError.
         raise ImportError(
-            f"[bb-mcp] FastMCP import failed even though {_VENV_READY} "
+            f"[bb-mcp] MCPServer import failed even though {_VENV_READY} "
             f"says the venv is ready ({e}). The mcp package was probably "
-            f"removed out-of-band. Recover with:\n"
+            f"removed or changed out-of-band. Recover with:\n"
             f"  rm {_VENV_READY}\n"
             f"…then relaunch — bootstrap will reinstall. Or nuke the "
             f"whole venv with `rm -rf {_VENV_DIR}` if state is corrupt."
@@ -239,9 +262,9 @@ if not _MCP_SKIP_BOOTSTRAP:
 else:
     # Minimal no-op stub. `@mcp.tool()` returns the function unchanged so
     # tests can call the wrapped tool directly. The stub class is callable
-    # as `FastMCP("name")` and exposes a `.run()` that raises (we don't
+    # as `MCPServer("name")` and exposes a `.run()` that raises (we don't
     # want a test accidentally launching a server).
-    class FastMCP:  # type: ignore[no-redef]
+    class MCPServer:  # type: ignore[no-redef]
         def __init__(self, name: str) -> None:
             self.name = name
             self._tools: dict[str, Any] = {}
@@ -254,7 +277,7 @@ else:
 
         def run(self) -> None:
             raise RuntimeError(
-                "FastMCP stub: BB_MCP_SKIP_BOOTSTRAP is set. The MCP "
+                "MCPServer stub: BB_MCP_SKIP_BOOTSTRAP is set. The MCP "
                 "server cannot run in this mode; it's for unit tests only."
             )
 
@@ -564,7 +587,7 @@ _TOOL_EXPECTED_EXCEPTIONS = (
 # MCP server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("bb")
+mcp = MCPServer("bb")
 
 
 def _opt_str(value: str | None) -> str | None:
@@ -651,7 +674,7 @@ def pipeline_trigger(
         pattern: Custom pipeline name (matches `custom:` entries in
                  bitbucket-pipelines.yml). Empty for the branch's default
                  pipeline.
-        pipeline: Alias for `pattern`. The alias exists because FastMCP
+        pipeline: Alias for `pattern`. The alias exists because the MCP SDK
                   silently discards arguments that aren't in the schema,
                   and `pipeline=` is the name callers naturally reach for
                   on a tool named pipeline_trigger; without it, a custom

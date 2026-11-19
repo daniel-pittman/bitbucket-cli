@@ -27,15 +27,17 @@ classifiers = [
 ]
 
 # Runtime dependencies are intentionally minimal. The MCP server self-bootstraps
-# a venv at /tmp/bbenv on first run and installs `mcp` there; consumers who
-# install via `pip install -e .` get the same package added explicitly via the
-# `mcp` extra. The transport layer (bb_api) is stdlib-only.
+# a venv at $XDG_DATA_HOME/bitbucket-cli/venv on first run and installs `mcp`
+# there; consumers who install via `pip install -e .` get the same package
+# added explicitly via the `mcp` extra. The transport layer (bb_api) is
+# stdlib-only.
 dependencies = []
 
 [project.optional-dependencies]
 # Pull in the MCP runtime when installing for the MCP server use case:
 #   pip install -e ".[mcp]"
-mcp = ["mcp >= 1.0"]
+# Must match _VENV_DEPS in mcp_server.py (tests/test_mcp_server.py enforces it).
+mcp = ["mcp>=2.1.1,<3"]
 
 # Test-time dependencies.
 test = ["pytest >= 9.2.0"]

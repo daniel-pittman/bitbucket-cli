@@ -4,7 +4,7 @@ Shared pytest setup.
 Two responsibilities, both load-bearing:
 
 1. Set BB_MCP_SKIP_BOOTSTRAP=1 BEFORE mcp_server is imported. The MCP server
-   self-bootstraps a venv at /tmp/bbenv on first run; without this sentinel,
+   self-bootstraps a venv under $XDG_DATA_HOME on first run; without this sentinel,
    importing mcp_server during a pytest run would try to exec into that venv
    and the test process would never come back. The sentinel must land in the
    environment before any test module's `import mcp_server`, which is why it

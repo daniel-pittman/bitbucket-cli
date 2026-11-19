@@ -4,7 +4,7 @@ Tests for mcp_server.
 Discipline:
   - BB_MCP_SKIP_BOOTSTRAP=1 is set in conftest.py BEFORE this module
     imports, so importing mcp_server skips the venv bootstrap and uses
-    the FastMCP stub (decorator returns the function unchanged).
+    the MCPServer stub (decorator returns the function unchanged).
   - Tools are tested by patching bb_ops / git_ops functions at the
     module level, calling the tool directly, and asserting (a) the
     underlying function was called with the right arguments, (b) the
@@ -132,7 +132,7 @@ EXPECTED_TOOLS = {
 
 
 def test_all_expected_tools_registered() -> None:
-    """The FastMCP stub records every @mcp.tool()-decorated function in
+    """The MCPServer stub records every @mcp.tool()-decorated function in
     its _tools dict. Pin the exact set so an accidental rename or drop
     is caught by the suite — the agent depends on these exact names."""
     registered = set(mcp_server.mcp._tools.keys())
@@ -598,7 +598,7 @@ class TestPipelineTools:
     def test_pipeline_trigger_pipeline_alias_maps_to_pattern(
         self, stub_client: bb_api.BBClient
     ) -> None:
-        """`pipeline=` is an alias for `pattern=`. FastMCP silently
+        """`pipeline=` is an alias for `pattern=`. The MCP SDK silently
         discards arguments missing from the schema, so before the alias
         existed a custom selector passed as `pipeline=` was DROPPED and a
         plain branch build ran instead; the selector must reach the
@@ -2058,7 +2058,7 @@ class TestWhoami:
 
 
 class TestBootstrapStub:
-    def test_fastmcp_stub_run_raises(self) -> None:
+    def test_mcpserver_stub_run_raises(self) -> None:
         """The stub MCP must never accidentally serve in production —
         .run() raises a clear error so a test that imports mcp_server
         and calls .run() fails loud instead of hanging on stdio."""
@@ -2067,7 +2067,7 @@ class TestBootstrapStub:
 
     def test_skip_bootstrap_env_is_set(self) -> None:
         """conftest.py sets BB_MCP_SKIP_BOOTSTRAP=1 unconditionally; pin
-        that we actually loaded the stub path (not the real FastMCP)."""
+        that we actually loaded the stub path (not the real MCPServer)."""
         import os as _os
         assert _os.environ.get("BB_MCP_SKIP_BOOTSTRAP") == "1"
         assert mcp_server._MCP_SKIP_BOOTSTRAP is True
@@ -2109,3 +2109,154 @@ class TestVenvLocation:
         — otherwise a stale sentinel could survive and claim a missing
         venv is ready."""
         assert mcp_server._VENV_READY.parent == mcp_server._VENV_DIR
+
+
+class TestVenvDependencyStamp:
+    """The ready-sentinel records the dependency spec the venv was built
+    for. A venv built for another spec (including the empty sentinel that
+    releases before the stamp wrote) must reinstall, or an mcp major
+    bump leaves existing installs on the old SDK and the import fails."""
+
+    @pytest.fixture
+    def venv(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        venv_dir = tmp_path / "bitbucket-cli" / "venv"
+        venv_py = venv_dir / "bin" / "python3"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text("")
+        ready = venv_dir / ".bbenv-ready"
+        monkeypatch.setattr(mcp_server, "_VENV_DIR", venv_dir)
+        monkeypatch.setattr(mcp_server, "_VENV_PY", venv_py)
+        monkeypatch.setattr(mcp_server, "_VENV_READY", ready)
+        return ready
+
+    @pytest.fixture
+    def bootstrap_calls(self, monkeypatch: pytest.MonkeyPatch):
+        """Record pip installs and the re-exec instead of running them."""
+        calls: dict[str, list] = {"pip": [], "execv": [], "venv": []}
+        monkeypatch.setattr(
+            mcp_server, "_find_builder_python", lambda: "builder-python"
+        )
+        monkeypatch.setattr(
+            mcp_server, "_pip_install_or_diagnose",
+            lambda args: calls["pip"].append(list(args)),
+        )
+        monkeypatch.setattr(
+            mcp_server.subprocess, "check_call",
+            lambda args, **kw: calls["venv"].append(list(args)),
+        )
+        monkeypatch.setattr(
+            mcp_server.os, "execv",
+            lambda path, argv: calls["execv"].append((path, list(argv))),
+        )
+        return calls
+
+    def test_missing_sentinel_is_not_current(self, venv) -> None:
+        assert not venv.exists()
+        assert mcp_server._venv_is_current() is False
+
+    def test_legacy_empty_sentinel_is_not_current(self, venv) -> None:
+        venv.write_text("")
+        assert mcp_server._venv_is_current() is False
+
+    def test_other_spec_is_not_current(self, venv) -> None:
+        venv.write_text("mcp>=1.0,<2\n")
+        assert mcp_server._venv_is_current() is False
+
+    def test_matching_stamp_is_current(self, venv) -> None:
+        venv.write_text(mcp_server._venv_stamp())
+        assert mcp_server._venv_is_current() is True
+
+    def test_stamp_names_every_dep(self) -> None:
+        stamp = mcp_server._venv_stamp()
+        for dep in mcp_server._VENV_DEPS:
+            assert dep in stamp.splitlines()
+
+    def test_legacy_venv_reinstalls_and_restamps(
+        self, venv, bootstrap_calls
+    ) -> None:
+        """An existing venv with the pre-stamp empty sentinel reruns the
+        dependency install (so pip upgrades mcp 1.x to the new spec),
+        reuses the existing interpreter, and rewrites the sentinel."""
+        venv.write_text("")
+        mcp_server._bootstrap_venv()
+        assert bootstrap_calls["venv"] == []  # venv python already exists
+        deps = list(mcp_server._VENV_DEPS)
+        assert any(
+            args[-len(deps):] == deps for args in bootstrap_calls["pip"]
+        ), bootstrap_calls["pip"]
+        assert venv.read_text() == mcp_server._venv_stamp()
+        assert len(bootstrap_calls["execv"]) == 1
+
+    def test_current_venv_skips_install(self, venv, bootstrap_calls) -> None:
+        venv.write_text(mcp_server._venv_stamp())
+        mcp_server._bootstrap_venv()
+        assert bootstrap_calls["pip"] == []
+        assert bootstrap_calls["venv"] == []
+        assert len(bootstrap_calls["execv"]) == 1
+
+    def test_failed_install_leaves_sentinel_stale(
+        self, venv, monkeypatch: pytest.MonkeyPatch, bootstrap_calls
+    ) -> None:
+        """A pip failure must not stamp the sentinel, so the next launch
+        retries rather than re-execing into a half-upgraded venv."""
+        venv.write_text("mcp>=1.0,<2\n")
+
+        def _fail(args):
+            raise RuntimeError("[bb-mcp] pip install failed (exit 1)")
+
+        monkeypatch.setattr(mcp_server, "_pip_install_or_diagnose", _fail)
+        with pytest.raises(RuntimeError, match="pip install failed"):
+            mcp_server._bootstrap_venv()
+        assert venv.read_text() == "mcp>=1.0,<2\n"
+        assert bootstrap_calls["execv"] == []
+
+
+class TestMcpDependencyParity:
+    """The bootstrap venv and the pyproject `mcp` extra must ask for the
+    same SDK range; a mismatch is how the venv stayed on mcp<2 while the
+    extra floor moved to 2.x."""
+
+    def test_venv_deps_match_pyproject_extra(self) -> None:
+        import re
+        from pathlib import Path
+
+        text = (Path(mcp_server.__file__).parent / "pyproject.toml").read_text()
+        m = re.search(r"^mcp\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
+        assert m, "pyproject.toml has no `mcp = [...]` extra"
+        extra = [
+            s.replace(" ", "")
+            for s in re.findall(r'"([^"]*)"', m.group(1))
+        ]
+        venv = [s.replace(" ", "") for s in mcp_server._VENV_DEPS]
+        assert extra == venv
+
+
+class TestRealMCPServer:
+    """Register every tool on the REAL mcp SDK and list them. The rest of
+    this file runs against the stub, which accepts any signature; this is
+    the check that the import path and every tool's annotations work on
+    the pinned SDK major version. Skips when the SDK is not installed
+    (CI installs the `mcp` extra so it runs there)."""
+
+    @pytest.fixture
+    def real_server(self):
+        mcpserver = pytest.importorskip("mcp.server.mcpserver")
+        server = mcpserver.MCPServer("bb")
+        for fn in mcp_server.mcp._tools.values():
+            server.tool()(fn)
+        return server
+
+    def test_every_tool_lists_on_real_sdk(self, real_server) -> None:
+        import asyncio
+
+        listed = asyncio.run(real_server.list_tools())
+        assert {t.name for t in listed} == EXPECTED_TOOLS
+
+    def test_pipeline_alias_is_in_the_real_schema(self, real_server) -> None:
+        """The `pipeline=` alias only helps if the SDK advertises it; a
+        schema without it would drop the argument silently."""
+        import asyncio
+
+        listed = {t.name: t for t in asyncio.run(real_server.list_tools())}
+        props = listed["pipeline_trigger"].input_schema["properties"]
+        assert {"pattern", "pipeline", "variables"} <= set(props)
