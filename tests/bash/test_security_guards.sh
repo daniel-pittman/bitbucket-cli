@@ -139,6 +139,28 @@ assert_rejects "logs build_number non-numeric" \
     "build_number must be a positive integer" \
     -- logs "$REPO" 'abc'
 
+# repo / workspace slug → path rewrite or query smuggling (issue #69).
+# A `?` or `#` turns the rest of the request path into a query string or
+# fragment; a space or control character makes the URL invalid.
+SLUG_MSG="must contain only letters, digits, '.', '_' and '-'"
+assert_rejects "repo slug '?' query-smuggle" "$SLUG_MSG" \
+    -- pipelines 'dummy-ws/widget?x=1'
+assert_rejects "repo slug '#' fragment" "$SLUG_MSG" \
+    -- prs 'dummy-ws/widget#frag'
+assert_rejects "repo slug percent-escape" "$SLUG_MSG" \
+    -- pipelines 'dummy-ws/widget%2Fother'
+assert_rejects "workspace slug '?' via ws/repo" "$SLUG_MSG" \
+    -- pipelines 'ws?x=1/widget'
+assert_rejects "workspace slug control char" "$SLUG_MSG" \
+    -- pipelines "$(printf 'ws\001x')/widget"
+assert_rejects "projects workspace '?'" "$SLUG_MSG" \
+    -- -w 'ws?x=1' projects
+assert_rejects "members workspace '#'" "$SLUG_MSG" \
+    -- -w 'ws#x' members
+# Inner whitespace: the long-standing whitespace check catches it first.
+assert_rejects "repo slug inner space" "non-whitespace" \
+    -- pipelines 'dummy-ws/bad repo'
+
 echo ""
 echo "== valid input must clear the guards =="
 assert_passes_guard "logs valid step 0 clears guard" \
@@ -149,6 +171,10 @@ assert_passes_guard "pipelines valid count clears guard" \
     "count must be" -- pipelines "$REPO" 3
 assert_passes_guard "prs valid state clears guard" \
     "state must be one of" -- prs "$REPO" MERGED
+assert_passes_guard "slug with . _ - and caps clears guard" \
+    "must contain only letters" -- pipelines 'My_ws-1/Widget.Service_2'
+assert_passes_guard "projects valid workspace clears guard" \
+    "must contain only letters" -- -w 'acme-co_2' projects
 
 echo ""
 echo "== summary: ${pass} passed, ${fail} failed =="

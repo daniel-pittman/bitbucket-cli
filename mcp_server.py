@@ -44,6 +44,7 @@ Environment overrides:
 
 from __future__ import annotations
 
+import http.client
 import os
 import re
 import subprocess
@@ -386,6 +387,8 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
             raise ValueError(
                 f"workspace and repo must not be '.' or '..'; got {repo!r}"
             )
+        bb_api.validate_slug("workspace", parts[0])
+        bb_api.validate_slug("repo", parts[1])
         client = _get_client()
         return client, parts[0], parts[1]
 
@@ -397,6 +400,7 @@ def _resolve_repo(repo: str | None = "") -> tuple[bb_api.BBClient, str, str]:
         raise ValueError(
             f"repo must not be '.' or '..'; got {repo!r}"
         )
+    bb_api.validate_slug("repo", repo)
     client = _get_client()
     # BB_WORKSPACE is optional (v1.2.0). A bare slug has no workspace of
     # its own, so it can only resolve against the configured default. If
@@ -566,6 +570,10 @@ def _error_dict_with(e: Exception, **extras: Any) -> dict[str, Any]:
 #   - AttributeError covers the JSON-null-into-string-arg case where
 #     an MCP client sends {"repo": null} and `.strip()` would
 #     otherwise crash uncaught.
+#   - http.client.InvalidURL is raised by urllib before sending when a
+#     URL holds a space or control character. It subclasses neither
+#     OSError nor ValueError. Slug validation keeps it off the repo
+#     path; this catches any other URL component that slips one in.
 #
 # Deliberately EXCLUDES TypeError — a refactor that renames a bb_ops
 # kwarg should surface as an obvious dev-time crash, not a fake
@@ -580,6 +588,7 @@ _TOOL_EXPECTED_EXCEPTIONS = (
     OSError,
     AttributeError,
     ValueError,
+    http.client.InvalidURL,
 )
 
 

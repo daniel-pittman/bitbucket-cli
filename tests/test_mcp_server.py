@@ -299,6 +299,22 @@ class TestResolveRepo:
         with pytest.raises(ValueError, match=r"'\.'"):
             mcp_server._resolve_repo(bare)
 
+    @pytest.mark.parametrize(
+        "repo", ["widget?x=1", "acme/widget#f", "ws?x/widget", "acme/bad repo"]
+    )
+    def test_non_slug_characters_rejected_before_get_client(
+        self, monkeypatch: pytest.MonkeyPatch, repo: str
+    ) -> None:
+        """Issue #69: a slug with `?`, `#` or inner whitespace is a clean
+        ValueError raised before _get_client, never a URL that reaches
+        another endpoint or an InvalidURL from urllib."""
+        mcp_server._reset_client_cache()
+        def raise_config(*_args: Any, **_kwargs: Any) -> Any:
+            raise bb_api.BBConfigError("Missing BB_USER")
+        monkeypatch.setattr(bb_api, "load_config", raise_config)
+        with pytest.raises(ValueError, match="only letters, digits"):
+            mcp_server._resolve_repo(repo)
+
 
 # ---------------------------------------------------------------------------
 # _error_dict
@@ -2260,3 +2276,29 @@ class TestRealMCPServer:
         listed = {t.name: t for t in asyncio.run(real_server.list_tools())}
         props = listed["pipeline_trigger"].input_schema["properties"]
         assert {"pattern", "pipeline", "variables"} <= set(props)
+
+
+class TestInvalidUrlEnvelope:
+    """http.client.InvalidURL subclasses neither OSError nor ValueError;
+    a tool must still return the error envelope, not raise (#69)."""
+
+    def test_invalid_url_is_enveloped(self, stub_client: bb_api.BBClient) -> None:
+        import http.client
+
+        def boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise http.client.InvalidURL("URL can't contain control characters")
+
+        with patch.object(bb_ops, "pipelines_list", boom):
+            out = mcp_server.pipelines_list(repo="acme/widget-service")
+        assert out["ok"] is False
+        assert out["kind"] == "InvalidURL"
+
+    def test_tool_returns_envelope_for_query_smuggling_slug(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(branch="main", repo="acme/widget?")
+        assert out["ok"] is False
+        assert "only letters, digits" in out["message"]
+        assert recorder.calls == []

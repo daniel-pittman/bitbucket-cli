@@ -1694,3 +1694,26 @@ class TestMembersList:
         with pytest.raises(ValueError):
             bb_ops.members_list(_client(opener), count=bad)
         assert opener.calls == []
+
+
+class TestWorkspaceSlugCharacters:
+    """Workspace-level calls build `/workspaces/{ws}/...` or
+    `/repositories/{ws}` without repo_path, so each validates the slug
+    itself; a `?` or `#` must be rejected before any request (#69)."""
+
+    @pytest.mark.parametrize("bad", ["ws?x=1", "ws#x", "w s", "ws%2F"])
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda c, ws: bb_ops.projects_list(c, workspace=ws),
+            lambda c, ws: bb_ops.members_list(c, workspace=ws),
+            lambda c, ws: bb_ops.repos_list(c, workspace=ws),
+            lambda c, ws: bb_ops.vars_list(c, ws, scope="workspace"),
+        ],
+        ids=["projects_list", "members_list", "repos_list", "vars_list-workspace"],
+    )
+    def test_rejects_before_any_request(self, call, bad: str) -> None:
+        opener = _CaptureOpener([])
+        with pytest.raises(ValueError, match="workspace"):
+            call(_client(opener), bad)
+        assert opener.calls == []

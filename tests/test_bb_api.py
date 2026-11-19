@@ -783,3 +783,49 @@ def test_paginate_yields_nothing_on_empty_first_page() -> None:
     opener = _CaptureOpener([{"values": []}])
     client = _client(opener)
     assert list(client.paginate("/repos")) == []
+
+
+# Slug character set (issue #69). Slugs reach URL paths unencoded, so a
+# `?` or `#` would move the rest of the path into a query or fragment,
+# and a space or control character makes urllib reject the URL.
+_BAD_SLUG_CHARS = [
+    "bad repo",       # inner space: Python used to accept it (bash rejected)
+    "widget?x=1",     # query smuggling
+    "widget?",        # truncates the endpoint path
+    "widget#frag",    # fragment
+    "widget%2Fother", # pre-encoded escape
+    "ws\x01x",        # control character
+    "wid\tget",       # inner tab
+    "{uuid-form}",    # UUID form is not accepted
+    "wïdget",         # non-ASCII letter
+]
+
+
+@pytest.mark.parametrize("bad", _BAD_SLUG_CHARS)
+def test_repo_path_rejects_non_slug_characters(bad: str) -> None:
+    with pytest.raises(ValueError, match="only letters, digits"):
+        repo_path(bad, "widget")
+    with pytest.raises(ValueError, match="only letters, digits"):
+        repo_path("acme", bad)
+
+
+@pytest.mark.parametrize(
+    "good", ["acme", "widget-service", "Widget.Service_2", "a", "0", "a.b-c_d"]
+)
+def test_repo_path_accepts_slug_characters(good: str) -> None:
+    assert repo_path(good, good) == f"/repositories/{good}/{good}"
+
+
+def test_validate_slug_rejects_non_string() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        bb_api.validate_slug("repo", None)
+    with pytest.raises(ValueError, match="non-empty"):
+        bb_api.validate_slug("repo", 7)
+
+
+def test_validate_slug_keeps_earlier_messages() -> None:
+    """The long-standing checks still fire first, with their messages."""
+    with pytest.raises(ValueError, match="must not contain '/'"):
+        bb_api.validate_slug("repo", "a/b?")
+    with pytest.raises(ValueError, match=r"'\.' or '\.\.'"):
+        bb_api.validate_slug("repo", "..")
