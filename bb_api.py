@@ -257,23 +257,50 @@ def detect_repo(
     return repo
 
 
+# Bitbucket workspace and repository slugs use only these characters.
+# Slugs are interpolated into URL paths unencoded, so anything else (a
+# space, `?`, `#`, `%`, a control character) would either be rejected by
+# urllib or change which endpoint the request reaches. UUID-form
+# identifiers (`{...}`) are not accepted here. Mirrored by the bash
+# _slug_chars_ok helper.
+_SLUG_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def validate_slug(label: str, value: Any) -> str:
+    """Validate a workspace or repo slug before it reaches a URL path.
+
+    Rejects, in order (the earlier messages are the long-standing ones):
+      - non-strings and empty / whitespace-only values (would produce
+        `/repositories//repo`)
+      - embedded `/` (would silently change path structure)
+      - `.` or `..` (path traversal: after URL normalisation,
+        `/repositories/../widget` resolves to `/repositories/widget` with
+        the wrong workspace)
+      - any character outside `_SLUG_RE`
+    Returns the value unchanged.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty, non-whitespace string. Got {value!r}.")
+    if "/" in value:
+        raise ValueError(f"{label} must not contain '/'. Got {value!r}.")
+    if value in (".", ".."):
+        raise ValueError(f"{label} must not be '.' or '..'. Got {value!r}.")
+    if not _SLUG_RE.fullmatch(value):
+        raise ValueError(
+            f"{label} must contain only letters, digits, '.', '_' and '-'. "
+            f"Got {value!r}."
+        )
+    return value
+
+
 def repo_path(workspace: str, repo: str) -> str:
     """Build the Bitbucket REST path for a repo (`/repositories/{ws}/{repo}`).
 
-    Mirrors the bash repo_path helper. Validates inputs reject:
-      - empty / whitespace-only values (would produce `/repositories//repo`)
-      - embedded `/` (would silently change path structure)
-      - `.` or `..` segments (path-traversal: after URL normalisation,
-        `/repositories/../widget` resolves to `/repositories/widget` with
-        the wrong workspace)
+    Mirrors the bash repo_path helper; both slugs go through
+    validate_slug.
     """
-    for label, value in (("workspace", workspace), ("repo", repo)):
-        if not value or not value.strip():
-            raise ValueError(f"{label} must be a non-empty, non-whitespace string. Got {value!r}.")
-        if "/" in value:
-            raise ValueError(f"{label} must not contain '/'. Got {value!r}.")
-        if value in (".", ".."):
-            raise ValueError(f"{label} must not be '.' or '..'. Got {value!r}.")
+    validate_slug("workspace", workspace)
+    validate_slug("repo", repo)
     return f"/repositories/{workspace}/{repo}"
 
 

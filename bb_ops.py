@@ -23,7 +23,7 @@ import re
 from typing import Any, Iterable
 from urllib.parse import quote
 
-from bb_api import BBApiError, BBClient, repo_path
+from bb_api import BBApiError, BBClient, repo_path, validate_slug
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1127,7 @@ def projects_list(
         raise ValueError(f"workspace must not contain '/', got {ws!r}")
     if ws in (".", ".."):
         raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
+    validate_slug("workspace", ws)
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
 
@@ -1174,6 +1175,7 @@ def members_list(
         raise ValueError(f"workspace must not contain '/', got {ws!r}")
     if ws in (".", ".."):
         raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
+    validate_slug("workspace", ws)
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
 
@@ -1226,6 +1228,7 @@ def repos_list(
         raise ValueError(f"workspace must not contain '/', got {ws!r}")
     if ws in (".", ".."):
         raise ValueError(f"workspace must not be '.' or '..', got {ws!r}")
+    validate_slug("workspace", ws)
     if not _is_positive_int(count):
         raise ValueError(f"count must be a positive int, got {count!r}")
 
@@ -1629,6 +1632,7 @@ def _variables_base(
             raise ValueError(f"workspace must not contain '/', got {workspace!r}")
         if workspace in (".", ".."):
             raise ValueError(f"workspace must not be '.' or '..', got {workspace!r}")
+        validate_slug("workspace", workspace)
         # HYPHEN form — verified against the live API; the underscore
         # form 404s at the workspace scope.
         return f"/workspaces/{workspace}/pipelines-config/variables/"
