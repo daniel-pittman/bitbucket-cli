@@ -245,7 +245,7 @@ Surface the log's relevant tail (last ~50 lines or the stderr region around the 
 The CLI is two parallel implementations:
 
 - **`bb`** (bash) — human-facing CLI, ~1000 lines of pure bash + curl + jq.
-- **`bb_api.py`** + **`bb_ops.py`** + **`git_ops.py`** + **`mcp_server.py`** (Python) — what the MCP server uses. Stdlib-only runtime (no `requests` etc.); `mcp` is the only third-party dep, installed by the self-bootstrapping venv at `~/.local/share/bitbucket-cli/venv`.
+- **`bb_api.py`** + **`bb_ops.py`** + **`git_ops.py`** + **`mcp_server.py`** (Python) — what the MCP server uses. Stdlib-only runtime (no `requests` etc.); `mcp` is the only third-party dep, installed by the self-bootstrapping venv at `~/.local/share/bitbucket-cli/venv-mcp2`.
 
 ### When delegated a `bb` change
 

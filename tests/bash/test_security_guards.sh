@@ -139,6 +139,72 @@ assert_rejects "logs build_number non-numeric" \
     "build_number must be a positive integer" \
     -- logs "$REPO" 'abc'
 
+# repo / workspace slug → path rewrite or query smuggling (issue #69).
+# A `?` or `#` turns the rest of the request path into a query string or
+# fragment; a space or control character makes the URL invalid.
+SLUG_MSG="must contain only letters, digits, '.', '_' and '-'"
+assert_rejects "repo slug '?' query-smuggle" "$SLUG_MSG" \
+    -- pipelines 'dummy-ws/widget?x=1'
+assert_rejects "repo slug '#' fragment" "$SLUG_MSG" \
+    -- prs 'dummy-ws/widget#frag'
+assert_rejects "repo slug percent-escape" "$SLUG_MSG" \
+    -- pipelines 'dummy-ws/widget%2Fother'
+assert_rejects "workspace slug '?' via ws/repo" "$SLUG_MSG" \
+    -- pipelines 'ws?x=1/widget'
+assert_rejects "workspace slug control char" "$SLUG_MSG" \
+    -- pipelines "$(printf 'ws\001x')/widget"
+assert_rejects "projects workspace '?'" "$SLUG_MSG" \
+    -- -w 'ws?x=1' projects
+assert_rejects "members workspace '#'" "$SLUG_MSG" \
+    -- -w 'ws#x' members
+# Inner whitespace: the long-standing whitespace check catches it first.
+assert_rejects "repo slug inner space" "non-whitespace" \
+    -- pipelines 'dummy-ws/bad repo'
+# Workspace-level builders that bypass repo_path (review of #69).
+assert_rejects "repos workspace '?'" "$SLUG_MSG" \
+    -- -w 'acme?x=1' repos
+assert_rejects "repos workspace '..'" "must not be '.' or '..'" \
+    -- -w '..' repos
+assert_rejects "vars --workspace '#'" "invalid workspace for workspace-scope" \
+    -- -w 'acme#f' vars --workspace
+assert_rejects "vars set --workspace '?'" "invalid workspace for workspace-scope" \
+    -- -w 'acme?x=1' vars set --workspace SOME_KEY --value v
+assert_rejects "vars --workspace inner space" "invalid workspace for workspace-scope" \
+    -- -w 'bad ws' vars --workspace
+# Browser URLs go through the same slug checks.
+assert_rejects "open repo '?'" "$SLUG_MSG" \
+    -- open 'dummy-ws/widget?x=1'
+assert_rejects "approve workspace '#'" "$SLUG_MSG" \
+    -- approve 'ws#x/widget' 1
+
+# whoami must not probe an invalid workspace (`..` reaches the global
+# repositories listing and would report a false "auth OK").
+for bad_ws in '..' 'acme?x=1'; do
+    out="$("$BB" -w "$bad_ws" whoami 2>&1)"
+    if printf '%s' "$out" | grep -q "is not a valid slug"; then
+        echo "pass: whoami skips probe for '${bad_ws}'"; pass=$((pass + 1))
+    else
+        echo "FAIL: whoami probed invalid workspace '${bad_ws}'"
+        echo "      output: ${out}"; fail=$((fail + 1))
+    fi
+done
+
+# _slug_chars_ok itself: `$(...)` strips trailing newlines, so a value
+# whose only bad bytes are newlines must still fail.
+eval "$(sed -n '/^_slug_chars_ok() {/,/^}/p' "$BB")"
+for v in $'acme\n' $'a\nb' $'\n'; do
+    if _slug_chars_ok "$v"; then
+        echo "FAIL: _slug_chars_ok accepted a newline-bearing value"; fail=$((fail + 1))
+    else
+        echo "pass: _slug_chars_ok rejects newline-bearing value"; pass=$((pass + 1))
+    fi
+done
+if _slug_chars_ok 'Widget.Service_2-x'; then
+    echo "pass: _slug_chars_ok accepts a valid slug"; pass=$((pass + 1))
+else
+    echo "FAIL: _slug_chars_ok rejected a valid slug"; fail=$((fail + 1))
+fi
+
 echo ""
 echo "== valid input must clear the guards =="
 assert_passes_guard "logs valid step 0 clears guard" \
@@ -149,6 +215,10 @@ assert_passes_guard "pipelines valid count clears guard" \
     "count must be" -- pipelines "$REPO" 3
 assert_passes_guard "prs valid state clears guard" \
     "state must be one of" -- prs "$REPO" MERGED
+assert_passes_guard "slug with . _ - and caps clears guard" \
+    "must contain only letters" -- pipelines 'My_ws-1/Widget.Service_2'
+assert_passes_guard "projects valid workspace clears guard" \
+    "must contain only letters" -- -w 'acme-co_2' projects
 
 echo ""
 echo "== summary: ${pass} passed, ${fail} failed =="

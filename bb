@@ -408,6 +408,18 @@ _resolve_pr_args() {
     [[ -n "$pr_id" ]] && _require_pr_id "$pr_id"
 }
 
+# True when every byte of $1 is a slug character: [A-Za-z0-9._-].
+# Slugs are interpolated into URL paths unencoded, so a space, `?`, `#`,
+# `%` or control character would change which endpoint a request reaches.
+# LC_ALL=C keeps the ranges byte-exact, matching the ASCII-only
+# bb_api._SLUG_RE on the Python side in every locale. The trailing `x`
+# is load-bearing: `$(...)` strips trailing newlines, so without it a
+# value whose only bad bytes are newlines would test as empty and pass.
+# Emptiness is the callers' check, so an empty value passes here.
+_slug_chars_ok() {
+    [[ "$(printf '%s' "$1" | LC_ALL=C tr -d 'A-Za-z0-9._-'; printf x)" == "x" ]]
+}
+
 repo_path() {
     local repo="$1"
     # Validate inputs at the boundary so a malformed slug doesn't
@@ -441,6 +453,14 @@ repo_path() {
     fi
     if [[ "$repo" == "." || "$repo" == ".." ]]; then
         echo "Error: repo must not be '.' or '..'." >&2
+        kill -TERM $$
+    fi
+    if ! _slug_chars_ok "$BB_WORKSPACE"; then
+        echo "Error: workspace must contain only letters, digits, '.', '_' and '-' (got '$BB_WORKSPACE')." >&2
+        kill -TERM $$
+    fi
+    if ! _slug_chars_ok "$repo"; then
+        echo "Error: repo must contain only letters, digits, '.', '_' and '-' (got '$repo')." >&2
         kill -TERM $$
     fi
     # `exit 1` inside a `$(repo_path ...)` command substitution only
@@ -568,6 +588,10 @@ _require_workspace() {
     fi
     if [[ "$ws" == "." || "$ws" == ".." ]]; then
         echo "Error: workspace must not be '.' or '..' (got '$ws')." >&2
+        exit 1
+    fi
+    if ! _slug_chars_ok "$ws"; then
+        echo "Error: workspace must contain only letters, digits, '.', '_' and '-' (got '$ws')." >&2
         exit 1
     fi
 }
@@ -1060,6 +1084,10 @@ cmd_pipeline_approve() {
         echo "Usage: bb approve [repo] <build-number>" >&2
         exit 1
     fi
+    _require_build_number "$build_number"
+    # Validate both slugs exactly as API URLs do (repo_path exits on a
+    # bad one); the path itself is not needed here.
+    repo_path "$repo" > /dev/null
 
     echo "Manual step approval is not supported by the Bitbucket public API."
     echo "Opening pipeline in browser..."
@@ -2243,6 +2271,7 @@ cmd_members() {
 
 cmd_repos() {
     resolve_workspace
+    _require_workspace "$BB_WORKSPACE"
     echo "Repositories in ${BB_WORKSPACE}:"
     echo ""
 
@@ -2814,8 +2843,10 @@ _vars_base_path() {
             # and Python's `.strip()` emptiness check (parity).
             local _ws_stripped
             _ws_stripped="$(printf '%s' "${BB_WORKSPACE:-}" | tr -d '[:space:]')"
-            if [[ -z "$_ws_stripped" || "$BB_WORKSPACE" == */* \
-                  || "$BB_WORKSPACE" == "." || "$BB_WORKSPACE" == ".." ]]; then
+            if [[ -z "$_ws_stripped" || "$_ws_stripped" != "$BB_WORKSPACE" \
+                  || "$BB_WORKSPACE" == */* \
+                  || "$BB_WORKSPACE" == "." || "$BB_WORKSPACE" == ".." ]] \
+                  || ! _slug_chars_ok "$BB_WORKSPACE"; then
                 echo "Error: invalid workspace for workspace-scope variables: '${BB_WORKSPACE:-}'." >&2
                 # Inside `$(...)`; kill the parent, not just the subshell.
                 kill -TERM $$
@@ -3353,6 +3384,12 @@ cmd_whoami() {
     if [[ -z "$probe_ws" ]]; then
         echo "  Skipped — no workspace to probe (set BB_WORKSPACE or run"
         echo "  inside a Bitbucket git checkout). Config + token look set."
+    elif [[ "$probe_ws" == "." || "$probe_ws" == ".." ]] \
+            || ! _slug_chars_ok "$probe_ws"; then
+        # A `..` or `?`/`#` would probe a different endpoint (`..` reaches
+        # the global /repositories listing and falsely reports auth OK).
+        echo "  Workspace '${probe_ws}' is not a valid slug (letters, digits,"
+        echo "  '.', '_' and '-' only); probe skipped. Fix BB_WORKSPACE / -w."
     elif bb_get "/repositories/${probe_ws}?pagelen=1" > /dev/null 2>&1; then
         echo "  Workspace '${probe_ws}' reachable — auth OK."
     else
@@ -3368,6 +3405,9 @@ cmd_open() {
     local repo
     resolve_repo "${1:-}"
     local section="${2:-}"
+    # Validate both slugs exactly as API URLs do (repo_path exits on a
+    # bad one); the path itself is not needed here.
+    repo_path "$repo" > /dev/null
 
     local url="https://bitbucket.org/${BB_WORKSPACE}/${repo}"
 

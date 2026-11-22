@@ -299,6 +299,22 @@ class TestResolveRepo:
         with pytest.raises(ValueError, match=r"'\.'"):
             mcp_server._resolve_repo(bare)
 
+    @pytest.mark.parametrize(
+        "repo", ["widget?x=1", "acme/widget#f", "ws?x/widget", "acme/bad repo"]
+    )
+    def test_non_slug_characters_rejected_before_get_client(
+        self, monkeypatch: pytest.MonkeyPatch, repo: str
+    ) -> None:
+        """Issue #69: a slug with `?`, `#` or inner whitespace is a clean
+        ValueError raised before _get_client, never a URL that reaches
+        another endpoint or an InvalidURL from urllib."""
+        mcp_server._reset_client_cache()
+        def raise_config(*_args: Any, **_kwargs: Any) -> Any:
+            raise bb_api.BBConfigError("Missing BB_USER")
+        monkeypatch.setattr(bb_api, "load_config", raise_config)
+        with pytest.raises(ValueError, match="only letters, digits"):
+            mcp_server._resolve_repo(repo)
+
 
 # ---------------------------------------------------------------------------
 # _error_dict
@@ -2022,15 +2038,14 @@ class TestWhoami:
         # Token must NEVER be echoed, even on the auth-failure path.
         assert "tok-xyz" not in str(out)
 
-    def test_auth_probe_url_encodes_workspace(
+    def test_auth_probe_skips_workspace_with_slash(
         self,
         stub_client: bb_api.BBClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """If the workspace slug has a character that needs URL
-        encoding (rare, but `/` would break path parsing), the probe
-        must encode it — bash uses raw curl, Python uses urllib.quote
-        with safe=''. Test the encoding rather than the raw substitution."""
+        """A workspace holding `/` is not a slug, so the probe does not
+        run (encoding it would still probe a workspace that cannot
+        exist). Both surfaces skip the probe for an invalid slug."""
         # BBConfig is frozen; swap the whole client in.
         weird_cfg = bb_api.BBConfig(
             user="alice@example.com",
@@ -2048,8 +2063,10 @@ class TestWhoami:
         calls = self._stub_auth_ok(stub_client)
         out = mcp_server.whoami()
         assert out["ok"] is True
-        # `/` must be encoded as %2F so it doesn't fragment the path.
-        assert calls == [("/repositories/ws%2Fwith-slash", {"pagelen": "1"})]
+        assert calls == []
+        assert out["auth"]["ok"] is False
+        assert out["auth"]["kind"] == "ValueError"
+        assert "'/'" in out["auth"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -2082,7 +2099,7 @@ class TestVenvLocation:
         """The venv path must end in `bitbucket-cli/venv` so it lives
         alongside other XDG-spec app state."""
         from pathlib import Path
-        assert mcp_server._VENV_DIR.parts[-2:] == ("bitbucket-cli", "venv")
+        assert mcp_server._VENV_DIR.parts[-2:] == ("bitbucket-cli", "venv-mcp2")
         # NOT /tmp (which would re-bootstrap every reboot).
         assert not str(mcp_server._VENV_DIR).startswith("/tmp")
 
@@ -2127,6 +2144,11 @@ class TestVenvDependencyStamp:
         monkeypatch.setattr(mcp_server, "_VENV_DIR", venv_dir)
         monkeypatch.setattr(mcp_server, "_VENV_PY", venv_py)
         monkeypatch.setattr(mcp_server, "_VENV_READY", ready)
+        # The lock lives beside the venv; redirect it too, or the tests
+        # would take a lock beside the real venv directory.
+        monkeypatch.setattr(
+            mcp_server, "_VENV_LOCK", venv_dir.parent / "venv-mcp2.lock"
+        )
         return ready
 
     @pytest.fixture
@@ -2238,10 +2260,39 @@ class TestRealMCPServer:
     the pinned SDK major version. Skips when the SDK is not installed
     (CI installs the `mcp` extra so it runs there)."""
 
+    @staticmethod
+    def _module_server_import() -> tuple[str, str]:
+        """(module, class) from mcp_server.py's own real-SDK import, the
+        `from mcp... import MCPServer` inside the bootstrap branch. Read
+        from the source so a wrong module path on that line fails here;
+        the suite itself always runs the stub branch."""
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path(mcp_server.__file__).read_text())
+        found = [
+            (node.module, alias.name)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module and node.module.startswith("mcp")
+            for alias in node.names
+        ]
+        assert len(found) == 1, found
+        return found[0]
+
     @pytest.fixture
     def real_server(self):
-        mcpserver = pytest.importorskip("mcp.server.mcpserver")
-        server = mcpserver.MCPServer("bb")
+        import importlib
+
+        # Skip only when the SDK is absent. An installed SDK that lacks
+        # the module mcp_server imports must FAIL, not skip.
+        pytest.importorskip("mcp")
+        module, cls = self._module_server_import()
+        server_cls = getattr(importlib.import_module(module), cls)
+        # The module-level server is built from the same name the stub
+        # uses, so `mcp = MCPServer("bb")` matches what this constructs.
+        assert cls == type(mcp_server.mcp).__name__
+        server = server_cls("bb")
         for fn in mcp_server.mcp._tools.values():
             server.tool()(fn)
         return server
@@ -2260,3 +2311,185 @@ class TestRealMCPServer:
         listed = {t.name: t for t in asyncio.run(real_server.list_tools())}
         props = listed["pipeline_trigger"].input_schema["properties"]
         assert {"pattern", "pipeline", "variables"} <= set(props)
+
+
+class TestInvalidUrlEnvelope:
+    """http.client.InvalidURL subclasses neither OSError nor ValueError;
+    a tool must still return the error envelope, not raise (#69)."""
+
+    def test_invalid_url_is_enveloped(self, stub_client: bb_api.BBClient) -> None:
+        import http.client
+
+        def boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise http.client.InvalidURL("URL can't contain control characters")
+
+        with patch.object(bb_ops, "pipelines_list", boom):
+            out = mcp_server.pipelines_list(repo="acme/widget-service")
+        assert out["ok"] is False
+        assert out["kind"] == "InvalidURL"
+
+    def test_tool_returns_envelope_for_query_smuggling_slug(
+        self, stub_client: bb_api.BBClient
+    ) -> None:
+        recorder = _recorder([])
+        with patch.object(bb_ops, "pipeline_trigger", recorder):
+            out = mcp_server.pipeline_trigger(branch="main", repo="acme/widget?")
+        assert out["ok"] is False
+        assert "only letters, digits" in out["message"]
+        assert recorder.calls == []
+
+
+class TestVenvPerMajor:
+    """The venv directory is named for the mcp major version in
+    _VENV_DEPS, so releases built for another major keep their own venv
+    and a rollback never meets an SDK it cannot import (#71)."""
+
+    def test_venv_dir_names_the_pinned_major(self) -> None:
+        import re
+
+        (spec,) = mcp_server._VENV_DEPS
+        m = re.search(r"<\s*(\d+)", spec)
+        assert m, f"no major-version ceiling in {spec!r}"
+        major = int(m.group(1)) - 1
+        assert mcp_server._VENV_DIR.name == f"venv-mcp{major}"
+
+    def test_old_major_venv_is_not_reused(self) -> None:
+        """The pre-2.x releases bootstrapped `bitbucket-cli/venv`."""
+        assert mcp_server._VENV_DIR.name != "venv"
+
+    def test_lock_lives_beside_the_venv(self) -> None:
+        assert mcp_server._VENV_LOCK.parent == mcp_server._VENV_DIR.parent
+        assert mcp_server._VENV_LOCK.name == mcp_server._VENV_DIR.name + ".lock"
+
+
+class TestVenvInstallLock:
+    """Install-and-stamp runs under an exclusive flock, and the sentinel
+    is checked again once the lock is held (#71)."""
+
+    @pytest.fixture
+    def venv(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        venv_dir = tmp_path / "bitbucket-cli" / "venv-mcp2"
+        venv_py = venv_dir / "bin" / "python3"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text("")
+        ready = venv_dir / ".bbenv-ready"
+        monkeypatch.setattr(mcp_server, "_VENV_DIR", venv_dir)
+        monkeypatch.setattr(mcp_server, "_VENV_PY", venv_py)
+        monkeypatch.setattr(mcp_server, "_VENV_READY", ready)
+        monkeypatch.setattr(
+            mcp_server, "_VENV_LOCK", venv_dir.parent / "venv-mcp2.lock"
+        )
+        return ready
+
+    @pytest.fixture
+    def events(self, monkeypatch: pytest.MonkeyPatch):
+        """Record lock, pip and exec events in order, without running any."""
+        log: list[str] = []
+        real_flock = mcp_server.fcntl.flock
+
+        def flock(fd, op):
+            log.append("lock" if op == mcp_server.fcntl.LOCK_EX else "unlock")
+            return real_flock(fd, op)
+
+        monkeypatch.setattr(mcp_server.fcntl, "flock", flock)
+        monkeypatch.setattr(
+            mcp_server, "_find_builder_python", lambda: "builder-python"
+        )
+        monkeypatch.setattr(
+            mcp_server, "_pip_install_or_diagnose",
+            lambda args: log.append("pip"),
+        )
+        monkeypatch.setattr(
+            mcp_server.subprocess, "check_call",
+            lambda args, **kw: log.append("venv"),
+        )
+        monkeypatch.setattr(
+            mcp_server.os, "execv", lambda path, argv: log.append("execv")
+        )
+        return log
+
+    def test_install_runs_inside_the_lock(self, venv, events) -> None:
+        mcp_server._bootstrap_venv()
+        assert events == ["lock", "pip", "pip", "unlock", "execv"]
+        assert venv.read_text() == mcp_server._venv_stamp()
+        assert mcp_server._VENV_LOCK.exists()
+
+    def test_waiter_skips_install_another_launch_finished(
+        self, venv, events, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """While this launch waited on the lock, another launch finished
+        the install and stamped the sentinel: the re-check sees that and
+        this launch installs nothing."""
+        def flock(fd, op):
+            if op == mcp_server.fcntl.LOCK_EX:
+                events.append("lock")
+                venv.write_text(mcp_server._venv_stamp())  # the other launch
+            else:
+                events.append("unlock")
+
+        monkeypatch.setattr(mcp_server.fcntl, "flock", flock)
+        mcp_server._bootstrap_venv()
+        assert events == ["lock", "unlock", "execv"]
+
+    def test_current_venv_takes_no_lock(self, venv, events) -> None:
+        venv.write_text(mcp_server._venv_stamp())
+        mcp_server._bootstrap_venv()
+        assert events == ["execv"]
+
+    def test_lock_released_when_install_fails(
+        self, venv, events, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(args):
+            events.append("pip")
+            raise RuntimeError("[bb-mcp] pip install failed (exit 1)")
+
+        monkeypatch.setattr(mcp_server, "_pip_install_or_diagnose", fail)
+        with pytest.raises(RuntimeError, match="pip install failed"):
+            mcp_server._bootstrap_venv()
+        assert events == ["lock", "pip", "unlock"]
+        assert not venv.exists()
+
+    def test_corrupt_sentinel_reinstalls(self, venv, events) -> None:
+        """A sentinel holding bytes that are not UTF-8 counts as stale
+        and triggers a reinstall instead of crashing startup."""
+        venv.write_bytes(b"\xff\xfe\x00garbage")
+        assert mcp_server._venv_is_current() is False
+        mcp_server._bootstrap_venv()
+        assert events == ["lock", "pip", "pip", "unlock", "execv"]
+        assert venv.read_text() == mcp_server._venv_stamp()
+
+
+class TestWhoamiProbeSlug:
+    """whoami must not probe an invalid workspace. quote() leaves `..`
+    intact, and `/repositories/..` can reach the global listing and
+    report a false "auth OK" (review of #69)."""
+
+    @pytest.mark.parametrize("bad", ["..", "acme?x=1", "acme#f"])
+    def test_invalid_probe_workspace_is_not_probed(
+        self,
+        stub_client: bb_api.BBClient,
+        monkeypatch: pytest.MonkeyPatch,
+        bad: str,
+    ) -> None:
+        import dataclasses
+
+        monkeypatch.setattr(
+            stub_client, "config",
+            dataclasses.replace(stub_client.config, workspace=bad),
+        )
+        monkeypatch.setattr(git_ops, "git_current_branch", lambda path=None: "main")
+        monkeypatch.setattr(
+            git_ops, "git_remote_repo", lambda path=None: ("acme", "widget-service")
+        )
+        calls: list[str] = []
+
+        def fake_get(path: str, *, query=None, timeout=None):
+            calls.append(path)
+            return {}
+
+        monkeypatch.setattr(stub_client, "get", fake_get)
+        out = mcp_server.whoami()
+        assert calls == []
+        assert out["auth"]["ok"] is False
+        assert out["auth"]["workspace"] == bad
+        assert out["auth"]["kind"] == "ValueError"
