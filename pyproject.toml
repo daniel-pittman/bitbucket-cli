@@ -37,7 +37,7 @@ dependencies = []
 # Pull in the MCP runtime when installing for the MCP server use case:
 #   pip install -e ".[mcp]"
 # Must match _VENV_DEPS in mcp_server.py (tests/test_mcp_server.py enforces it).
-mcp = ["mcp>=2.1.1,<3"]
+mcp = ["mcp>=2.3.0,<3"]
 
 # Test-time dependencies.
 test = ["pytest >= 9.2.0"]
