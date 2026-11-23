@@ -487,8 +487,8 @@ def _validate_pr_id(pr_id: int) -> None:
 # default. Bitbucket PR objects carry the full rendered description +
 # summary (raw / html / markup variants) and the participants array,
 # which together push even a 3-PR list past the MCP 25k-token response
-# cap on repos with rich PR bodies (observed: johnny-server, 3 open PRs
-# = ~70 KB). The list/triage workflow (prs_list -> pick one -> pr_show)
+# cap on repos with rich PR bodies (observed on a private repository: 3
+# open PRs = ~70 KB). The list/triage workflow (prs_list -> pick one -> pr_show)
 # only needs identity + state + branches + author + links; the full
 # body is one pr_show away. pr_show is intentionally NOT slimmed — it's
 # the drill-down where you WANT the whole object.
@@ -959,9 +959,9 @@ def pr_merge(
     # historical assumption that Bitbucket accepted either; that's no
     # longer true. PUT now returns HTTP 403 + "This endpoint does not
     # support token-based authentication" (an unhelpful error that
-    # actually means "wrong method here"). Confirmed against
-    # dreamfacesbir/ryan-os PR#2 (2026-06-28) where direct POST with the
-    # same API token merged cleanly. Keep POST; do not "improve" back.
+    # actually means "wrong method here"). Confirmed against a private
+    # repository's PR, where direct POST with the same API token merged
+    # cleanly. Keep POST; do not "improve" back.
     return client.post(
         f"{_prs_root(workspace, repo)}/{pr_id}/merge",
         json_body=payload,
