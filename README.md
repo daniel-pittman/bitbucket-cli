@@ -241,7 +241,7 @@ Pipelines must be **enabled** on a repo before pipeline variables, custom pipeli
 `bb trigger` runs the branch's default pipeline, or a `custom:` pipeline when `[pattern]` is given. Per-run pipeline variables are passed with the repeatable `--var KEY=VALUE` flag (short form `-v`, or `--var=KEY=VALUE`); trailing positional `KEY=VALUE` pairs after `[pattern]` are also accepted. The variables do not have to be declared in `bitbucket-pipelines.yml`; Bitbucket accepts arbitrary per-run keys. Malformed pairs (no `=`, or a key that isn't letters/digits/underscores starting with a non-digit) fail loudly before any API call, and the confirmation echo masks values as `KEY=***` because they may be secrets:
 
 ```bash
-bb trigger ryan-repo develop build-installer --var GOLD_VERSION=v1.0.1
+bb trigger my-repo develop build-installer --var GOLD_VERSION=v1.0.1
 ```
 
 ### Pull Requests
